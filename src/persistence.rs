@@ -117,10 +117,17 @@ pub struct PersistedTab {
     #[serde(default)]
     pub git_origin: Option<GitOrigin>,
     /// Index into `PersistedState.global_envs` of the Global Environment
-    /// linked/"pinned" to this collection, if any. Remapped to a fresh
-    /// `Environment` id on restore (ids aren't stable across restarts).
-    #[serde(default)]
-    pub linked_env_index: Option<usize>,
+    /// active on this tab, if any. Remapped to a fresh `Environment` id on
+    /// restore (ids aren't stable across restarts).
+    ///
+    /// Still written under its old name `linked_env_index`: when this was the
+    /// per-collection "pinned" environment sitting under an app-wide active
+    /// one, it held the same thing this does, so keeping the key means a state
+    /// file written here still restores sensibly under an older build (and
+    /// theirs under this one) instead of every tab silently losing its
+    /// environment on a version hop.
+    #[serde(default, rename = "linked_env_index")]
+    pub env_index: Option<usize>,
     /// Root folder this tab is bound to as a Workspace (see
     /// [`crate::workspace`]), if any. When set, `entries` is NOT a trusted
     /// snapshot — [`Self::into_collection`] re-reads `path` fresh from disk
@@ -181,10 +188,10 @@ fn rel_slashes(rel: &std::path::Path) -> String {
 }
 
 impl PersistedTab {
-    /// Snapshot a collection's persistable parts. `linked_env_index` is
-    /// filled in by the caller (it needs the full global list to resolve the
-    /// collection's `linked_env_id` to an index).
-    pub fn from_collection(c: &Collection, linked_env_index: Option<usize>) -> Self {
+    /// Snapshot a collection's persistable parts. `env_index` is filled in by
+    /// the caller (it needs the full global list to resolve the collection's
+    /// `env_id` to an index).
+    pub fn from_collection(c: &Collection, env_index: Option<usize>) -> Self {
         Self {
             name: c.name.clone(),
             // A Workspace-bound tab's entries are never a trusted snapshot —
@@ -199,7 +206,7 @@ impl PersistedTab {
             selected_entry: c.selected_entry,
             path: c.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
             git_origin: c.git_origin.clone(),
-            linked_env_index,
+            env_index,
             workspace_root: c
                 .workspace_root
                 .as_ref()
@@ -233,16 +240,16 @@ impl PersistedTab {
         }
     }
 
-    /// Rebuild a collection from persisted data. `linked_env_id` is resolved
-    /// by the caller from `linked_env_index` (see [`Self::from_collection`]),
-    /// against the freshly-restored global environments' ids. Also returns
+    /// Rebuild a collection from persisted data. `env_id` is resolved by the
+    /// caller from `env_index` (see [`Self::from_collection`]), against the
+    /// freshly-restored global environments' ids. Also returns
     /// a [`PendingWorkspaceReload`] whenever this tab's entire Workspace
     /// root has vanished *and* it's known to have come from git — the
     /// caller (`TuiApp::apply_persisted`) uses this to offer redownloading
     /// it instead of just reporting it as permanently gone.
     pub fn into_collection(
         self,
-        linked_env_id: Option<u64>,
+        env_id: Option<u64>,
     ) -> (Collection, Option<PendingWorkspaceReload>) {
         let workspace_root = self
             .workspace_root
@@ -343,7 +350,7 @@ impl PersistedTab {
             c.rebuild_restored_structure_baseline();
         }
         c.git_origin = self.git_origin;
-        c.linked_env_id = linked_env_id;
+        c.env_id = env_id;
         c.workspace_root = workspace_root;
         c.workspace_filter_hurl_json = self.workspace_filter_hurl_json.unwrap_or(true);
         c.workspace_downloaded_from_git = self.workspace_downloaded_from_git && !root_missing;
@@ -614,7 +621,7 @@ pub struct PersistedState {
     pub discard_request_edits_on_esc: bool,
     /// User-created themes (Settings → Theme). Built-in presets are not stored.
     #[serde(default)]
-    pub custom_themes: Vec<crate::tui::theme::ThemeSpec>,
+    pub custom_themes: Vec<crate::theme::ThemeSpec>,
     /// The explicitly-chosen theme name, or `None` to follow the language
     /// preset. Persisted so a manual theme choice survives restarts.
     #[serde(default)]
@@ -624,8 +631,13 @@ pub struct PersistedState {
     /// `env` field.
     #[serde(default)]
     pub global_envs: Vec<PersistedEnv>,
-    /// Index into `global_envs` of the currently-activated Global
-    /// Environment, if any.
+    /// Index into `global_envs` of the environment that used to be active
+    /// app-wide, from a state file written before environments became per-tab.
+    ///
+    /// Read-only: [`crate::session::Session::apply_persisted`] hands it to any
+    /// restored tab that has no environment of its own, which is exactly what
+    /// that tab was substituting from under the old merge. Never written any
+    /// more, since there is no longer one app-wide answer to give it.
     #[serde(default)]
     pub active_global_env: Option<usize>,
     /// Which source(s) the Environments panel lists. Shared by both front-ends

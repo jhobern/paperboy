@@ -128,6 +128,7 @@ impl<R: EntryRunner> EntryRunner for CancellableRunner<R> {
     ) -> crate::hurl::RunOutput {
         if self.cancel.load(Ordering::Relaxed) {
             return crate::hurl::RunOutput {
+                generated: Default::default(),
                 entries: Vec::new(),
                 error: Some("cancelled".to_string()),
             };
@@ -981,7 +982,6 @@ impl TuiApp {
                     let diags = crate::report::context::report_diagnostics(
                         &self.collections,
                         &self.global_envs,
-                        self.active_env_id,
                         &flow,
                         rt.report.path.as_deref(),
                         &crate::i18n::Strings::for_language(&self.language),
@@ -1078,6 +1078,7 @@ impl TuiApp {
             strings: &strings,
             params: inputs.params,
             sink: None,
+            shuffle: None,
         };
         Ok(run_flow(&inputs.flow, &ctx))
     }
@@ -1098,7 +1099,6 @@ impl TuiApp {
         crate::report::context::report_run_inputs(
             &self.collections,
             &self.global_envs,
-            self.active_env_id,
             &flow,
             rt.report.path.as_deref(),
         )
@@ -1353,6 +1353,7 @@ impl TuiApp {
                     strings: &strings,
                     params: params.clone(),
                     sink: None,
+                    shuffle: None,
                 };
                 run_flow_raw(&flow, &dry_ctx)
             };
@@ -1403,6 +1404,7 @@ impl TuiApp {
                 strings: &strings,
                 params: params.clone(),
                 sink: Some(&sink),
+                shuffle: None,
             };
             let mut result = run_flow_raw(&flow, &ctx);
             // 3. Finalize (comparison/baseline collapse) off the raw rows, then
@@ -5282,7 +5284,7 @@ fn draw_report_source(
     // Context so the highlighter can colour the `# collection:`/`# environment:`
     // references (and `ENVS` names) by whether they currently resolve. Built
     // before any `&mut app` borrow below.
-    let ctx = super::report_highlight::HlCtx {
+    let ctx = crate::report_highlight::HlCtx {
         error_line: app.reports[idx].parse_error_line,
         collection_resolves: app
             .resolve_bound_collection(&app.reports[idx].report)
@@ -5309,7 +5311,7 @@ fn draw_report_source(
         let completion = app.report_completion(idx);
         if let Some(editor) = app.reports[idx].editor.as_ref() {
             render_editor_highlighted(f, inner, editor, th, |row, line| {
-                super::report_highlight::highlight_row(row, line, &ctx, th)
+                crate::report_highlight::highlight_row(row, line, &ctx, th)
             });
             if let Some(completion) = completion {
                 draw_editor_ghost(f, inner, editor, &completion.ghost, th);
@@ -5326,7 +5328,7 @@ fn draw_report_source(
             Style::default().fg(th.dim),
         ))]
     } else {
-        super::report_highlight::highlight_source(trimmed, &ctx, th)
+        crate::report_highlight::highlight_source(trimmed, &ctx, th)
     };
     let (inner, bar) = draw_report_panel(
         f,
@@ -5511,7 +5513,7 @@ mod export_path_tests {
 mod source_panel_tests {
     use super::*;
     use crate::i18n::Language;
-    use crate::tui::report_highlight::{HlCtx, highlight_source};
+    use crate::report_highlight::{HlCtx, highlight_source};
     use crate::tui::theme::theme;
 
     /// Item 10 (rep-blank-highlight): the read-only source panel must render one

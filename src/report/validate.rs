@@ -18,8 +18,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::flow::{
-    EnvClause, FlowNode, OverrideTarget, ParamKind, Pattern, Producer, ReportFlow, ReportStmt,
-    RoleRef, ShowField, UsingItem,
+    Element, EnvClause, FlowNode, OverrideTarget, ParamKind, Pattern, Producer, ReportFlow,
+    ReportStmt, RoleRef, ShowField, UsingItem,
 };
 use crate::i18n::{Strings, fill};
 
@@ -122,7 +122,9 @@ impl Default for Context<'_> {
 fn emits_a_column(nodes: &[FlowNode]) -> bool {
     nodes.iter().any(|n| match n {
         FlowNode::Report(_) => true,
-        FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => emits_a_column(body),
+        FlowNode::ForEach { body, .. }
+        | FlowNode::ForEnvs { body, .. }
+        | FlowNode::Graph { body, .. } => emits_a_column(body),
         _ => false,
     })
 }
@@ -132,12 +134,23 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let s = ctx.strings;
 
-    // Header: collection binding + output format.
+    // Header: collection binding + output format. A `REQUESTS` section is its
+    // own declaration — a flow that carries its requests needs no binding, and
+    // demanding one would make the single-file monitor impossible.
+    // The declaration is the section, not the requests it yielded: a malformed
+    // one must be reported as malformed, not compounded with "and you have no
+    // collection either".
+    let embedded = flow.embedded_entries();
+    let declares = flow.requests.is_some();
     match flow.header.collection() {
+        None if declares => {}
         None => diags.push(Diagnostic::error(s.diag_collection_unset)),
-        Some(c) if c.trim().is_empty() => diags.push(Diagnostic::error(s.diag_collection_unset)),
+        Some(c) if c.trim().is_empty() && !declares => {
+            diags.push(Diagnostic::error(s.diag_collection_unset))
+        }
         Some(_) => {}
     }
+    check_embedded_requests(flow, &embedded, ctx, &mut diags);
     check_collection_directives(flow, ctx, &mut diags);
     if let Some(out) = flow.header.output() {
         let out = out.trim();
@@ -269,6 +282,14 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
     let mut scopes: Vec<HashMap<String, Producer>> = vec![HashMap::new()];
     walk(&flow.nodes, ctx, &mut scopes, &mut diags);
 
+    // Step identity: every request statement has to be nameable, and a name has
+    // to identify one step within the scopes that can see it.
+    check_step_names(flow, ctx, &mut diags);
+
+    // `GRAPH` regions: what may appear inside one, where one may appear, and
+    // whether the graph it declares can be ordered at all.
+    check_regions(&flow.nodes, ctx, false, &mut diags);
+
     // Variable-availability analysis: walk the flow in execution order and
     // warn when a request references a `{{VAR}}` that is provably not defined
     // at that point. Only runs when both the base-env variable names AND the
@@ -352,26 +373,24 @@ fn nested_params<'a>(nodes: &'a [FlowNode]) -> Vec<&'a super::flow::ParamDecl> {
 }
 
 /// Judge the `ENVS` names that are written as `{{PARAM}}` rather than spelled
-/// out. Two things can be said about them without running anything: whether
-/// they name a parameter at all (nothing else is resolvable this early — an
-/// `ENVS` clause is read before the first request has run, so a capture or an
-/// assignment would be a name whose meaning depends on where the run had got
-/// to), and, once the parameters' defaults are filled in, whether what they
-/// currently mean is loaded. The second is only a warning: changing it per run
-/// is the entire point.
+/// out: once the parameters' defaults are filled in, is what the name
+/// currently means actually loaded? Only a warning — changing it per run is
+/// the entire point — and only answerable at all when every reference in the
+/// name is a parameter, since nothing else has a value to substitute here.
+///
+/// Whether the reference resolves to *anything* is a separate question, asked
+/// by `check_var_availability` where the scope at the clause is known. It used
+/// to be asked here, and answered "only a parameter will do", on the grounds
+/// that an `ENVS` clause is read before the first request has run. That was
+/// never true of the interpreter: `run_for_envs` resolves the clause when it
+/// reaches it, against everything then in scope, so a loop variable — the way
+/// `BASELINE("prod-{{region}}")` inside a `FOR` is written, and the reason
+/// role targets are resolved per visit — is perfectly resolvable.
 fn check_env_refs(flow: &ReportFlow, ctx: &Context, diags: &mut Vec<Diagnostic>) {
     let s = ctx.strings;
     let declared = flow.params();
     let defaults = super::params::effective(&declared, &Default::default());
     for name in env_ref_names(&flow.nodes) {
-        for key in crate::environment::referenced_keys(name) {
-            if !declared.iter().any(|p| p.name == key) {
-                diags.push(Diagnostic::error(fill(
-                    s.diag_env_ref_not_a_param,
-                    &[&key, name],
-                )));
-            }
-        }
         let resolved = crate::environment::substitute(name, &defaults);
         if resolved.contains("{{") {
             // Still unresolved: a required parameter with no default. What it
@@ -499,7 +518,7 @@ fn walk(
                     .unwrap()
                     .insert(name.clone(), producer.clone());
             }
-            FlowNode::Request { name, using } => {
+            FlowNode::Request { name, using, .. } | FlowNode::Cleanup { name, using, .. } => {
                 check_request_name(name, ctx, diags);
                 check_using(name, using, ctx, diags);
             }
@@ -522,6 +541,10 @@ fn walk(
                 walk(body, ctx, scopes, diags);
                 scopes.pop();
             }
+            // A region is not a scope — it holds only requests, and the names
+            // they use come from outside it. It reorders its body; it does not
+            // enclose anything.
+            FlowNode::Graph { body, .. } => walk(body, ctx, scopes, diags),
         }
     }
 }
@@ -777,6 +800,99 @@ fn split_helper<'a>(
 /// The `# collection:` directives: exactly one primary (unaliased, first), every
 /// helper aliased, aliases distinct identifiers that don't collide with a
 /// top-level virtual folder, and every declared helper actually loadable.
+/// Check a `REQUESTS` section: that the keyword bought something, that no
+/// embedded name collides, and that nothing embedded is dead weight.
+fn check_embedded_requests(
+    flow: &ReportFlow,
+    embedded: &[crate::hurl::HurlEntry],
+    ctx: &Context,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(text) = &flow.requests else {
+        return;
+    };
+    if embedded.is_empty() {
+        // A section that parsed to nothing is nearly always a malformed one,
+        // and the Hurl parser's own reason is far more useful than "no
+        // requests" on its own.
+        // Offset to the file's own numbering: the section is a slice of a
+        // `.trail`, and the `.trail` is the file the reader has open.
+        let why = crate::hurl::parse_hurl_error_from(text, flow.requests_line.max(1));
+        diags.push(Diagnostic::error(fill(
+            ctx.strings.diag_requests_section_empty,
+            &[why.as_deref().unwrap_or("")],
+        )));
+        return;
+    }
+
+    // A collision is counted against the merged title list rather than against
+    // the external collection alone, so two embedded requests sharing a name
+    // are caught by the same rule — both leave a reference meaning one of two
+    // things, which is the actual problem.
+    if let Some(titles) = ctx.request_titles {
+        for e in embedded {
+            if titles.iter().filter(|t| **t == e.title).count() > 1 {
+                diags.push(Diagnostic::error(fill(
+                    ctx.strings.diag_requests_name_collision,
+                    &[&e.title],
+                )));
+            }
+        }
+    }
+
+    // Unreferenced is a warning, not an error: "unused by this --targets
+    // selection" is ordinary, but "unused by any step" is worth saying, because
+    // an embedded request nothing calls is dead text in the one file that was
+    // supposed to be self-contained.
+    let mut called = Vec::new();
+    collect_called(&flow.nodes, &mut called);
+    let titles = ctx.request_titles.unwrap_or(&[]);
+    for e in embedded {
+        // Resolution order, not a looser guess: a call is only a use of this
+        // embedded request if it names it exactly, or if it is a path whose
+        // leaf matches *and* nothing declares that exact path. Otherwise
+        // `REQUEST folder/ping` against an external `folder/ping` would count
+        // as calling an embedded `ping` that in fact never runs.
+        let used = called.iter().any(|c| {
+            if *c == e.title {
+                return true;
+            }
+            // A helper alias is resolved *before* any title, so `helper/ping`
+            // is a call on the helper collection and says nothing about an
+            // embedded `ping` — which stays dead text, and has to still be
+            // reported as such.
+            if c.split_once('/')
+                .is_some_and(|(alias, _)| ctx.helpers.iter().any(|h| h.alias == alias))
+            {
+                return false;
+            }
+            c.rsplit('/').next() == Some(e.title.as_str()) && !titles.iter().any(|t| t == c)
+        });
+        if !used {
+            diags.push(Diagnostic::warning(fill(
+                ctx.strings.diag_requests_unreferenced,
+                &[&e.title],
+            )));
+        }
+    }
+}
+
+/// Every request name the flow calls, at any depth.
+fn collect_called(nodes: &[FlowNode], out: &mut Vec<String>) {
+    for node in nodes {
+        match node {
+            FlowNode::Request { name, .. } | FlowNode::Cleanup { name, .. } => {
+                out.push(name.clone())
+            }
+            FlowNode::Report(ReportStmt::Request { name, .. }) => out.push(name.clone()),
+            FlowNode::ForEach { body, .. }
+            | FlowNode::ForEnvs { body, .. }
+            | FlowNode::Graph { body, .. } => collect_called(body, out),
+            _ => {}
+        }
+    }
+}
+
 fn check_collection_directives(flow: &ReportFlow, ctx: &Context, diags: &mut Vec<Diagnostic>) {
     let s = ctx.strings;
     let refs = flow.header.collections();
@@ -836,6 +952,605 @@ fn check_collection_directives(flow: &ReportFlow, ctx: &Context, diags: &mut Vec
             s.diag_collection_helper_unreadable,
             &[reference, reason],
         )));
+    }
+}
+
+/// The step name a request statement contributes, and the request it names.
+///
+/// `alias` is `None` for a defaulted name, which is what tells the diagnostics
+/// apart: a clash between two written names is a different mistake from a
+/// clash between two names nobody wrote.
+struct StepUse<'a> {
+    request: &'a str,
+    alias: Option<&'a str>,
+    /// A cleanup runs when its *block* unwinds, not where it is written, which
+    /// is what makes an inner block's reference to one in an enclosing block
+    /// unsatisfiable — see the `DEPENDS` check in [`walk_step_names`].
+    is_cleanup: bool,
+}
+
+fn step_use(node: &FlowNode) -> Option<StepUse<'_>> {
+    match node {
+        FlowNode::Request { name, alias, .. } => Some(StepUse {
+            request: name,
+            alias: alias.as_deref(),
+            is_cleanup: false,
+        }),
+        FlowNode::Report(ReportStmt::Request { name, alias, .. }) => Some(StepUse {
+            request: name,
+            alias: alias.as_deref(),
+            is_cleanup: false,
+        }),
+        // A cleanup is a step: it is sent, it can be named, and `DEPENDS` and
+        // `{{step.var}}` both refer to it. Leaving it out let two steps share
+        // one identity, and let a cleanup carry a name that is not an
+        // identifier at all.
+        FlowNode::Cleanup { name, alias, .. } => Some(StepUse {
+            request: name,
+            alias: alias.as_deref(),
+            is_cleanup: true,
+        }),
+        _ => None,
+    }
+}
+
+/// Check that every step can be named, and that a name identifies one step.
+///
+/// A *step* is one execution of a request. Its name is the unit of identity —
+/// what a dependency clause refers to and what qualifies a capture reference —
+/// so it has to be an identifier, and it has to be unambiguous. `AS` supplies
+/// it; with no `AS` the request's leaf name is used, which is only viable when
+/// that leaf is already an identifier.
+///
+/// **Uniqueness is lexical, not flow-global.** A name must be unique along any
+/// one root-to-leaf path, because that is exactly the set of steps a reference
+/// can see: a statement can refer to its own body and to enclosing ones, never
+/// sideways into a sibling block. Two sibling loops may therefore each contain
+/// a `CreateSession`, or each report `AS Liveness` to pour their rows into one
+/// shared set of columns — a deliberate idiom, since a column is identified by
+/// its name rather than by which statement filled it. A flow-global rule would
+/// reject both, and would be rejecting readable, unambiguous flows to no end.
+/// Check every `GRAPH` region's shape and its graph.
+///
+/// The restrictions are v1 restrictions, all relaxable later, and all errors
+/// rather than warnings. The reason they are errors is the same one that makes
+/// the region a construct at all: a region is an assertion about ordering, and
+/// a construct whose ordering the region cannot describe — a loop, a variable
+/// assignment that later steps read, a nested region with its own promise —
+/// would silently narrow the assertion to something weaker than it reads as.
+fn check_regions(nodes: &[FlowNode], ctx: &Context, in_region: bool, diags: &mut Vec<Diagnostic>) {
+    let s = ctx.strings;
+    for node in nodes {
+        match node {
+            FlowNode::Graph { body, .. } => {
+                if in_region {
+                    diags.push(Diagnostic::error(s.diag_graph_nested.to_string()));
+                }
+                for inner in body {
+                    match inner {
+                        // A comment is not a step and orders nothing, so it is
+                        // simply carried; everything else in the body is.
+                        FlowNode::Comment(_)
+                        | FlowNode::Request { .. }
+                        | FlowNode::Report(ReportStmt::Request { .. }) => {}
+                        // Reported by the recursive walk below, which knows it
+                        // is in a region; naming it here as well would say the
+                        // same thing twice.
+                        FlowNode::Cleanup { .. } => {}
+                        FlowNode::ForEach { .. } | FlowNode::ForEnvs { .. } => {
+                            diags.push(Diagnostic::error(s.diag_graph_loop_inside.to_string()));
+                        }
+                        FlowNode::Graph { .. } => {}
+                        other => diags.push(Diagnostic::error(fill(
+                            s.diag_graph_only_requests,
+                            &[&other.label()],
+                        ))),
+                    }
+                }
+                check_regions(body, ctx, true, diags);
+                check_region_graph(body, ctx, diags);
+            }
+            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                if body.iter().any(|n| matches!(n, FlowNode::Graph { .. })) {
+                    diags.push(Diagnostic::error(s.diag_graph_in_loop.to_string()));
+                }
+                check_regions(body, ctx, in_region, diags);
+            }
+            // A cleanup is already deferred and already ordered by what it
+            // depends on, so its `DEPENDS` means something wherever it is
+            // written. Everything else needs a region.
+            FlowNode::Cleanup { .. } => {
+                if in_region {
+                    diags.push(Diagnostic::error(s.diag_cleanup_in_graph.to_string()));
+                }
+            }
+            // `DEPENDS` places a step in a graph, and there is only a graph
+            // inside a region. Written anywhere else it is not merely useless
+            // but misleading: statements already run in the order they are
+            // written, so the clause would read as a constraint while
+            // constraining nothing. That covers the `FOR` case too — a region
+            // may not appear in a loop, so a loop body is never in one.
+            other => {
+                if !in_region && !super::graph::declared_deps(other).is_empty() {
+                    diags.push(Diagnostic::error(fill(
+                        s.diag_depends_outside_graph,
+                        &[&other.label()],
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// Order the region's graph now, so a cycle or an ambiguous reference is
+/// reported when the file is opened rather than partway through a run that has
+/// already sent requests.
+fn check_region_graph(body: &[FlowNode], ctx: &Context, diags: &mut Vec<Diagnostic>) {
+    // Without a bound collection nothing is knowable about captures, so every
+    // inferred edge would be missing and the "graph" would be a list.
+    let Some(entries) = ctx.request_entries else {
+        return;
+    };
+    if let Err(errs) = super::graph::build(body, entries, ctx.helpers, ctx.strings) {
+        diags.extend(errs.into_iter().map(Diagnostic::error));
+    }
+}
+
+fn check_step_names(flow: &ReportFlow, ctx: &Context, diags: &mut Vec<Diagnostic>) {
+    let mut path: Vec<HashMap<String, StepInfo>> = vec![HashMap::new()];
+    walk_step_names(&flow.nodes, ctx, &mut path, false, diags);
+}
+
+/// What the lexical walk remembers about a step already in scope.
+struct StepInfo {
+    /// Whether the name was written with `AS`. Recorded so a clash can name the
+    /// mistake actually made: two `AS Foo`s are a duplicate the author chose,
+    /// while two bare requests with the same leaf are an accident of naming
+    /// that `AS` is the fix for.
+    written: bool,
+    /// The request this step runs, so a `{{step.var}}` reference can be checked
+    /// against the captures that request actually declares.
+    request: String,
+    /// Whether the step is a `CLEANUP`.
+    is_cleanup: bool,
+}
+
+/// The step name a use contributes, before validity is considered.
+fn step_name_of(use_: &StepUse<'_>) -> String {
+    match use_.alias {
+        Some(a) => a.to_string(),
+        None => use_
+            .request
+            .rsplit('/')
+            .next()
+            .unwrap_or(use_.request)
+            .to_string(),
+    }
+}
+
+fn walk_step_names(
+    nodes: &[FlowNode],
+    ctx: &Context,
+    path: &mut Vec<HashMap<String, StepInfo>>,
+    in_region: bool,
+    diags: &mut Vec<Diagnostic>,
+) {
+    // A cleanup is written where it belongs logically but runs at the end of
+    // its block, so every step in that block has already run by the time it
+    // sends. Checking it in written position would reject the ordinary shape —
+    // a teardown written beside the thing it tears down, above the rest of the
+    // setup — so its references are checked once the block's frame is complete.
+    let mut deferred: Vec<&FlowNode> = Vec::new();
+    for node in nodes {
+        // Outside a region, checked *before* this node's name is recorded,
+        // which is what makes a step unable to refer to itself: its captures
+        // don't exist until it has run. Inside one the names are registered up
+        // front (a reference may point forward), so the same rule has to be
+        // stated rather than fall out of the order.
+        let own = if in_region {
+            step_use(node).map(|u| step_name_of(&u))
+        } else {
+            None
+        };
+        check_hurl_side_qualified(node, ctx, path, diags);
+        if matches!(node, FlowNode::Cleanup { .. }) {
+            deferred.push(node);
+        } else {
+            check_qualified_refs(node, ctx, path, own.as_deref(), diags);
+        }
+        if in_region {
+            // Already registered by the region pass below.
+            if let FlowNode::Graph { body, .. } = node {
+                walk_step_names(body, ctx, path, true, diags);
+            }
+            continue;
+        }
+        if let Some(use_) = step_use(node) {
+            register_step(&use_, ctx, path, diags);
+        }
+        // A loop body is a new lexical frame: names inside it are visible to
+        // the body and to nothing outside it.
+        match node {
+            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                path.push(HashMap::new());
+                walk_step_names(body, ctx, path, false, diags);
+                path.pop();
+            }
+            // A region is not a lexical frame — its steps are named in the
+            // enclosing one — but its names are registered *before* its body is
+            // checked, because inside a region a reference may point at a step
+            // written below it. That is the whole difference a region makes.
+            FlowNode::Graph { body, .. } => {
+                for inner in body {
+                    if let Some(use_) = step_use(inner) {
+                        register_step(&use_, ctx, path, diags);
+                    }
+                }
+                walk_step_names(body, ctx, path, true, diags);
+            }
+            _ => {}
+        }
+    }
+    // The block's frame is complete now, so a cleanup may name anything in it.
+    let mut cleanup_deps: Vec<(String, Vec<String>)> = Vec::new();
+    for node in deferred {
+        let own = step_use(node).map(|u| step_name_of(&u));
+        check_qualified_refs(node, ctx, path, own.as_deref(), diags);
+        // A cleanup runs only if what it depends on succeeded, so a `DEPENDS`
+        // naming no step at all reads as "it didn't succeed" and the teardown
+        // is quietly skipped — a typo that leaves things behind and says
+        // nothing. The name has to exist.
+        let FlowNode::Cleanup { depends, .. } = node else {
+            continue;
+        };
+        let here = own.as_deref().unwrap_or_default();
+        cleanup_deps.push((here.to_string(), depends.clone()));
+        for dep in depends {
+            if dep == here {
+                // It can never have succeeded when it is asked, so it would
+                // always skip itself — a cycle of one, said plainly.
+                diags.push(Diagnostic::error(fill(
+                    ctx.strings.diag_graph_depends_self,
+                    &[here],
+                )));
+            } else if let Some((depth, info)) = path
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, f)| f.get(dep.as_str()).map(|info| (i, info)))
+            {
+                // A cleanup runs when its own block unwinds. An enclosing
+                // block unwinds *after* this one, so a cleanup out there
+                // cannot have succeeded by the time this one is asked — it
+                // would be skipped on every iteration, every run, with only a
+                // warning to show for it.
+                if info.is_cleanup && depth + 1 < path.len() {
+                    diags.push(Diagnostic::error(fill(
+                        ctx.strings.diag_cleanup_depends_outer,
+                        &[here, dep, dep],
+                    )));
+                }
+            } else {
+                diags.push(Diagnostic::error(fill(
+                    ctx.strings.diag_graph_depends_unknown,
+                    &[here, dep],
+                )));
+            }
+        }
+    }
+    check_cleanup_cycles(&cleanup_deps, ctx, diags);
+}
+
+/// Reject a `DEPENDS` cycle between two or more cleanups.
+///
+/// A self-dependency is caught above and says something clearer; this is for
+/// the longer ring, which has no honest execution at all: every member is
+/// waiting on another member that has not run, so each in turn reads its
+/// prerequisite as unsuccessful and skips — the whole ring is silently torn
+/// down by nobody, leaking exactly the resources it was written to reclaim.
+/// Ordering cannot break the tie, so it has to be refused before the run.
+fn check_cleanup_cycles(
+    deps: &[(String, Vec<String>)],
+    ctx: &Context,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let names: HashSet<&str> = deps.iter().map(|(n, _)| n.as_str()).collect();
+    // Kahn's algorithm over the cleanup-to-cleanup edges alone: a dependency on
+    // an ordinary step is a real edge but never part of a cleanup ring, and
+    // pulling it in here would only report the innocent step as a member.
+    let mut waiting: Vec<(&str, Vec<&str>)> = deps
+        .iter()
+        .map(|(n, d)| {
+            let edges: Vec<&str> = d
+                .iter()
+                .map(String::as_str)
+                .filter(|x| names.contains(x) && *x != n.as_str())
+                .collect();
+            (n.as_str(), edges)
+        })
+        .collect();
+    loop {
+        let Some(at) = waiting.iter().position(|(_, edges)| edges.is_empty()) else {
+            break;
+        };
+        let (done, _) = waiting.remove(at);
+        for (_, edges) in &mut waiting {
+            edges.retain(|e| *e != done);
+        }
+    }
+    if !waiting.is_empty() {
+        let stuck: Vec<&str> = waiting.iter().map(|(n, _)| *n).collect();
+        diags.push(Diagnostic::error(fill(
+            ctx.strings.diag_graph_cycle,
+            &[&stuck.join(", ")],
+        )));
+    }
+}
+
+/// The PaperTrail source text on `node` that is `{{VAR}}`-interpolated at run
+/// time, and so may carry a step-qualified capture reference.
+///
+/// Only PaperTrail's own text is collected. A `.hurl` request body is left
+/// alone deliberately: Hurl's expression grammar has no dotted path, so a
+/// qualified name can't be written there in the first place, and the request
+/// stays runnable on its own outside any flow.
+pub(super) fn interpolated_source(node: &FlowNode) -> Vec<&str> {
+    fn using(items: &[UsingItem]) -> Vec<&str> {
+        items
+            .iter()
+            .filter_map(|i| match i {
+                UsingItem::Override { value, .. } => Some(value.as_str()),
+                UsingItem::Require(_) => None,
+            })
+            .collect()
+    }
+    // A producer path is interpolated the same way and against the same map,
+    // so a dotted name written there means a step reference there too. Without
+    // this the one text `vars_for_source` substitutes that validation never
+    // looked at could carry a name that silently resolves to nothing.
+    fn producer<'p>(p: &'p Producer, out: &mut Vec<&'p str>) {
+        match p {
+            Producer::Files { dir, glob } => {
+                out.push(dir.as_str());
+                out.extend(glob.as_deref());
+            }
+            Producer::Folders { dir, glob, roles } => {
+                out.push(dir.as_str());
+                out.extend(glob.as_deref());
+                out.extend(roles.iter().map(|r| r.glob.as_str()));
+            }
+            Producer::Tuples { path } => out.push(path.as_str()),
+            // A list literal's elements are interpolated too — `expand_producer`
+            // substitutes each one — so a reference written there is as real as
+            // one in a path.
+            Producer::List(items) => {
+                for item in items {
+                    match item {
+                        Element::Scalar(v) => out.push(v.as_str()),
+                        Element::Tuple(parts) => out.extend(parts.iter().map(String::as_str)),
+                    }
+                }
+            }
+            Producer::Zip(ps) | Producer::Concat(ps) => {
+                for p in ps {
+                    producer(p, out);
+                }
+            }
+            // A named list is checked where it is declared.
+            Producer::Named(_) => {}
+        }
+    }
+    match node {
+        FlowNode::ForEach { producer: p, .. } => {
+            let mut out = Vec::new();
+            producer(p, &mut out);
+            out
+        }
+        FlowNode::ListDecl { producer: p, .. } => {
+            let mut out = Vec::new();
+            producer(p, &mut out);
+            out
+        }
+        FlowNode::Assign { value, .. } => vec![value.as_str()],
+        FlowNode::Request { using: u, .. } => using(u),
+        FlowNode::Cleanup { using: u, .. } => using(u),
+        FlowNode::Report(ReportStmt::Request { using: u, .. }) => using(u),
+        FlowNode::Report(ReportStmt::Computed { template, .. }) => vec![template.as_str()],
+        // A `FILE(…)` snapshot path is resolved like a producer path, against
+        // the same dotted-capable map, so it is an interpolation site like any
+        // other. The role *names* beside it are checked by `check_env_refs`.
+        FlowNode::ForEnvs { clause, .. } => match clause {
+            EnvClause::Plain(_) => vec![],
+            EnvClause::Roles {
+                baseline,
+                comparisons,
+                ..
+            } => baseline
+                .iter()
+                .chain(comparisons)
+                .filter_map(|r| match r {
+                    RoleRef::File(p) => Some(p.as_str()),
+                    RoleRef::Env(_) => None,
+                })
+                .collect(),
+        },
+        _ => vec![],
+    }
+}
+
+/// Catch a step-qualified name written in a *request's own* Hurl, where it
+/// cannot work: PaperTrail resolves `{{step.var}}` in its own source before the
+/// request is built, and never hands a dotted name to Hurl — whose expression
+/// grammar has no dotted path, so the placeholder is left verbatim and the run
+/// fails on an undefined variable with no hint as to why.
+///
+/// Only reported when the prefix names a step in scope. A dotted `.vars` key is
+/// legal (environment keys are not restricted to identifiers), so the mere
+/// presence of a dot proves nothing; a prefix that matches a step the author
+/// can see is what makes the intent unambiguous.
+fn check_hurl_side_qualified(
+    node: &FlowNode,
+    ctx: &Context,
+    path: &[HashMap<String, StepInfo>],
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(use_) = step_use(node) else { return };
+    let Some(entry) = resolve_entry_qualified(use_.request, ctx) else {
+        return;
+    };
+    let mut bad: Vec<String> = crate::request::entry_referenced_keys(entry)
+        .into_iter()
+        .filter(|k| {
+            k.split_once('.')
+                .is_some_and(|(step, _)| path.iter().rev().any(|f| f.contains_key(step)))
+        })
+        .collect();
+    bad.sort();
+    for key in bad {
+        diags.push(Diagnostic::error(fill(
+            ctx.strings.diag_step_ref_in_hurl,
+            &[use_.request, &key],
+        )));
+    }
+}
+
+/// Check every `{{step.var}}` written on `node` against the steps visible at
+/// this point in the walk.
+///
+/// A dotted placeholder is unambiguously a step reference: PaperTrail variable
+/// names are identifiers, so a `.` can only be the qualifier. Both halves are
+/// checked — the step has to be one that has already run in an enclosing scope,
+/// and it has to be a step whose request declares that capture — because the
+/// failure this feature exists to prevent is a value silently resolving to the
+/// wrong producer's copy.
+fn check_qualified_refs(
+    node: &FlowNode,
+    ctx: &Context,
+    path: &[HashMap<String, StepInfo>],
+    own: Option<&str>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let s = ctx.strings;
+    for text in interpolated_source(node) {
+        for key in crate::environment::referenced_keys(text) {
+            let Some((step, var)) = key.split_once('.') else {
+                continue;
+            };
+            // A step's own captures don't exist until it has run. Outside a
+            // region that falls out of the walk order; inside one the names are
+            // registered up front, so it has to be said explicitly.
+            if own == Some(step) {
+                diags.push(Diagnostic::error(fill(
+                    s.diag_step_ref_unknown,
+                    &[&key, step],
+                )));
+                continue;
+            }
+            let Some((depth, info)) = path
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, f)| f.get(step).map(|info| (i, info)))
+            else {
+                diags.push(Diagnostic::error(fill(
+                    s.diag_step_ref_unknown,
+                    &[&key, step],
+                )));
+                continue;
+            };
+            // Reading a capture is a dependency as surely as naming one, so
+            // the rules that govern `DEPENDS` on a cleanup govern this too —
+            // otherwise the same mistake written as a value slips through,
+            // makes no edge at run time, and puts the literal `{{…}}` on the
+            // wire without a word said.
+            if info.is_cleanup {
+                if !matches!(node, FlowNode::Cleanup { .. }) {
+                    diags.push(Diagnostic::error(fill(
+                        s.diag_step_ref_cleanup,
+                        &[&key, step],
+                    )));
+                    continue;
+                }
+                // An enclosing block unwinds after this one, so a cleanup out
+                // there cannot have run by the time this value is needed.
+                if depth + 1 < path.len() {
+                    let here = own.unwrap_or(step);
+                    diags.push(Diagnostic::error(fill(
+                        s.diag_cleanup_depends_outer,
+                        &[here, step, step],
+                    )));
+                    continue;
+                }
+            }
+            // Unbound collection: the request's captures aren't knowable, so
+            // the second half of the check is skipped rather than guessed at.
+            if ctx.request_entries.is_none() {
+                continue;
+            }
+            let Some(entry) = resolve_entry_qualified(&info.request, ctx) else {
+                continue; // unresolvable request — already reported
+            };
+            let known = entry
+                .captures
+                .iter()
+                .chain(entry.generators.iter())
+                .any(|(n, _)| n == var);
+            if !known {
+                diags.push(Diagnostic::error(fill(
+                    s.diag_step_ref_no_capture,
+                    &[step, &info.request, var],
+                )));
+            }
+        }
+    }
+}
+
+/// Validate one step's name and record it in the innermost frame.
+fn register_step(
+    use_: &StepUse<'_>,
+    ctx: &Context,
+    path: &mut [HashMap<String, StepInfo>],
+    diags: &mut Vec<Diagnostic>,
+) {
+    let s = ctx.strings;
+    let name = match use_.alias {
+        Some(a) => {
+            if !super::parser::is_ident(a) {
+                diags.push(Diagnostic::error(fill(s.diag_step_name_invalid, &[a])));
+                return;
+            }
+            a
+        }
+        None => {
+            let leaf = use_.request.rsplit('/').next().unwrap_or(use_.request);
+            if !super::parser::is_ident(leaf) {
+                diags.push(Diagnostic::error(fill(
+                    s.diag_step_name_not_identifier,
+                    &[use_.request],
+                )));
+                return;
+            }
+            leaf
+        }
+    };
+    // `written` records how the *existing* name got there, so the message
+    // names the mistake actually made.
+    if let Some(prev) = path.iter().find_map(|f| f.get(name)) {
+        let msg = if prev.written || use_.alias.is_some() {
+            fill(s.diag_step_name_duplicate, &[name, "2"])
+        } else {
+            fill(s.diag_step_name_ambiguous, &[use_.request, "2"])
+        };
+        diags.push(Diagnostic::error(msg));
+    } else {
+        path.last_mut().unwrap().insert(
+            name.to_string(),
+            StepInfo {
+                written: use_.alias.is_some(),
+                request: use_.request.to_string(),
+                is_cleanup: use_.is_cleanup,
+            },
+        );
     }
 }
 
@@ -1294,6 +2009,15 @@ fn check_var_availability(
                 warn_if_vars_undefined(name, ctx, defined, diags);
                 add_entry_captures(name, ctx, defined);
             }
+            // A cleanup is checked where it is written even though it runs at
+            // the end of its block, so a variable defined *after* it can warn
+            // when it would in fact be available. That is the conservative
+            // direction for a warning, and a teardown written above the setup
+            // it tears down is worth a second look anyway. Its own captures are
+            // not threaded forward: nothing runs after a teardown to read them.
+            FlowNode::Cleanup { name, .. } => {
+                warn_if_vars_undefined(name, ctx, defined, diags);
+            }
             // A REPORT statement — only the REQUEST form sends HTTP.
             FlowNode::Report(stmt) => {
                 if let ReportStmt::Request { name, .. } = stmt {
@@ -1332,7 +2056,15 @@ fn check_var_availability(
             // inside the body regardless of which env is active. If the loaded
             // env variable names are unknown (`all_env_var_names` is None) we
             // skip the body entirely to stay conservative.
-            FlowNode::ForEnvs { var, body, .. } => {
+            FlowNode::ForEnvs {
+                var, body, clause, ..
+            } => {
+                // The clause itself is read in *this* scope, not the body's:
+                // `BASELINE("prod-{{region}}")` is resolved afresh on every
+                // visit against whatever is bound where the loop is written.
+                // Anything in scope will do — a parameter, a loop variable, an
+                // assignment, a capture from a step above.
+                warn_if_env_names_undefined(clause, ctx, defined, diags);
                 let mut inner = defined.clone();
                 inner.insert(var.clone());
                 if let Some(env_vars) = ctx.all_env_var_names {
@@ -1342,7 +2074,84 @@ fn check_var_availability(
                 // If all_env_var_names is None, skip the body — we can't know
                 // what the environment will provide, so no warnings here.
             }
+            // A region reorders its body, so "written earlier" no longer means
+            // "runs earlier": a step may legitimately read a capture from a
+            // step written below it. Every capture the region produces is
+            // therefore made available to all of it before the walk, and the
+            // question of whether a particular step may see a particular
+            // capture is left to the graph itself, which alone knows ancestry.
+            //
+            // They stay in `defined` afterwards: the region's closing barrier
+            // means everything in it has run by the time anything after it
+            // does.
+            FlowNode::Graph { body, .. } => {
+                for node in body {
+                    if let Some(name) = step_request_name(node) {
+                        add_entry_captures(name, ctx, defined);
+                    }
+                }
+                check_var_availability(body, ctx, defined, diags);
+            }
         }
+    }
+}
+
+/// Warn for every `{{VAR}}` in an `ENVS` clause's environment names that
+/// nothing in scope at the clause can answer.
+///
+/// Conservative in the same way as `warn_if_vars_undefined`: when the loaded
+/// environments' variable names are unknown the check is skipped entirely,
+/// because an environment may itself supply the name and a false warning about
+/// a working report is worse than a missed one. A `FILE(…)` role is a path
+/// rather than an environment and is left to the snapshot checks.
+fn warn_if_env_names_undefined(
+    clause: &EnvClause,
+    ctx: &Context,
+    defined: &HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(env_vars) = ctx.all_env_var_names else {
+        return;
+    };
+    let names: Vec<&String> = match clause {
+        EnvClause::Plain(names) => names.iter().collect(),
+        EnvClause::Roles {
+            baseline,
+            comparisons,
+            ..
+        } => baseline
+            .iter()
+            .chain(comparisons.iter())
+            .filter_map(|r| match r {
+                RoleRef::Env(n) => Some(n),
+                RoleRef::File(_) => None,
+            })
+            .collect(),
+    };
+    for name in names {
+        let mut keys: Vec<String> = crate::environment::referenced_keys(name)
+            .into_iter()
+            .collect();
+        // Sorted for the same reason `warn_if_vars_undefined` sorts: the panel
+        // is rebuilt often and a set's order is not stable between builds.
+        keys.sort();
+        for key in keys {
+            if !defined.contains(&key) && !env_vars.iter().any(|v| *v == key) {
+                diags.push(Diagnostic::warning(fill(
+                    ctx.strings.diag_env_ref_not_in_scope,
+                    &[&key, name],
+                )));
+            }
+        }
+    }
+}
+
+/// The request a step node sends, for the node kinds that send one.
+fn step_request_name(node: &FlowNode) -> Option<&str> {
+    match node {
+        FlowNode::Request { name, .. } => Some(name),
+        FlowNode::Report(ReportStmt::Request { name, .. }) => Some(name),
+        _ => None,
     }
 }
 
@@ -1374,6 +2183,423 @@ mod tests {
             ..Default::default()
         };
         validate(&flow, &ctx)
+    }
+
+    /// Diagnostics for a flow with a `REQUESTS` section, with the title list
+    /// assembled the way [`super::super::context::bound_entries`] assembles it
+    /// at run time: the external collection's entries, then the embedded ones.
+    /// Building it any other way would test a context that never occurs.
+    fn diags_embedded(src: &str, external: &[crate::hurl::HurlEntry]) -> Vec<Diagnostic> {
+        let flow = parse_flow(src).expect("test source should parse");
+        let mut entries = external.to_vec();
+        entries.extend(flow.embedded_entries());
+        let titles: Vec<String> = entries.iter().map(|e| e.title.clone()).collect();
+        let ctx = Context {
+            request_titles: Some(&titles),
+            request_entries: Some(&entries),
+            ..Default::default()
+        };
+        validate(&flow, &ctx)
+    }
+
+    #[test]
+    fn a_flow_that_embeds_its_requests_needs_no_collection() {
+        // The single-file monitor. The section's presence is the declaration,
+        // so demanding a `# collection:` as well would make it impossible.
+        let diags = diags_embedded(
+            "# name: solo\n\nREPORT REQUEST ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n",
+            &[],
+        );
+        let errs: Vec<&str> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn a_helper_qualified_call_does_not_count_as_using_an_embedded_request() {
+        // A helper alias resolves before any title, so `helper/ping` runs the
+        // helper's request and says nothing about the embedded `ping` — which
+        // is dead text in the one file that was supposed to be self-contained,
+        // and has to still be reported as such.
+        let flow = parse_flow(
+            "# collection: c\n\nREPORT REQUEST helper/ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n",
+        )
+        .expect("test source should parse");
+        let entries = flow.embedded_entries();
+        let titles: Vec<String> = entries.iter().map(|e| e.title.clone()).collect();
+        let helpers = [crate::report::run::HelperCollection {
+            alias: "helper".into(),
+            entries: vec![capturing_entry("ping", &[])],
+        }];
+        let ctx = Context {
+            request_titles: Some(&titles),
+            request_entries: Some(&entries),
+            helpers: &helpers,
+            ..Default::default()
+        };
+        let diags = validate(&flow, &ctx);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("ping")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_embedded_name_may_not_collide_with_an_external_one() {
+        let diags = diags_embedded(
+            "# collection: c\n\nREPORT REQUEST ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n",
+            &[capturing_entry("ping", &[])],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("ping")),
+            "a reference would mean either of two requests: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_embedded_request_nothing_calls_is_a_warning_not_an_error() {
+        let diags = diags_embedded(
+            "# name: solo\n\nREPORT REQUEST ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n\n# spare\nGET https://x/spare\n",
+            &[],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("spare")),
+            "{diags:?}"
+        );
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("spare")),
+            "unused is normal enough not to fail the file: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_requests_section_that_declares_nothing_is_an_error() {
+        // The keyword bought nothing, which is nearly always a malformed
+        // section rather than a deliberately empty one.
+        let diags = diags_embedded("# name: solo\n\nREQUESTS\nnot hurl at all\n", &[]);
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Error),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_section_is_reported_as_malformed_not_as_a_missing_collection() {
+        // The declaration is the keyword, not the requests it yielded. Telling
+        // an author who wrote a `REQUESTS` section that they have no collection
+        // buries the one thing they need to know: why their Hurl didn't parse.
+        let diags = diags_embedded("# name: solo\n\nREQUESTS\nnot hurl at all\n", &[]);
+        let errs: Vec<&str> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(
+            errs.iter().any(|m| m.contains("REQUESTS")),
+            "the malformed section must be named: {errs:?}"
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|m| *m == Strings::english().diag_collection_unset),
+            "and it must not also be accused of having no collection: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_hurl_error_in_the_section_counts_lines_from_the_file() {
+        // The section is a slice of a `.trail`, and the `.trail` is the only
+        // file the reader has open — a line number counted from the section
+        // sends them to the wrong place in it.
+        let diags = diags_embedded(
+            "# name: solo\n# out: csv\n\nREQUESTS\nnot hurl at all\n",
+            &[],
+        );
+        let msg = diags
+            .iter()
+            .find(|d| d.severity == Severity::Error)
+            .map(|d| d.message.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("line 5"),
+            "the bad line is file line 5, not section line 1: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_call_that_resolves_elsewhere_does_not_excuse_an_embedded_request() {
+        // `folder/ping` names an external request exactly, so it is not a use
+        // of the embedded `ping`, which never runs and should be reported.
+        let diags = diags_embedded(
+            "# collection: c\n\nREPORT REQUEST folder/ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n",
+            &[capturing_entry("folder/ping", &[])],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("ping")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_call_still_reaches_an_embedded_request_by_its_leaf_name() {
+        // The other half of the same rule: with nothing declaring the exact
+        // path, a leaf match is how the call resolves, so it is a use.
+        let diags = diags_embedded(
+            "# name: solo\n\nREPORT REQUEST folder/ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n",
+            &[],
+        );
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("never called")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_is_a_step_and_may_not_share_another_steps_name() {
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST a AS same\nCLEANUP b AS same\n",
+            &[capturing_entry("a", &[]), capturing_entry("b", &[])],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("same")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_may_name_a_step_written_below_it() {
+        // It runs at the end of its block, so the ordinary shape — a teardown
+        // written beside the thing it tears down, above the rest of the setup —
+        // must not be rejected.
+        let diags = diags_with_entries(
+            "# collection: c\n\nCLEANUP teardown USING(url = \"{{create.sid}}\")\nREQUEST create\n",
+            &[
+                capturing_entry("create", &["sid"]),
+                capturing_entry("teardown", &[]),
+            ],
+        );
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_depending_on_nothing_that_exists_is_refused() {
+        // Unchecked, the missing name reads as "it didn't succeed" and the
+        // teardown is quietly skipped — a typo that leaves things behind and
+        // says nothing about it.
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST a\nCLEANUP teardown DEPENDS ghost\n",
+            &[capturing_entry("a", &[]), capturing_entry("teardown", &[])],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("ghost")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn two_cleanups_that_depend_on_each_other_are_refused() {
+        // A ring has no honest execution: each member waits on another that has
+        // not run, so each in turn reads its prerequisite as unsuccessful and
+        // skips itself. Every resource the ring covers leaks, silently — and
+        // ordering cannot break the tie, so it has to be refused up front.
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST setup\n\
+             CLEANUP purge_a DEPENDS setup, purge_b\n\
+             CLEANUP purge_b DEPENDS setup, purge_a\n",
+            &[
+                capturing_entry("setup", &[]),
+                capturing_entry("purge_a", &[]),
+                capturing_entry("purge_b", &[]),
+            ],
+        );
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("purge_a")
+                && d.message.contains("purge_b")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_may_not_depend_on_one_in_an_enclosing_block() {
+        // The enclosing block unwinds after the inner one, so the outer cleanup
+        // has not run when the inner one is asked whether it may. Accepted, it
+        // was skipped on every iteration of every run, saying only "didn't
+        // succeed" — the quietly-skipped teardown this check exists to prevent.
+        let diags = diags_with_entries(
+            "# collection: c\n\nCLEANUP outer\n\
+             FOR X IN [\"a\"]\n    REQUEST create\n    CLEANUP inner DEPENDS outer\nEND\n",
+            &[
+                capturing_entry("outer", &[]),
+                capturing_entry("create", &[]),
+                capturing_entry("inner", &[]),
+            ],
+        );
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("inner")
+                && d.message.contains("outer")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_may_not_read_a_capture_from_one_in_an_enclosing_block() {
+        // The same mistake written as a value instead of a clause. It made no
+        // edge at run time, was not skipped, and put the literal
+        // `{{outer.token}}` on the wire without a word said.
+        let diags = diags_with_entries(
+            "# collection: c\n\nCLEANUP outer\n\
+             FOR X IN [\"a\"]\n    REQUEST create\n    CLEANUP inner USING(query.t = \"{{outer.token}}\")\nEND\n",
+            &[
+                capturing_entry("outer", &["token"]),
+                capturing_entry("create", &[]),
+                capturing_entry("inner", &[]),
+            ],
+        );
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("inner")
+                && d.message.contains("outer")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_step_may_not_read_a_cleanups_capture() {
+        // Teardown runs after every step in its block, so the value does not
+        // exist yet when the step is sent — there is no ordering that would
+        // make this work, whichever way round the two are written.
+        let diags = diags_with_entries(
+            "# collection: c\n\nCLEANUP purge\nREQUEST use USING(query.t = \"{{purge.token}}\")\n",
+            &[
+                capturing_entry("purge", &["token"]),
+                capturing_entry("use", &[]),
+            ],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("purge.token")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_may_read_a_sibling_cleanups_capture() {
+        // The boundary of the rule above: same block, and the runner orders the
+        // two on exactly this reference.
+        let diags = diags_with_entries(
+            "# collection: c\n\nCLEANUP make\nCLEANUP purge USING(query.t = \"{{make.token}}\")\n",
+            &[
+                capturing_entry("make", &["token"]),
+                capturing_entry("purge", &[]),
+            ],
+        );
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("make")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_path_is_checked_for_step_references_like_any_other() {
+        // A FILE(…) role is resolved like a producer path, against the same
+        // dotted-capable map — so it is an interpolation site, and a reference
+        // to a step that does not exist has to be caught before the run.
+        let diags = diags_with_entries(
+            "# collection: c\n\nFOR T IN ENVS BASELINE(FILE(\"{{nosuch.sid}}.baseline\")), COMPARISON(\"eu\")\n    REPORT T AS S\nEND\n",
+            &[capturing_entry("create", &["sid"])],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("nosuch")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_may_depend_on_one_in_its_own_block() {
+        // The boundary: same block, same unwinding, so the ordering is real and
+        // the edge is exactly what DEPENDS between cleanups is for.
+        let diags = diags_with_entries(
+            "# collection: c\n\nFOR X IN [\"a\"]\n    REQUEST create\n\
+             CLEANUP first\n    CLEANUP second DEPENDS first\nEND\n",
+            &[
+                capturing_entry("create", &[]),
+                capturing_entry("first", &[]),
+                capturing_entry("second", &[]),
+            ],
+        );
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn cleanups_in_a_chain_are_not_a_cycle() {
+        // The boundary of the rule above: a chain is exactly what `DEPENDS`
+        // between cleanups is for, and rejecting it would take the feature away.
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST setup\n\
+             CLEANUP purge_a DEPENDS setup\n\
+             CLEANUP purge_b DEPENDS purge_a\n",
+            &[
+                capturing_entry("setup", &[]),
+                capturing_entry("purge_a", &[]),
+                capturing_entry("purge_b", &[]),
+            ],
+        );
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_name_in_a_requests_own_hurl_is_refused() {
+        // PaperTrail resolves `{{step.var}}` in its own source and never hands
+        // a dotted name to Hurl, which has no dotted path — so left in the
+        // request it fails at run time on an undefined variable, with nothing
+        // to say why.
+        let mut consumer = capturing_entry("consumer", &[]);
+        consumer.url = "http://x/{{login.token}}".into();
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST auth AS login\nREQUEST consumer\n",
+            &[capturing_entry("auth", &["token"]), consumer],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("login.token")),
+            "{diags:?}"
+        );
     }
 
     /// A request declaring the parameter, for the `USING` checks.
@@ -1549,18 +2775,58 @@ mod tests {
         );
     }
 
-    /// An `ENVS` clause is read before anything has run, so a name it reaches
-    /// for has to be a parameter — a capture or an assignment would mean
-    /// something different depending on where the run had got to.
+    /// An `ENVS` clause is resolved when the run reaches it, against everything
+    /// then in scope — so an assignment above it names an environment perfectly
+    /// well. Refusing anything but a parameter put every role target written
+    /// through a loop variable out of reach, which is most of what roles are
+    /// for.
     #[test]
-    fn an_environment_reference_that_isnt_a_parameter_is_refused() {
+    fn an_environment_named_by_something_in_scope_is_accepted() {
         let errs = errors_for(
             "# collection: c\nTARGET_ENV = \"staging\"\n\
              FOR T IN ENVS \"{{TARGET_ENV}}\"\n    REPORT REQUEST r\nEND\n",
         );
         assert!(
-            errs.iter().any(|e| e.contains("TARGET_ENV")),
-            "says which name and that it needs declaring: {errs:?}"
+            !errs.iter().any(|e| e.contains("TARGET_ENV")),
+            "an assignment binds it: {errs:?}"
+        );
+
+        let errs = errors_for(
+            "# collection: c\nFOR R IN [\"eu\", \"us\"]\n    \
+             FOR T IN ENVS BASELINE(\"prod-{{R}}\"), COMPARISON(\"stg-{{R}}\")\n        \
+             REPORT REQUEST r\n    END\nEND\n",
+        );
+        assert!(errs.is_empty(), "a loop variable binds it too: {errs:?}");
+    }
+
+    /// It is still worth saying when nothing at all could answer the reference
+    /// — but as a warning, and only where the scope is fully known, because an
+    /// environment may supply the name itself.
+    #[test]
+    fn an_environment_named_by_nothing_in_scope_is_a_warning() {
+        let entries = [test_entry("r", &[], &[])];
+        let warns: Vec<String> = {
+            let flow = parse_flow(
+                "# collection: c\nFOR T IN ENVS \"{{TARGET_ENV}}\"\n    REPORT REQUEST r\nEND\n",
+            )
+            .expect("test source should parse");
+            let titles = ["r".to_string()];
+            let ctx = Context {
+                request_titles: Some(&titles),
+                base_var_names: Some(&[]),
+                all_env_var_names: Some(&[]),
+                request_entries: Some(&entries),
+                ..Default::default()
+            };
+            validate(&flow, &ctx)
+                .into_iter()
+                .filter(|d| d.severity == Severity::Warning)
+                .map(|d| d.message)
+                .collect()
+        };
+        assert!(
+            warns.iter().any(|w| w.contains("TARGET_ENV")),
+            "says which name: {warns:?}"
         );
     }
 
@@ -2553,6 +3819,430 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("TOKEN") && w.contains("After")),
             "TOKEN IS captured by the time After runs: {warns_before:?}"
+        );
+    }
+    // ---- Step identity -----------------------------------------------------
+
+    /// Only the errors, as text — step-name checks need no collection context.
+    fn step_errors(src: &str) -> Vec<String> {
+        diags_for(src, None, None)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn as_names_a_plain_request_step() {
+        let src = "# collection: c\n\nREQUEST auth/session AS sess\n";
+        let flow = parse_flow(src).expect("parses");
+        assert!(matches!(
+            &flow.nodes[0],
+            FlowNode::Request { name, alias: Some(a), .. }
+                if name == "auth/session" && a == "sess"
+        ));
+        // And it round-trips, so naming a step survives an editor save.
+        assert_eq!(flow.to_text(), src);
+    }
+
+    #[test]
+    fn as_and_using_are_accepted_in_either_order_on_a_plain_request() {
+        // The clause belongs to the send and the name to the step, so neither
+        // order is obviously wrong to reach for; both normalise on save.
+        let a = parse_flow("# collection: c\n\nREQUEST up AS u USING(FILE)\n").expect("parses");
+        let b = parse_flow("# collection: c\n\nREQUEST up USING(FILE) AS u\n").expect("parses");
+        assert_eq!(a.to_text(), b.to_text());
+    }
+
+    #[test]
+    fn two_steps_in_one_body_may_not_share_a_name() {
+        // The defect this whole rule exists for: two sends collapsing into one
+        // node, so a reference to `up` cannot say which one it meant.
+        let errs = step_errors("# collection: c\n\nREQUEST up AS u\nREQUEST up AS u\n");
+        assert!(
+            errs.iter().any(|e| e.contains("'u'") && e.contains("own")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn running_one_request_twice_without_as_is_ambiguous() {
+        let errs = step_errors("# collection: c\n\nREQUEST up\nREQUEST up\n");
+        assert!(
+            errs.iter().any(|e| e.contains("'up'") && e.contains("AS")),
+            "{errs:?}"
+        );
+        // Naming them resolves it.
+        assert!(step_errors("# collection: c\n\nREQUEST up AS a\nREQUEST up AS b\n").is_empty());
+    }
+
+    #[test]
+    fn sibling_blocks_may_reuse_a_step_name() {
+        // `liveness.trail` does exactly this: two sibling loops each create a
+        // session and each report `AS Liveness`, deliberately, so both halves
+        // pour into one set of columns. Nothing in either block can refer to
+        // the other, so neither name is ambiguous and a flow-global uniqueness
+        // rule would reject a working, readable flow.
+        let src = concat!(
+            "# collection: c\n\n",
+            "FOR A IN FILES \"x\"\n",
+            "    REQUEST CreateSession\n",
+            "    REPORT REQUEST result AS Liveness\n",
+            "END\n",
+            "FOR B IN FILES \"y\"\n",
+            "    REQUEST CreateSession\n",
+            "    REPORT REQUEST result AS Liveness\n",
+            "END\n",
+        );
+        assert_eq!(step_errors(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_nested_block_may_not_shadow_an_enclosing_step_name() {
+        // Unlike siblings, a body *can* see its ancestors, so reusing the name
+        // there really would be ambiguous.
+        let src = concat!(
+            "# collection: c\n\n",
+            "REQUEST setup AS s\n",
+            "FOR A IN FILES \"x\"\n",
+            "    REQUEST other AS s\n",
+            "END\n",
+        );
+        assert!(!step_errors(src).is_empty());
+    }
+
+    #[test]
+    fn a_step_name_must_be_an_identifier() {
+        let errs = step_errors("# collection: c\n\nREQUEST up AS \"43_result\"\n");
+        assert!(errs.iter().any(|e| e.contains("43_result")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_request_whose_leaf_is_not_an_identifier_must_be_named() {
+        // Imported names routinely start with a digit; PaperTrail identifiers
+        // may not, so such a request cannot name its own step.
+        let errs = step_errors("# collection: c\n\nREQUEST \"folder/43_result\"\n");
+        assert!(errs.iter().any(|e| e.contains("43_result")), "{errs:?}");
+        // Naming it is the fix.
+        assert!(step_errors("# collection: c\n\nREQUEST \"folder/43_result\" AS v43\n").is_empty());
+    }
+
+    #[test]
+    fn a_path_like_request_names_its_step_from_the_leaf() {
+        // The leaf is an identifier even though the full name is not, so no
+        // `AS` is needed — and a second, differently-pathed request with the
+        // same leaf is then the ambiguous case.
+        assert!(step_errors("# collection: c\n\nREQUEST \"a/b/session\"\n").is_empty());
+        assert!(
+            !step_errors("# collection: c\n\nREQUEST \"a/session\"\nREQUEST \"b/session\"\n")
+                .is_empty()
+        );
+    }
+
+    // ---- Qualified capture references --------------------------------------
+
+    /// A request that captures `captures` under `title`.
+    fn capturing_entry(title: &str, captures: &[&str]) -> crate::hurl::HurlEntry {
+        crate::hurl::HurlEntry {
+            title: title.into(),
+            method: "POST".into(),
+            url: "http://x".into(),
+            captures: captures
+                .iter()
+                .map(|c| ((*c).to_string(), "jsonpath \"$.t\"".to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn ref_errors(src: &str, entries: &[crate::hurl::HurlEntry]) -> Vec<String> {
+        diags_with_entries(src, entries)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn a_qualified_reference_resolves_to_the_named_step() {
+        // The motivating case: two steps both capture `token`, and the flat
+        // name would silently mean whichever ran last. Qualifying says which.
+        let entries = [capturing_entry("login", &["token"]), {
+            let mut e = capturing_entry("api", &[]);
+            e.title = "api".into();
+            e
+        }];
+        let src = concat!(
+            "# collection: c\n\n",
+            "REQUEST login AS first\n",
+            "REQUEST login AS second\n",
+            "REQUEST api USING(header.Authorization = \"{{second.token}}\")\n",
+        );
+        assert_eq!(ref_errors(src, &entries), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_qualified_reference_to_an_unknown_step_is_an_error() {
+        let entries = [capturing_entry("login", &["token"])];
+        let src = "# collection: c\n\nREQUEST login USING(header.X = \"{{nope.token}}\")\n";
+        let errs = ref_errors(src, &entries);
+        assert!(errs.iter().any(|e| e.contains("nope")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_step_cannot_reference_its_own_captures() {
+        // They don't exist until it has run, so this is always a mistake —
+        // and it reads plausibly enough to be worth catching.
+        let entries = [capturing_entry("login", &["token"])];
+        let src = "# collection: c\n\nREQUEST login AS me USING(header.X = \"{{me.token}}\")\n";
+        let errs = ref_errors(src, &entries);
+        assert!(errs.iter().any(|e| e.contains("me")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_qualified_reference_to_a_value_the_step_does_not_capture_is_an_error() {
+        let entries = [
+            capturing_entry("login", &["token"]),
+            capturing_entry("api", &[]),
+        ];
+        let src = concat!(
+            "# collection: c\n\n",
+            "REQUEST login AS first\n",
+            "REQUEST api USING(header.X = \"{{first.session}}\")\n",
+        );
+        let errs = ref_errors(src, &entries);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("session") && e.contains("first")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_reference_cannot_reach_sideways_into_a_sibling_block() {
+        // Sibling scopes are exactly why uniqueness is lexical; the same rule
+        // has to govern what a reference can see, or the two disagree.
+        let entries = [
+            capturing_entry("login", &["token"]),
+            capturing_entry("api", &[]),
+        ];
+        let src = concat!(
+            "# collection: c\n\n",
+            "FOR A IN FILES \"x\"\n",
+            "    REQUEST login AS first\n",
+            "END\n",
+            "FOR B IN FILES \"y\"\n",
+            "    REQUEST api USING(header.X = \"{{first.token}}\")\n",
+            "END\n",
+        );
+        let errs = ref_errors(src, &entries);
+        assert!(errs.iter().any(|e| e.contains("first")), "{errs:?}");
+    }
+
+    #[test]
+    fn an_enclosing_step_is_visible_from_inside_a_block() {
+        let entries = [
+            capturing_entry("login", &["token"]),
+            capturing_entry("api", &[]),
+        ];
+        let src = concat!(
+            "# collection: c\n\n",
+            "REQUEST login AS first\n",
+            "FOR A IN FILES \"x\"\n",
+            "    REQUEST api USING(header.X = \"{{first.token}}\")\n",
+            "END\n",
+        );
+        assert_eq!(ref_errors(src, &entries), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_undotted_reference_is_not_treated_as_a_step_reference() {
+        // Ordinary variables outnumber qualified ones by a long way; the check
+        // must not fire on them.
+        let entries = [capturing_entry("api", &[])];
+        let src =
+            "# collection: c\n\nBASE = \"http://x\"\nREQUEST api USING(header.X = \"{{BASE}}\")\n";
+        assert_eq!(ref_errors(src, &entries), Vec::<String>::new());
+    }
+
+    // ---- GRAPH regions -----------------------------------------------------
+
+    #[test]
+    fn a_region_may_hold_only_requests_and_comments() {
+        let errs = step_errors(concat!(
+            "# collection: c\n\n",
+            "GRAPH\n",
+            "    # a note\n",
+            "    REQUEST a\n",
+            "    REPORT REQUEST b\n",
+            "END\n",
+        ));
+        assert_eq!(errs, Vec::<String>::new());
+
+        // An assignment inside a region has no place in the order: later steps
+        // read it, but it is not a step, so nothing can depend on it.
+        let errs = step_errors("# collection: c\n\nGRAPH\n    X = \"1\"\n    REQUEST a\nEND\n");
+        assert!(errs.iter().any(|e| e.contains("GRAPH")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_region_and_a_loop_may_not_contain_one_another() {
+        let in_loop = step_errors(concat!(
+            "# collection: c\n\n",
+            "FOR F IN FILES \"x\"\n",
+            "    GRAPH\n",
+            "        REQUEST a\n",
+            "    END\n",
+            "END\n",
+        ));
+        assert!(!in_loop.is_empty(), "a region inside a loop");
+        let loop_in = step_errors(concat!(
+            "# collection: c\n\n",
+            "GRAPH\n",
+            "    FOR F IN FILES \"x\"\n",
+            "        REQUEST a\n",
+            "    END\n",
+            "END\n",
+        ));
+        assert!(!loop_in.is_empty(), "a loop inside a region");
+    }
+
+    #[test]
+    fn a_region_may_not_contain_another_region() {
+        let errs = step_errors(concat!(
+            "# collection: c\n\n",
+            "GRAPH\n",
+            "    GRAPH\n",
+            "        REQUEST a\n",
+            "    END\n",
+            "END\n",
+        ));
+        assert!(!errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn a_reference_inside_a_region_may_point_forward() {
+        // Outside a region this is an unknown step, because nothing below has
+        // run yet. Inside one, order is computed, so it is ordinary.
+        let entries = [
+            capturing_entry("login", &["token"]),
+            capturing_entry("api", &[]),
+        ];
+        let forward = concat!(
+            "# collection: c\n\n",
+            "GRAPH\n",
+            "    REQUEST api USING(header.X = \"{{login.token}}\")\n",
+            "    REQUEST login\n",
+            "END\n",
+        );
+        assert_eq!(ref_errors(forward, &entries), Vec::<String>::new());
+        // The same two statements outside a region are not reorderable, so the
+        // reference really is to something that hasn't happened.
+        let flat = concat!(
+            "# collection: c\n\n",
+            "REQUEST api USING(header.X = \"{{login.token}}\")\n",
+            "REQUEST login\n",
+        );
+        assert!(!ref_errors(flat, &entries).is_empty());
+    }
+
+    #[test]
+    fn a_step_in_a_region_still_cannot_reference_itself() {
+        let entries = [capturing_entry("login", &["token"])];
+        let errs = ref_errors(
+            "# collection: c\n\nGRAPH\n    REQUEST login AS me USING(header.X = \"{{me.token}}\")\nEND\n",
+            &entries,
+        );
+        assert!(errs.iter().any(|e| e.contains("me")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_cycle_in_a_region_is_reported_when_the_report_is_opened() {
+        // Not partway through a run that has already sent requests.
+        let mut a = capturing_entry("a", &["x"]);
+        a.url = "http://x/{{y}}".into();
+        let mut b = capturing_entry("b", &["y"]);
+        b.url = "http://x/{{x}}".into();
+        let errs = ref_errors(
+            "# collection: c\n\nGRAPH\n    REQUEST a\n    REQUEST b\nEND\n",
+            &[a, b],
+        );
+        assert!(errs.iter().any(|e| e.contains("cycle")), "{errs:?}");
+    }
+
+    #[test]
+    fn depends_on_a_name_no_step_carries_is_an_error() {
+        let errs = ref_errors(
+            "# collection: c\n\nGRAPH\n    REQUEST a\n    REQUEST b DEPENDS nope\nEND\n",
+            &[capturing_entry("a", &[]), capturing_entry("b", &[])],
+        );
+        assert!(errs.iter().any(|e| e.contains("nope")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_step_may_not_depend_on_itself() {
+        let errs = ref_errors(
+            "# collection: c\n\nGRAPH\n    REQUEST a AS one DEPENDS one\nEND\n",
+            &[capturing_entry("a", &[])],
+        );
+        assert!(!errs.is_empty(), "a self-dependency must be rejected");
+    }
+
+    #[test]
+    fn depends_outside_a_region_is_an_error() {
+        // Outside a GRAPH the written order *is* the order, so a dependency
+        // has nothing to reorder and would quietly mean nothing.
+        let errs = ref_errors(
+            "# collection: c\n\nREQUEST a AS one\nREQUEST b DEPENDS one\n",
+            &[capturing_entry("a", &[]), capturing_entry("b", &[])],
+        );
+        assert!(
+            !errs.is_empty(),
+            "DEPENDS outside a region must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_may_not_live_inside_a_region() {
+        let errs = ref_errors(
+            "# collection: c\n\nGRAPH\n    REQUEST a\n    CLEANUP b\nEND\n",
+            &[capturing_entry("a", &[]), capturing_entry("b", &[])],
+        );
+        assert!(
+            !errs.is_empty(),
+            "a CLEANUP inside a GRAPH must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_outside_a_region_may_declare_dependencies() {
+        let errs = ref_errors(
+            "# collection: c\n\nREQUEST a AS one\nCLEANUP b DEPENDS one\n",
+            &[capturing_entry("a", &[]), capturing_entry("b", &[])],
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn a_step_name_survives_the_report_toggle_both_ways() {
+        // `AS` is identity, not a reporting option, so upgrading a REQUEST to a
+        // REPORT REQUEST (and back) must not silently rename the step.
+        use crate::report::edit::{DetachWhich, Modifier, attach_to_node, detach_from_node};
+        let mut node = FlowNode::Request {
+            name: "up".into(),
+            alias: Some("u".into()),
+            depends: Vec::new(),
+            using: Vec::new(),
+        };
+        assert!(attach_to_node(&mut node, Modifier::Report));
+        assert!(
+            matches!(&node, FlowNode::Report(ReportStmt::Request { alias: Some(a), .. }) if a == "u"),
+            "{node:?}"
+        );
+        detach_from_node(&mut node, DetachWhich::Report);
+        assert!(
+            matches!(&node, FlowNode::Request { alias: Some(a), .. } if a == "u"),
+            "{node:?}"
         );
     }
 }

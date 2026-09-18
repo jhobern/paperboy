@@ -47,9 +47,9 @@ pub(crate) struct GitSaveWizard {
     /// The shared state machine. The GUI drives the same one, so the two
     /// front-ends cannot disagree about how a save behaves.
     pub(crate) flow: SaveFlow,
-    /// A snapshot of the collection's effective environment (linked, or
-    /// active-global) taken when the wizard opened — used to build the pushed
-    /// `.vars` and to know whether to offer the step at all.
+    /// A snapshot of the collection's effective environment (its tab's) taken
+    /// when the wizard opened — used to build the pushed `.vars` and to know
+    /// whether to offer the step at all.
     pub(crate) env: Option<Environment>,
     pub(crate) url: Editor,
     pub(crate) token: Editor,

@@ -37,8 +37,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use crate::environment::substitute;
 use crate::hurl::HurlEntry;
@@ -49,7 +49,7 @@ use super::flow::{
     Binder, Element, EnvClause, FlowNode, OverrideTarget, ParallelSpec, Pattern, Producer,
     ReportFlow, ReportStmt, ResponseFmt, RoleBinding, RoleRef, ShowField, UsingItem, WithItem,
 };
-use super::model::{ReportResult, ReportRow, Trend, Verdict};
+use super::model::{ReportResult, ReportRow, RowRole, Trend, Verdict};
 use super::producers::{self, ProducerItem};
 
 /// Engine defaults for the `PRELUDE_*` settings (overridable per flow/scope by a
@@ -109,8 +109,10 @@ impl EntryRunner for DryRunner {
 
     fn run(&self, base: &HurlEntry, _vars: &HashMap<String, String>) -> RunOutput {
         RunOutput {
+            generated: Default::default(),
             entries: vec![EntryOutcome {
                 entry_index: 0,
+                superseded: false,
                 method: base.method.clone(),
                 url: base.url.clone(),
                 status: 0,
@@ -198,6 +200,10 @@ pub struct RunContext<'a> {
     /// collect-at-the-end run (CSV export, dry run, tests); `Some` when a
     /// front-end wants each row as it completes to fill a live grid.
     pub sink: Option<&'a RowSink<'a>>,
+    /// Seed for the `GRAPH` ready-set shuffle, or `None` for the default
+    /// earliest-written tie-break. See [`schedule_graph`]: a region *claims*
+    /// its edge set is complete, and shuffling is how that claim is falsified.
+    pub shuffle: Option<u64>,
 }
 
 /// A helper collection loaded for a report, under the alias its requests are
@@ -257,6 +263,15 @@ pub fn resolve_title<'a>(entries: &'a [HurlEntry], name: &str) -> Option<&'a Hur
 /// or the declaration's own default. The map an `ENVS` clause's names are
 /// resolved through outside the run itself (see
 /// [`compare::comparison_roles_with`](super::compare::comparison_roles_with)).
+/// Record one `ENVS` role resolution, keeping first-seen order and never a
+/// duplicate — see [`ReportResult::role_targets`].
+fn note_role(out: &mut HashMap<String, Vec<String>>, written: String, got: String) {
+    let seen = out.entry(written).or_default();
+    if !seen.contains(&got) {
+        seen.push(got);
+    }
+}
+
 fn effective_params(flow: &ReportFlow, ctx: &RunContext) -> super::params::ParamValues {
     super::params::effective(&flow.params(), &ctx.params)
 }
@@ -280,9 +295,13 @@ pub fn run_flow(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
 /// updates) and only collapse at the end.
 pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
     let mut ex = Exec::new(ctx);
-    ex.baseline_show = super::compare::comparison_roles_with(flow, &effective_params(flow, ctx))
-        .map(|r| r.baseline_show)
-        .unwrap_or_default();
+    // Only `baseline_show` is wanted here, and it is a list of field names: no
+    // role target is read, so there is nothing for the run's answers to correct
+    // — and none exist yet, since this is the call that starts the run.
+    ex.baseline_show =
+        super::compare::comparison_roles_with(flow, &effective_params(flow, ctx), &HashMap::new())
+            .map(|r| r.baseline_show)
+            .unwrap_or_default();
     let rows = ex.exec_block(&flow.nodes);
     // The table-wide no-match marker is the effective top-level
     // `PRELUDE_NO_MATCH_MARKER` (scoped assigns are popped after the run, so the
@@ -295,9 +314,12 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         .unwrap_or_else(|| DEFAULT_NO_MATCH.to_string());
     ReportResult {
         rows,
+        role_targets: ex.role_targets,
         column_order: ex.column_order,
         no_match_marker,
         errors: ex.errors,
+        skipped: ex.skipped,
+        warnings: ex.warnings,
         timing_columns: ex.timing_columns.into_iter().collect(),
         column_stats: flow.column_stats(),
         column_images: flow.column_images(),
@@ -327,7 +349,11 @@ pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) 
         .resolved_columns(&flow.header)
         .iter()
         .any(|c| c.truth.is_some());
-    if let Some(roles) = super::compare::comparison_roles_with(flow, &effective_params(flow, ctx)) {
+    if let Some(roles) = super::compare::comparison_roles_with(
+        flow,
+        &effective_params(flow, ctx),
+        &result.role_targets,
+    ) {
         super::compare::apply(result, &roles);
     } else if let Some(rel) = flow
         .header
@@ -521,8 +547,29 @@ struct Exec<'a> {
     /// Forward capture chain (values captured by requests, threaded to later
     /// requests). Highest precedence in [`Exec::vars_for`].
     captures: HashMap<String, String>,
+    /// The same captures, kept per *step* so a reference can say which step it
+    /// meant. `captures` above is flat and last-writer-wins, which is exactly
+    /// the ambiguity `{{step.var}}` exists to resolve: two steps that both
+    /// capture `token` leave only one of them visible under the bare name.
+    ///
+    /// Qualified names never reach Hurl — `{{a.b}}` is not valid Hurl syntax —
+    /// so this feeds [`Exec::vars_for_source`] only, which substitutes
+    /// PaperTrail's own text.
+    step_captures: HashMap<String, crate::report::produced::Produced>,
+    /// Which step wrote the value currently standing in `captures` under each
+    /// name. The flat chain is last-*writer*-wins, and a request that failed
+    /// its status or an assertion can still have captured — Hurl reports both —
+    /// so "who owns this value" cannot be re-derived afterwards from
+    /// `step_ok`. A `CLEANUP` reading a flat name has to be ordered against,
+    /// and gated on, the step whose value it will actually be handed; guessing
+    /// the latest *successful* capturer instead let a teardown be authorised by
+    /// one step and then sent with a different, failed step's identifier.
+    capture_owner: HashMap<String, String>,
     /// In-scope `FILES`/list loop-variable *values* in binding order — the row
-    /// key (the `ENVS`/`TARGET` axis is deliberately excluded).
+    /// key. A role-bearing `ENVS` axis is deliberately excluded: it is the
+    /// comparison axis, and baseline and candidate have to agree on the key to
+    /// be paired. A plain `ENVS "a","b"` list assigns no roles and is keyed
+    /// like any other loop.
     key_parts: Vec<String>,
     /// The **structural path** to the current position: one `(node index in its
     /// block, iteration index)` pair per enclosing loop. Stable and unique per
@@ -532,6 +579,13 @@ struct Exec<'a> {
     path: Vec<(usize, usize)>,
     /// The current `ENVS` target (environment name), if inside an `ENVS` loop.
     target: Option<String>,
+    /// The role the current `ENVS` target was given, if its clause assigned
+    /// one. A role belongs to a position in one comparison, not to the
+    /// environment's name — see [`ReportRow::role`].
+    role: RowRole,
+    /// Which comparison that role is a position in — see
+    /// [`ReportRow::comparison`].
+    comparison: Option<String>,
     /// The current `ENVS` target's variables, layered above pinned/global.
     target_env: Option<HashMap<String, String>>,
     /// Cells produced by REPORT statements in *enclosing* blocks (before this
@@ -550,6 +604,35 @@ struct Exec<'a> {
     /// Non-fatal problems (unresolved request, transport failure, …). Every
     /// issue still leaves a row.
     errors: Vec<String>,
+    /// Steps not run because a dependency did not succeed — see
+    /// [`ReportResult::skipped`].
+    skipped: Vec<String>,
+    /// Problems that must not change the verdict — see
+    /// [`ReportResult::warnings`].
+    warnings: Vec<String>,
+    /// What each `ENVS` role's written target resolved to — see
+    /// [`ReportResult::role_targets`]. An output accumulator, not state: it
+    /// travels back out of a fork, never into one.
+    role_targets: HashMap<String, Vec<String>>,
+    /// Step names in the order they ran, so a teardown can be ordered against
+    /// the setup it mirrors.
+    step_order: Vec<String>,
+    /// The request each step ran, so a dependency can be worked out from the
+    /// captures that request *declares*.
+    ///
+    /// Declared, not observed: a request that failed captured nothing, which is
+    /// precisely the moment a teardown needs to know it depended on it. Reading
+    /// the runtime capture map instead would make the edge disappear exactly
+    /// when it matters and run the cleanup against a resource that was never
+    /// created.
+    step_request: HashMap<String, String>,
+    /// Whether each step that has run so far succeeded, by step name.
+    ///
+    /// Kept as execution state rather than output because it is read *during*
+    /// the run: it is what tells a region whether a step's dependencies held,
+    /// and what tells a `CLEANUP` whether the thing it exists to tear down was
+    /// ever built.
+    step_ok: HashMap<String, bool>,
     /// Field names from the flow's `ENVS BASELINE(…) SHOW(…)` clause. These
     /// count as explicitly-shown fields for *every* request in the run, because
     /// the finalize-phase copy that produces `baseline.<alias>.<field>` can only
@@ -571,9 +654,16 @@ struct ExecState {
     scopes: Vec<HashMap<String, String>>,
     lists: HashMap<String, Producer>,
     captures: HashMap<String, String>,
+    step_captures: HashMap<String, crate::report::produced::Produced>,
+    capture_owner: HashMap<String, String>,
+    step_ok: HashMap<String, bool>,
+    step_order: Vec<String>,
+    step_request: HashMap<String, String>,
     key_parts: Vec<String>,
     path: Vec<(usize, usize)>,
     target: Option<String>,
+    role: RowRole,
+    comparison: Option<String>,
     target_env: Option<HashMap<String, String>>,
     broadcast: HashMap<String, String>,
     baseline_show: Vec<String>,
@@ -583,9 +673,518 @@ struct ExecState {
 /// iteration order after a (possibly parallel) loop.
 struct IterOut {
     rows: Vec<ReportRow>,
+    /// See [`ReportResult::role_targets`]: an `ENVS` loop nested in another
+    /// loop resolves its roles on the fork, so the answer has to travel back
+    /// with the rows it tagged.
+    role_targets: HashMap<String, Vec<String>>,
     columns: Vec<String>,
     timing_columns: Vec<String>,
     errors: Vec<String>,
+    skipped: Vec<String>,
+    warnings: Vec<String>,
+}
+
+/// What one step of a `GRAPH` region produced, collected from the forked
+/// [`Exec`] that ran it so the region can be merged back in plan order however
+/// many workers were used.
+struct StepOut {
+    /// The step's own captures, kept out of the shared chain so the next step
+    /// can be handed a chain assembled from its ancestors alone.
+    /// A region step runs on a fork, so whatever does not travel back out
+    /// here is thrown away with it — and a `CLEANUP` for a region step is
+    /// written in the *enclosing* block, which is where it would be missed.
+    /// Provenance rode in a second field for one release and was dropped on
+    /// exactly this path; carried inside the values, it cannot be.
+    produced: crate::report::produced::Produced,
+    ok: bool,
+    /// Set when the step was never sent because something it depends on didn't
+    /// succeed, as opposed to sent and failed. Both are `ok: false`; only this
+    /// one is a *skip*.
+    was_skipped: bool,
+    /// The request the step ran, so a later `CLEANUP` can work out what it
+    /// depended on from the captures that request declares.
+    request: String,
+    cells: HashMap<String, String>,
+    columns: Vec<String>,
+    timing_columns: Vec<String>,
+    errors: Vec<String>,
+    warnings: Vec<String>,
+}
+
+/// The mutable half of the region scheduler, behind one lock.
+struct Sched {
+    /// How many dependencies each step is still waiting on.
+    waiting: Vec<usize>,
+    /// Steps whose dependencies have all been decided, kept sorted by written
+    /// position so the default tie-break is "earliest written".
+    ready: Vec<usize>,
+    /// `None` until the step has been decided; `false` for failed *or* skipped.
+    ok: Vec<Option<bool>>,
+    out: Vec<Option<StepOut>>,
+    /// Steps dispatched but not yet finished. The region is done when the ready
+    /// set is empty *and* nothing is in flight — an empty ready set on its own
+    /// only means the remaining steps are still waiting on a worker.
+    running: usize,
+    rng: u64,
+    /// Whether the tie-break is random at all. Kept beside the state rather
+    /// than inferred from it: `0` is a legal seed to ask for and must not read
+    /// as "off".
+    rng_on: bool,
+}
+
+/// Run a region's steps, up to `degree` at once, taking each the moment its
+/// dependencies are decided.
+///
+/// Not wave-at-a-time: waves are how the plan is *explained*, not how it runs.
+/// Holding a ready step back because a sibling in its wave is slow would make
+/// the region as slow as the sum of its slowest members per depth, which is the
+/// cost the feature exists to avoid.
+///
+/// `seed` turns on the falsification mode from 07 §6.4. A `GRAPH` is a *claim*
+/// that the declared and inferred edges are the complete set, and that claim
+/// cannot be verified — but it can be falsified. With the earliest-written
+/// tie-break a missing edge is masked forever, because written order silently
+/// supplies the ordering the graph forgot. Picking randomly among the ready set
+/// turns that latent hazard into a failure, and seeding it makes the failure
+/// reproducible rather than intermittent.
+/// Reorder cleanups so that one naming another runs after it, keeping the
+/// given order as the tie-break.
+///
+/// `planned` arrives in reverse-dependency order, which is right for the
+/// ordinary create-then-destroy shape but says nothing about cleanups that
+/// depend on each other: none of them has run, so none has a position in
+/// `step_order` to be deep against. This is a Kahn sort over just those edges,
+/// always taking the ready cleanup that came earliest in the incoming order —
+/// so a flow with no cleanup-to-cleanup dependency comes out exactly as it went
+/// in.
+///
+/// Returns the cyclic remainder alongside the order. Validation refuses a cycle
+/// written with `DEPENDS`, but an edge can also be *inferred* from one cleanup
+/// reading another's capture, and those are not knowable before the run — so
+/// the ring has to be caught here too. It is left in the order it arrived and
+/// reported, because a ring that quietly skips itself leaks every resource it
+/// covers while the run still reads as green.
+/// Why a cleanup waits on a step, and therefore what counts as that step
+/// having delivered.
+///
+/// The distinction exists because a step has two kinds of output and they are
+/// worth different things to a teardown. It is not a refinement of the
+/// ordering — the two gate the same edge — only of the question asked at
+/// dispatch.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum DepGate {
+    /// The value came off the wire, so it is only worth anything if the step
+    /// succeeded. A request that failed its status or an assertion captured
+    /// nothing, and the name then falls through to whatever older value was
+    /// standing in the chain — which is somebody else's live resource.
+    Succeeded,
+    /// The named value was computed by the step's `# [Gen]` block, *before* the
+    /// request left, so it is known whatever the server went on to say. The
+    /// gate therefore asks the weaker and truer question: did this step
+    /// actually produce this value?
+    ///
+    /// Weaker on purpose. A client-minted id is the id the teardown wants
+    /// whether or not the create came back 500 — the server may well have made
+    /// the resource before erroring — and deleting an id we minted ourselves
+    /// is either a delete of our own resource or a harmless 404. Inheriting the
+    /// capture rule here would skip the teardown over a value that was never in
+    /// doubt, leaking exactly the resource it exists to reclaim.
+    ///
+    /// Still a gate, not a free pass. A step that never ran, or whose `[Gen]`
+    /// block failed to evaluate (in which case the send is refused outright and
+    /// nothing is generated), produced no value — and a teardown dispatched
+    /// then would carry a stale environment value of the same name, which is
+    /// the one outcome worth refusing.
+    Produced(String),
+}
+
+/// One step a cleanup waits on, and the gate that step has to pass.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct CleanupDep {
+    step: String,
+    gate: DepGate,
+}
+
+type PlannedCleanup<'a> = (usize, Option<usize>, &'a FlowNode, String, Vec<String>);
+fn order_cleanups(
+    planned: Vec<PlannedCleanup<'_>>,
+) -> (Vec<PlannedCleanup<'_>>, Vec<String>, Vec<String>) {
+    let index: HashMap<&str, usize> = planned
+        .iter()
+        .enumerate()
+        .map(|(i, (_, _, _, step, _))| (step.as_str(), i))
+        .collect();
+    let n = planned.len();
+    let mut waiting = vec![0usize; n];
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, (_, _, _, _, deps)) in planned.iter().enumerate() {
+        for d in deps {
+            if let Some(&j) = index.get(d.as_str())
+                && j != i
+            {
+                succ[j].push(i);
+                waiting[i] += 1;
+            }
+        }
+    }
+    let mut done = vec![false; n];
+    let mut out_idx: Vec<usize> = Vec::with_capacity(n);
+    let mut cyclic: Vec<String> = Vec::new();
+    let mut stalled: Vec<String> = Vec::new();
+    while out_idx.len() < n {
+        let Some(next) = (0..n).find(|&i| !done[i] && waiting[i] == 0) else {
+            // A cycle: emit what is left in the order it arrived. The
+            // leftovers are the ring *and* everything downstream of it, so
+            // name only the members themselves — a cleanup that merely depends
+            // on a ring member is well-formed, and telling its author to go
+            // break a cycle it is not part of sends them to the wrong line.
+            //
+            // "In a ring" means the node can be reached from itself. Peeling
+            // off the leftovers that have no successor is not the same test: it
+            // keeps a node that sits *between* two rings, which has a successor
+            // throughout and is in neither.
+            let stuck: Vec<usize> = (0..n).filter(|&i| !done[i]).collect();
+            let reaches_itself = |from: usize| {
+                let mut seen = vec![false; n];
+                let mut stack = succ[from].clone();
+                while let Some(k) = stack.pop() {
+                    if k == from {
+                        return true;
+                    }
+                    if !done[k] && !seen[k] {
+                        seen[k] = true;
+                        stack.extend(succ[k].iter().copied());
+                    }
+                }
+                false
+            };
+            cyclic.extend(
+                stuck
+                    .iter()
+                    .filter(|&&i| reaches_itself(i))
+                    .map(|&i| planned[i].3.clone()),
+            );
+            // Every leftover, not just the members. Kahn only stalls on a node
+            // still waiting on another leftover, so following those edges
+            // backwards through a finite set always reaches a ring: each one of
+            // these depends, transitively, on a cleanup that has been refused,
+            // and so cannot run either. Reporting only the members left the
+            // rest to be dispatched in arrival order — before the very steps
+            // they follow.
+            stalled.extend(stuck.iter().map(|&i| planned[i].3.clone()));
+            out_idx.extend((0..n).filter(|&i| !done[i]));
+            break;
+        };
+        done[next] = true;
+        out_idx.push(next);
+        for &k in &succ[next] {
+            waiting[k] -= 1;
+        }
+    }
+    let mut slots: Vec<Option<PlannedCleanup<'_>>> = planned.into_iter().map(Some).collect();
+    let ordered = out_idx
+        .into_iter()
+        .filter_map(|i| slots[i].take())
+        .collect();
+    (ordered, cyclic, stalled)
+}
+
+/// Decrements the in-flight count and wakes the sleepers if the worker holding
+/// it unwinds. See the comment at its only construction site.
+struct InFlight<'s> {
+    sched: &'s Mutex<Sched>,
+    idle: &'s Condvar,
+    armed: bool,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The panic happened in the step, which holds no lock, so this mutex is
+        // unpoisoned in practice; `if let Ok` rather than `unwrap` only because
+        // panicking inside a `Drop` during unwind aborts the process, and a
+        // miscounted region is still better than that.
+        if let Ok(mut s) = self.sched.lock() {
+            s.running -= 1;
+        }
+        self.idle.notify_all();
+    }
+}
+
+fn schedule_graph<'a>(
+    ctx: &'a RunContext<'a>,
+    plan: &super::graph::Plan,
+    body: &[FlowNode],
+    base: &ExecState,
+    degree: usize,
+    seed: Option<u64>,
+) -> Vec<Option<StepOut>> {
+    let n = plan.steps.len();
+    // Deduplicated: a step may be named by `DEPENDS` *and* be reachable by an
+    // inferred data edge, and counting that pair twice would leave the
+    // dependent waiting on an arrival that can only happen once.
+    let mut seen = std::collections::HashSet::new();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut waiting = vec![0usize; n];
+    for e in &plan.edges {
+        if seen.insert((e.from, e.to)) {
+            succ[e.from].push(e.to);
+            waiting[e.to] += 1;
+        }
+    }
+    let ready: Vec<usize> = (0..n).filter(|&i| waiting[i] == 0).collect();
+
+    let sched = Mutex::new(Sched {
+        waiting,
+        ready,
+        ok: vec![None; n],
+        out: (0..n).map(|_| None).collect(),
+        running: 0,
+        // Zero is the one state a xorshift generator cannot leave, so a `0`
+        // seed would silently mean "no shuffle at all" — the opposite of what
+        // was asked for.
+        rng: seed.unwrap_or(0) | 1,
+        rng_on: seed.is_some(),
+    });
+    let idle = Condvar::new();
+
+    let work = || {
+        loop {
+            // Claim a step, resolving any skips along the way, or find that the
+            // region is finished. Both decisions need the lock, and building
+            // the step's view of the world does too (it reads what its
+            // ancestors produced), so it is all done here and the request
+            // itself is sent with the lock released.
+            let claimed = {
+                let mut s = sched.lock().unwrap();
+                loop {
+                    if let Some(pos) = pick(&mut s) {
+                        let idx = s.ready.remove(pos);
+                        if let Some(dep) = blocker(&s, plan, idx) {
+                            s.out[idx] = Some(skip_out(ctx, plan, body, idx, &dep));
+                            // A skip is decided without ever dropping the lock,
+                            // so this is the one path that can grow the ready
+                            // set with no matching wake-up: the worker simply
+                            // goes back round and claims one itself. Today that
+                            // strands nothing, because a skip always propagates
+                            // — every step it releases has this one as a
+                            // predecessor, so each is skipped in turn by the
+                            // same loop and none of them would have made a
+                            // request. Waking here anyway keeps the scheduler's
+                            // invariant local: work reaching the ready set
+                            // always wakes the sleepers, whoever put it there.
+                            if finish(&mut s, &succ, idx, false) {
+                                idle.notify_all();
+                            }
+                            continue;
+                        }
+                        let state = view_for(plan, base, &s, idx);
+                        s.running += 1;
+                        break Some((idx, state));
+                    }
+                    if s.running == 0 {
+                        break None;
+                    }
+                    s = idle.wait(s).unwrap();
+                }
+            };
+            let Some((idx, state)) = claimed else {
+                // Nothing left and nothing in flight: every worker can leave,
+                // including the ones asleep waiting for work that will never
+                // come.
+                idle.notify_all();
+                break;
+            };
+
+            // A step that panics must not leave the region counted as busy.
+            // Every other worker would then sleep on the condvar waiting for an
+            // arrival that can never come, and `thread::scope` would block
+            // joining those sleepers instead of propagating the panic — turning
+            // a crash into a hang, which is the one failure a CI job cannot
+            // diagnose.
+            let mut flight = InFlight {
+                sched: &sched,
+                idle: &idle,
+                armed: true,
+            };
+            let out = run_step(ctx, plan, body, idx, state);
+
+            let mut s = sched.lock().unwrap();
+            let ok = out.ok;
+            s.out[idx] = Some(out);
+            s.running -= 1;
+            flight.armed = false;
+            finish(&mut s, &succ, idx, ok);
+            drop(s);
+            idle.notify_all();
+        }
+    };
+
+    if degree <= 1 {
+        work();
+    } else {
+        std::thread::scope(|sc| {
+            for _ in 0..degree {
+                sc.spawn(work);
+            }
+        });
+    }
+
+    let sched = sched.into_inner().unwrap();
+    sched.out
+}
+
+/// Choose a position in the ready set, or `None` when it is empty.
+fn pick(s: &mut Sched) -> Option<usize> {
+    if s.ready.is_empty() {
+        return None;
+    }
+    if !s.rng_on {
+        return Some(0);
+    }
+    let mut x = s.rng;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    s.rng = x;
+    Some((x % s.ready.len() as u64) as usize)
+}
+
+/// The dependency that stops `idx` running, if any.
+///
+/// Only the *direct* predecessors are checked, which is enough to skip
+/// recursively: a step is claimed only once every predecessor has been decided,
+/// and a skipped one is recorded as not-succeeded like a failed one.
+fn blocker(s: &Sched, plan: &super::graph::Plan, idx: usize) -> Option<String> {
+    plan.incoming(idx)
+        .into_iter()
+        .find(|e| !s.ok[e.from].unwrap_or(false))
+        .map(|e| plan.steps[e.from].name.clone())
+}
+
+/// Record a decision and release whatever was waiting on it. Reports whether
+/// anything reached the ready set, so a caller holding the lock knows if there
+/// is now work a sleeping worker should be woken for.
+fn finish(s: &mut Sched, succ: &[Vec<usize>], idx: usize, ok: bool) -> bool {
+    s.ok[idx] = Some(ok);
+    let mut released = false;
+    for &to in &succ[idx] {
+        s.waiting[to] -= 1;
+        if s.waiting[to] == 0 {
+            // Kept sorted so "earliest written" is `ready[0]` without a scan,
+            // and so the ready set itself doesn't depend on completion order.
+            let at = s.ready.partition_point(|&i| i < to);
+            s.ready.insert(at, to);
+            released = true;
+        }
+    }
+    released
+}
+
+/// The execution state one step sees: the region's entry state plus exactly
+/// what its ancestors produced, in execution order (the flat capture map is
+/// last-writer-wins, so "last" has to mean the same thing here as it does
+/// outside a region).
+fn view_for(plan: &super::graph::Plan, base: &ExecState, s: &Sched, idx: usize) -> ExecState {
+    let mut st = base.clone();
+    for anc in plan.ancestors(idx) {
+        let Some(out) = &s.out[anc] else { continue };
+        st.step_captures
+            .insert(plan.steps[anc].name.clone(), out.produced.clone());
+        for (k, v) in out.produced.iter() {
+            st.captures.insert(k.clone(), v.clone());
+            st.capture_owner
+                .insert(k.clone(), plan.steps[anc].name.clone());
+        }
+    }
+    st
+}
+
+/// The verdict for a step that was never sent.
+fn skip_out(
+    ctx: &RunContext<'_>,
+    plan: &super::graph::Plan,
+    body: &[FlowNode],
+    idx: usize,
+    dep: &str,
+) -> StepOut {
+    let step = &plan.steps[idx];
+    let mut out = StepOut {
+        produced: crate::report::produced::Produced::default(),
+        ok: false,
+        was_skipped: true,
+        request: step.request.clone(),
+        cells: HashMap::new(),
+        columns: Vec::new(),
+        timing_columns: Vec::new(),
+        errors: Vec::new(),
+        warnings: Vec::new(),
+    };
+    // The row still gets a cell, and it says *skipped* rather than being left
+    // blank: an empty cell is indistinguishable from a request that returned
+    // nothing, and the whole point of the verdict is that the reader must not
+    // mistake this for a pass.
+    if let FlowNode::Report(ReportStmt::Request { .. }) = &body[step.written] {
+        let key = format!("{}.Error", step.name);
+        out.cells.insert(
+            key.clone(),
+            crate::i18n::fill(ctx.strings.run_step_skipped, &[dep]),
+        );
+        out.columns.push(key);
+    }
+    out
+}
+
+/// Run one step on a forked [`Exec`], so that steps running at the same time
+/// cannot see each other's captures — the visibility rule and the ordering rule
+/// are the same rule.
+fn run_step(
+    ctx: &RunContext<'_>,
+    plan: &super::graph::Plan,
+    body: &[FlowNode],
+    idx: usize,
+    state: ExecState,
+) -> StepOut {
+    let step = &plan.steps[idx];
+    let mut ex = Exec::from_state(ctx, state);
+    let mut cells = HashMap::new();
+    match &body[step.written] {
+        FlowNode::Request {
+            name, alias, using, ..
+        } => {
+            ex.run_request(name, alias.as_deref(), using);
+        }
+        FlowNode::Report(stmt) => {
+            for (k, v) in ex.eval_report(stmt) {
+                ex.note_column(&k);
+                cells.insert(k, v);
+            }
+        }
+        // Validation confines a region to requests; anything else here is a
+        // node that check let through, so skipping it is the conservative
+        // choice over guessing where it belongs in the order.
+        _ => {}
+    }
+    StepOut {
+        produced: ex
+            .step_captures
+            .get(&step.name)
+            .cloned()
+            .unwrap_or_default(),
+        // A node that ran nothing (the arm above) never records a verdict. It
+        // counts as succeeded: it cannot have failed, and treating it as a
+        // failure would skip everything written after it.
+        ok: ex.step_ok.get(&step.name).copied().unwrap_or(true),
+        was_skipped: false,
+        request: step.request.clone(),
+        cells,
+        columns: ex.column_order,
+        timing_columns: ex.timing_columns,
+        errors: ex.errors,
+        warnings: ex.warnings,
+    }
 }
 
 impl<'a> Exec<'a> {
@@ -595,14 +1194,24 @@ impl<'a> Exec<'a> {
             scopes: vec![HashMap::new()],
             lists: HashMap::new(),
             captures: HashMap::new(),
+            step_captures: HashMap::new(),
+            capture_owner: HashMap::new(),
+            step_ok: HashMap::new(),
+            step_order: Vec::new(),
+            step_request: HashMap::new(),
             key_parts: Vec::new(),
             path: Vec::new(),
             target: None,
+            role: RowRole::Unknown,
+            comparison: None,
             target_env: None,
             broadcast: HashMap::new(),
             column_order: Vec::new(),
             timing_columns: Vec::new(),
             errors: Vec::new(),
+            skipped: Vec::new(),
+            warnings: Vec::new(),
+            role_targets: HashMap::new(),
             baseline_show: Vec::new(),
         }
     }
@@ -615,9 +1224,16 @@ impl<'a> Exec<'a> {
             scopes: self.scopes.clone(),
             lists: self.lists.clone(),
             captures: self.captures.clone(),
+            step_captures: self.step_captures.clone(),
+            capture_owner: self.capture_owner.clone(),
+            step_ok: self.step_ok.clone(),
+            step_order: self.step_order.clone(),
+            step_request: self.step_request.clone(),
             key_parts: self.key_parts.clone(),
             path: self.path.clone(),
             target: self.target.clone(),
+            role: self.role,
+            comparison: self.comparison.clone(),
             target_env: self.target_env.clone(),
             broadcast: self.broadcast.clone(),
             baseline_show: self.baseline_show.clone(),
@@ -632,14 +1248,24 @@ impl<'a> Exec<'a> {
             scopes: state.scopes,
             lists: state.lists,
             captures: state.captures,
+            step_captures: state.step_captures,
+            capture_owner: state.capture_owner,
+            step_ok: state.step_ok,
+            step_order: state.step_order,
+            step_request: state.step_request,
             key_parts: state.key_parts,
             path: state.path,
             target: state.target,
+            role: state.role,
+            comparison: state.comparison,
             target_env: state.target_env,
             broadcast: state.broadcast,
             column_order: Vec::new(),
             timing_columns: Vec::new(),
             errors: Vec::new(),
+            skipped: Vec::new(),
+            warnings: Vec::new(),
+            role_targets: HashMap::new(),
             baseline_show: state.baseline_show,
         }
     }
@@ -685,8 +1311,120 @@ impl<'a> Exec<'a> {
         m
     }
 
+    /// [`Exec::vars_for`] plus the `step.var` names.
+    ///
+    /// Only for substituting **PaperTrail's own text** — `USING(…)` values,
+    /// computed columns, producer paths. Hurl never sees these: its expression
+    /// grammar has no dotted path, so `{{oauth2.token}}` inside a `.hurl` would
+    /// be a parse error rather than a lookup that misses. That asymmetry is the
+    /// whole reason qualification lives at the call site: request text stays
+    /// ordinary, standalone-runnable Hurl.
+    fn vars_for_source(&self) -> HashMap<String, String> {
+        let mut m = self.vars_for();
+        // A dotted name means one thing in PaperTrail source: step, then
+        // capture. `.vars` keys are not restricted to identifiers, so an
+        // environment could carry a flat `login.token` — and left in the map it
+        // would answer `{{login.token}}` whenever the step `login` had *not*
+        // captured a token, which is exactly when the reference must fail.
+        // Silently sending a stale credential is the worst available outcome,
+        // so the qualified namespace is kept to itself.
+        m.retain(|k, _| !k.contains('.'));
+        for (step, caps) in &self.step_captures {
+            for (k, v) in caps.iter() {
+                m.insert(format!("{step}.{k}"), v.clone());
+            }
+        }
+        m
+    }
+
+    /// Thread one request's captures forward: into the flat chain, and under
+    /// the step's own name so a later reference can disambiguate.
+    fn record_captures(&mut self, step: &str, captures: &[(String, String)]) {
+        self.record_values(
+            step,
+            captures,
+            crate::report::produced::Provenance::Captured,
+        );
+    }
+
+    fn record_values(
+        &mut self,
+        step: &str,
+        captures: &[(String, String)],
+        how: crate::report::produced::Provenance,
+    ) {
+        let own = self.step_captures.entry(step.to_string()).or_default();
+        for (k, v) in captures {
+            match how {
+                crate::report::produced::Provenance::Captured => own.record_captured(k, v),
+                crate::report::produced::Provenance::Generated => own.record_generated(k, v),
+            }
+        }
+        for (k, v) in captures {
+            self.captures.insert(k.clone(), v.clone());
+            self.capture_owner.insert(k.clone(), step.to_string());
+        }
+    }
+
+    /// Thread one request's `[Gen]` values forward, exactly where its captures
+    /// go.
+    ///
+    /// Called *before* [`record_captures`](Self::record_captures) at every
+    /// dispatch, so a request that generates a name and then captures the same
+    /// name resolves downstream to what the response said. The generated value
+    /// is the guess the request went out with; the captured one is what came
+    /// back, and the later writer has to be the one that wins — the other order
+    /// would clobber the server's canonical id with the client's placeholder.
+    ///
+    /// Recorded whether or not the send succeeded, because a `[Gen]` row is
+    /// evaluated before the request leaves: the value is a fact about what was
+    /// sent, and a teardown holding it is holding the right one even when the
+    /// send came back 500. What the failure changes is whether the *resource*
+    /// exists, which is a question about gating — see [`DepGate`].
+    fn record_generated(&mut self, step: &str, generated: &HashMap<String, String>) {
+        if generated.is_empty() {
+            return;
+        }
+        let mut pairs: Vec<(String, String)> = generated
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        // A map has no order and two names never collide within one block, but
+        // sorting keeps the recorded sequence reproducible for anything that
+        // replays it.
+        pairs.sort();
+        self.record_values(step, &pairs, crate::report::produced::Provenance::Generated);
+        // Which value answered, not which clause was written. A request may
+        // declare a `[Gen]` row *and* a capture for the same name — mint an id
+        // client-side, then read the server's canonical one back — and when the
+        // send fails the capture never fires, leaving the generated value
+        // standing as the live one. Reading the gate off the declared clauses
+        // called that a capture, required the step to have succeeded, and
+        // skipped the teardown for a resource the request may well have
+        // created.
+    }
+
+    /// Record whether a step succeeded.
+    ///
+    /// "Succeeded" is the runner's own verdict for the entry — status, asserts
+    /// and transport all satisfied — and a step that never got as far as being
+    /// sent counts as failed, because the one thing that must not follow from a
+    /// missing result is that everything downstream is safe to run.
+    fn note_step(&mut self, step: &str, request: &str, ok: bool) {
+        if self.step_ok.insert(step.to_string(), ok).is_none() {
+            self.step_order.push(step.to_string());
+        }
+        self.step_request
+            .insert(step.to_string(), request.to_string());
+    }
+
     /// Look up a single variable across the full precedence stack.
     fn lookup(&self, key: &str) -> Option<String> {
+        if let Some((step, var)) = key.split_once('.')
+            && let Some(v) = self.step_captures.get(step).and_then(|c| c.get(var))
+        {
+            return Some(v.clone());
+        }
         if let Some(v) = self.captures.get(key) {
             return Some(v.clone());
         }
@@ -749,6 +1487,10 @@ impl<'a> Exec<'a> {
         let mut own: HashMap<String, String> = HashMap::new();
         let mut child_rows: Vec<ReportRow> = Vec::new();
         let mut has_loop = false;
+        // Cleanups are collected as they are passed and run once the block is
+        // finished, so a teardown is written beside the thing it tears down
+        // rather than at the far end of the flow.
+        let mut cleanups: Vec<&FlowNode> = Vec::new();
 
         for (node_index, node) in nodes.iter().enumerate() {
             match node {
@@ -756,7 +1498,7 @@ impl<'a> Exec<'a> {
                 // them; they do nothing at run time.
                 FlowNode::Comment(_) => {}
                 FlowNode::Assign { key, value } => {
-                    let v = substitute(&unquote(value), &self.vars_for());
+                    let v = substitute(&unquote(value), &self.vars_for_source());
                     self.set_var(key, v);
                 }
                 FlowNode::ListDecl { name, producer } => {
@@ -777,14 +1519,16 @@ impl<'a> Exec<'a> {
                 FlowNode::Param(p) => {
                     match super::params::value_for(p, &self.ctx.params, self.ctx.strings) {
                         Ok(raw) => {
-                            let v = substitute(&raw, &self.vars_for());
+                            let v = substitute(&raw, &self.vars_for_source());
                             self.set_var(&p.name, v);
                         }
                         Err(e) => self.errors.push(e),
                     }
                 }
-                FlowNode::Request { name, using } => {
-                    self.run_request(name, using);
+                FlowNode::Request {
+                    name, alias, using, ..
+                } => {
+                    self.run_request(name, alias.as_deref(), using);
                 }
                 FlowNode::Report(stmt) => {
                     let cells = self.eval_report(stmt);
@@ -825,8 +1569,19 @@ impl<'a> Exec<'a> {
                         &own,
                     ));
                 }
+                // A region reorders its body and nothing else: its steps emit
+                // their cells into this block's row exactly as they would have
+                // written inline. Wrapping a sequential block in `GRAPH … END`
+                // has to be observable only through ordering, or the migration
+                // path onto the feature doesn't exist.
+                FlowNode::Graph { body, parallel, .. } => {
+                    self.run_graph(body, parallel.as_ref(), &mut own)
+                }
+                FlowNode::Cleanup { .. } => cleanups.push(node),
             }
         }
+
+        self.run_cleanups(&cleanups);
 
         if has_loop {
             for row in &mut child_rows {
@@ -838,6 +1593,381 @@ impl<'a> Exec<'a> {
         } else {
             vec![self.emit_row(own)]
         }
+    }
+
+    /// Run a block's `CLEANUP` statements, once the block has finished.
+    ///
+    /// Order is the reverse of the order the things being torn down were built:
+    /// a cleanup runs before any cleanup whose dependencies finished earlier,
+    /// which for the ordinary create-then-destroy shape unwinds the flow the
+    /// way it was wound. A cleanup that depends on nothing sorts last, because
+    /// nothing constrains it and the thing set up first is torn down last.
+    ///
+    /// A cleanup is skipped only when one of *its own* dependencies did not
+    /// succeed — never because some unrelated step failed. That is the whole
+    /// reason it is a construct rather than a trailing `REQUEST`: teardown has
+    /// to survive exactly the failures it exists to clean up after, and a
+    /// blanket "something went wrong, skip the cleanup" leaks the resource
+    /// every time.
+    fn run_cleanups(&mut self, cleanups: &[&FlowNode]) {
+        if cleanups.is_empty() {
+            return;
+        }
+        // Work out every cleanup's dependencies and position *before* running
+        // any of them. A cleanup sends a request, which records a step of its
+        // own, and a dependency set computed as we go would start seeing those
+        // — so two cleanups could end up ordered against each other by nothing
+        // more than which was resolved first.
+        //
+        // The cleanups' own step names have to be known before any dependency
+        // is worked out, too: a cleanup may read `{{other_cleanup.token}}`, and
+        // since none of them has run there is nothing in `step_ok` to recognise
+        // that prefix by. Without this the edge was silently dropped and the
+        // dependent could run first and fail substitution.
+        let siblings: Vec<(String, String)> = cleanups
+            .iter()
+            .filter_map(|node| match node {
+                FlowNode::Cleanup { name, alias, .. } => Some((
+                    alias.clone().unwrap_or_else(|| leaf(name).to_string()),
+                    name.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        let mut planned: Vec<(usize, Option<usize>, &FlowNode, String, Vec<String>)> = Vec::new();
+        for (written, node) in cleanups.iter().enumerate() {
+            let FlowNode::Cleanup {
+                name,
+                alias,
+                depends,
+                using,
+            } = node
+            else {
+                continue;
+            };
+            let step = alias.clone().unwrap_or_else(|| leaf(name).to_string());
+            // Ordering cares only about *which* steps a cleanup waits on. Which
+            // gate each one has to pass is a dispatch-time question about the
+            // value that actually arrived, and asking it here — before anything
+            // has run — could only guess.
+            let deps: Vec<String> = self
+                .cleanup_deps(name, depends, using, &step, &siblings)
+                .into_iter()
+                .map(|d| d.step)
+                .collect();
+            // How late the cleanup's latest dependency ran. `None` — it depends
+            // on nothing — sorts first here, and therefore last once reversed.
+            let depth = deps
+                .iter()
+                .filter_map(|d| self.step_order.iter().position(|s| s == d))
+                .max();
+            planned.push((written, depth, node, step, deps));
+        }
+        // Reverse-dependency order: the last thing built is the first thing
+        // torn down, which for the ordinary create-then-destroy shape unwinds
+        // the flow exactly the way it was wound.
+        planned.sort_by_key(|(written, depth, ..)| {
+            (std::cmp::Reverse(*depth), std::cmp::Reverse(*written))
+        });
+        // A cleanup may depend on another cleanup, and none of them has run
+        // yet, so `step_order` has nothing to say about their relative depth.
+        // Reverse-written order alone can then run the dependent first, which
+        // sees its prerequisite as unsuccessful and skips itself. Honour those
+        // edges explicitly, keeping the reverse order above as the tie-break so
+        // the ordinary unwinding is unchanged.
+        let cyclic;
+        let stalled;
+        (planned, cyclic, stalled) = order_cleanups(planned);
+        if !cyclic.is_empty() {
+            self.errors.push(crate::i18n::fill(
+                self.ctx.strings.run_cleanup_cycle,
+                &[&cyclic.join(", ")],
+            ));
+        }
+        // Record the verdict for everything the sort could not order before
+        // anything is dispatched, not as the loop reaches each one. When Kahn
+        // stalls the leftovers come out in arrival order, which throws away the
+        // well-formed edges *between* them — so one can be dispatched before
+        // the very cleanup it follows. Asking at that moment found no verdict
+        // written for the other yet: the reference was silently dropped,
+        // nothing gated it, and the teardown went out with `{{a.tok}}` still
+        // literal in its URL while the run called it a success. A verdict
+        // written up front is true whatever order the leftovers arrive in.
+        //
+        // All of them, not only the ring's members. A leftover is by
+        // construction downstream of a ring, so its prerequisite has been
+        // refused and it could never have run — but it is not itself part of a
+        // cycle, so it is warned about rather than named in the cycle error,
+        // which would send its author to a line that is perfectly well formed.
+        for (_, _, node, step, deps) in &planned {
+            if !stalled.contains(step) {
+                continue;
+            }
+            let FlowNode::Cleanup { name, .. } = node else {
+                continue;
+            };
+            self.skipped.push(step.clone());
+            self.note_step(step, name, false);
+            if cyclic.contains(step) {
+                continue;
+            }
+            if let Some(dep) = deps.iter().find(|d| stalled.contains(d)) {
+                self.warnings.push(crate::i18n::fill(
+                    self.ctx.strings.run_cleanup_skipped,
+                    &[step, dep],
+                ));
+            }
+        }
+
+        for (_, _, node, step, _) in planned {
+            let FlowNode::Cleanup {
+                name,
+                alias,
+                depends,
+                using,
+            } = node
+            else {
+                continue;
+            };
+            // Gate on what wrote each value *now*, not on what was expected to
+            // write it when the order was worked out. The two are different
+            // questions: ordering has to be decided before anything has run, so
+            // it can only ask which steps *declare* a name, while the gate is
+            // about the value this teardown is actually being handed — and by
+            // the time it is dispatched that is a fact, not a forecast.
+            //
+            // Deciding both statically was wrong in both directions. A sibling
+            // that was skipped writes nothing, so gating on it abandoned a
+            // resource an earlier step had really made; a sibling that ran but
+            // captured nothing vouched for a value that belonged to a step that
+            // had failed.
+            //
+            // A ring is the one shape the dispatch-time question cannot answer.
+            // Its members read one another, so whichever goes first is looking
+            // for a value nothing has written yet — and a flat name in that
+            // state falls through to whatever older step last stood in the
+            // chain, which is a live resource belonging to somebody else. The
+            // same is true of everything downstream of the ring, which is why
+            // the verdict above covers every cleanup the sort had to leave
+            // unordered, not just the members.
+            if stalled.contains(&step) {
+                continue;
+            }
+            let deps = self.cleanup_deps(name, depends, using, &step, &[]);
+            if let Some(dep) = deps.into_iter().find(|d| match &d.gate {
+                DepGate::Succeeded => !self.step_ok.get(&d.step).copied().unwrap_or(false),
+                // "Produced" is asked of the recorded value rather than of the
+                // verdict, so a failed send whose `[Gen]` block ran still
+                // satisfies it — and a step that never ran, or that generated
+                // nothing, still does not.
+                DepGate::Produced(var) => !self
+                    .step_captures
+                    .get(&d.step)
+                    .is_some_and(|c| c.contains(var)),
+            }) {
+                // Not an error. A cleanup whose subject was never created has
+                // nothing to do, and saying "failed" about it would bury the
+                // real failure under a second one caused entirely by the first.
+                self.skipped.push(step.clone());
+                self.note_step(&step, name, false);
+                self.warnings.push(crate::i18n::fill(
+                    self.ctx.strings.run_cleanup_skipped,
+                    &[&step, &dep.step],
+                ));
+                continue;
+            }
+            let before = self.errors.len();
+            self.run_request(name, alias.as_deref(), using);
+            // A failing cleanup is a warning, not an error: the requests under
+            // test already passed or failed on their own terms, and letting a
+            // leaked test resource turn a green run red would train everyone to
+            // ignore the exit code. The error it raised is moved, not copied,
+            // so it can't count twice.
+            let failed = !self.step_ok.get(&step).copied().unwrap_or(false);
+            let raised: Vec<String> = self.errors.drain(before..).collect();
+            if failed {
+                let detail = raised.into_iter().next().unwrap_or_else(|| step.clone());
+                self.warnings.push(crate::i18n::fill(
+                    self.ctx.strings.run_cleanup_failed,
+                    &[&step, &detail],
+                ));
+            }
+        }
+    }
+
+    /// The steps one `CLEANUP` depends on: whatever it names explicitly, plus
+    /// whatever its own request and `USING(…)` values read.
+    ///
+    /// Only names that are actually steps count. A reference to an ordinary
+    /// variable says nothing about ordering, and treating one as a dependency
+    /// would skip the teardown over a name that was never going to "succeed".
+    ///
+    /// A step's outputs are its response captures *and* its `# [Gen]` values —
+    /// the language lets a reference name either, so the ordering has to see
+    /// both or the two spellings of the same dependency disagree. Each returned
+    /// dependency carries the [`DepGate`] its kind earns.
+    ///
+    /// `siblings` is every cleanup in this block as `(step name, request)`,
+    /// including this one: cleanups are ordered against each other too, and
+    /// none of them has run yet, so they cannot be recognised from `step_ok`.
+    fn cleanup_deps(
+        &self,
+        name: &str,
+        depends: &[String],
+        using: &[UsingItem],
+        self_step: &str,
+        siblings: &[(String, String)],
+    ) -> Vec<CleanupDep> {
+        // An explicit `DEPENDS` is the author asking for the strong gate by
+        // hand: they named a step, not a value, and what they meant by naming
+        // it is "only if that worked".
+        let mut out: Vec<CleanupDep> = depends
+            .iter()
+            .map(|d| CleanupDep {
+                step: d.clone(),
+                gate: DepGate::Succeeded,
+            })
+            .collect();
+        // What a request declaring `var` promises about it, or `None` if it
+        // does not declare it at all. A response capture and a `[Gen]` row are
+        // both outputs of the step — validation says so, and a reference to
+        // either is legal — but they are worth different things to a teardown,
+        // so the kind travels with the dependency rather than being flattened
+        // away here.
+        let gate_for = |step: &str, request: &str, var: &str| -> Option<DepGate> {
+            let e = resolve_qualified(self.ctx.entries, self.ctx.helpers, request)?;
+            // What the run observed outranks what the source declares, because
+            // only the run knows which clause answered. A step that has not run
+            // has nothing recorded and falls through to the declarations, which
+            // is the conservative reading: the strong gate, and a teardown that
+            // is skipped rather than pointed at a resource nobody made.
+            if self
+                .step_captures
+                .get(step)
+                .is_some_and(|p| p.is_generated(var))
+            {
+                return Some(DepGate::Produced(var.to_string()));
+            }
+            if e.captures.iter().any(|(c, _)| c == var) {
+                // A request that generates a name and then captures it too is
+                // answered by the response *when the capture fires* — it is
+                // written second and wins everywhere. When it does not fire the
+                // generated value is still standing, and the check above has
+                // already said so.
+                return Some(DepGate::Succeeded);
+            }
+            if e.generators.iter().any(|(g, _)| g == var) {
+                return Some(DepGate::Produced(var.to_string()));
+            }
+            None
+        };
+        // The request a step runs, whether it has already run or is a cleanup
+        // still waiting its turn.
+        let request_of = |step: &str| -> Option<String> {
+            self.step_request.get(step).cloned().or_else(|| {
+                siblings
+                    .iter()
+                    .find(|(s, _)| s == step)
+                    .map(|(_, r)| r.clone())
+            })
+        };
+        let mut refs: Vec<String> = Vec::new();
+        if let Some(entry) = resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
+            refs.extend(crate::request::entry_referenced_keys(entry));
+        }
+        for item in using {
+            if let UsingItem::Override { value, .. } = item {
+                refs.extend(crate::environment::referenced_keys(value));
+            }
+        }
+        for r in refs {
+            // A qualified reference names its step outright; a flat one is
+            // matched against the steps that captured it.
+            match r.split_once('.') {
+                Some((step, var))
+                    if self.step_ok.contains_key(step)
+                        || siblings.iter().any(|(s, _)| s == step && s != self_step) =>
+                {
+                    // The reference names the step outright, so the only
+                    // question left is what that step promised about the
+                    // value. A step whose request cannot be resolved promised
+                    // nothing legible, and the strong gate is the safe reading.
+                    let gate = request_of(step)
+                        .and_then(|req| gate_for(step, &req, var))
+                        .unwrap_or(DepGate::Succeeded);
+                    out.push(CleanupDep {
+                        step: step.to_string(),
+                        gate,
+                    })
+                }
+                Some(_) => {}
+                None => {
+                    // A sibling cleanup that captures this name writes it
+                    // *after* every ordinary step in the block has run, so by
+                    // the time this teardown is dispatched the sibling is the
+                    // last writer and its value is the one on the wire. The
+                    // dependency has to be the step whose value actually
+                    // arrives; gating on the earlier owner instead would
+                    // authorise the teardown by one step and then point it at
+                    // another one's resource.
+                    //
+                    // That is true whether or not anything else can answer the
+                    // name. An environment value looks like a second source,
+                    // but a capture shadows the environment everywhere else in
+                    // the language and does so here too — declining the edge
+                    // to protect it only meant the ordering disagreed with the
+                    // value while the wrong resource was torn down anyway.
+                    let sibs: Vec<CleanupDep> = siblings
+                        .iter()
+                        .filter(|(s, _)| s != self_step)
+                        .filter_map(|(s, req)| {
+                            gate_for(s, req, &r).map(|gate| CleanupDep {
+                                step: s.clone(),
+                                gate,
+                            })
+                        })
+                        .collect();
+                    if !sibs.is_empty() {
+                        out.extend(sibs);
+                        continue;
+                    }
+                    // A flat reference is otherwise answered by whatever is
+                    // standing in the flat chain, so the step it depends on is
+                    // the step that *wrote* that value — recorded at the time,
+                    // because a request that failed a status or an assertion
+                    // can still have captured, and the winner is therefore not
+                    // always the latest successful one.
+                    if let Some(owner) = self.capture_owner.get(&r) {
+                        // `capture_owner` records generated values alongside
+                        // captured ones — both are things a step wrote — so
+                        // ask the owner's request which kind this was.
+                        let gate = request_of(owner)
+                            .and_then(|req| gate_for(owner, &req, &r))
+                            .unwrap_or(DepGate::Succeeded);
+                        out.push(CleanupDep {
+                            step: owner.clone(),
+                            gate,
+                        });
+                        continue;
+                    }
+                    // Nothing has written the name yet. Every step that
+                    // declares it is a candidate producer — which is what makes
+                    // a single producer that failed before capturing still skip
+                    // the cleanup: it ran, and the value it was supposed to
+                    // leave is missing.
+                    out.extend(self.step_order.iter().filter_map(|step| {
+                        let req = self.step_request.get(step)?;
+                        gate_for(step, req, &r).map(|gate| CleanupDep {
+                            step: step.clone(),
+                            gate,
+                        })
+                    }));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Build the single row for a loop-free (innermost) block: this-block's
@@ -858,6 +1988,8 @@ impl<'a> Exec<'a> {
             key: self.key_parts.clone(),
             path: self.path.clone(),
             target: self.target.clone(),
+            role: self.role,
+            comparison: self.comparison.clone(),
         };
         if let Some(sink) = self.ctx.sink {
             sink(RowEvent::Completed(&row));
@@ -870,32 +2002,42 @@ impl<'a> Exec<'a> {
     /// Send a request by name (no column emitted), threading its captures
     /// forward. Records an error (but does not abort) if the name is unresolved
     /// or the send fails.
-    fn run_request(&mut self, name: &str, using: &[UsingItem]) -> Option<EntryOutcome> {
+    fn run_request(
+        &mut self,
+        name: &str,
+        alias: Option<&str>,
+        using: &[UsingItem],
+    ) -> Option<EntryOutcome> {
+        let step = alias.unwrap_or_else(|| leaf(name)).to_string();
         let base = match resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
             Some(e) => e.clone(),
             None => {
                 self.errors
                     .push(format!("request '{name}' could not be resolved"));
+                self.note_step(&step, name, false);
                 return None;
             }
         };
-        let vars = self.vars_for();
-        let base = match self.apply_using(name, base, using, &vars) {
+        let base = match self.apply_using(name, base, using, &self.vars_for_source()) {
             Ok(base) => base,
             Err(e) => {
                 self.errors.push(e);
+                self.note_step(&step, name, false);
                 return None;
             }
         };
-        let out = self.ctx.runner.run(&base, &vars);
+        let out = self.ctx.runner.run(&base, &self.vars_for());
+        self.record_generated(&step, &out.generated);
         if let Some(err) = &out.error {
             self.errors.push(format!("{name}: {err}"));
         }
         let eo = out.entries.into_iter().next();
-        if let Some(eo) = &eo {
-            for (k, v) in &eo.captures {
-                self.captures.insert(k.clone(), v.clone());
+        match &eo {
+            Some(eo) => {
+                self.record_captures(&step, &eo.captures);
+                self.note_step(&step, name, eo.ok);
             }
+            None => self.note_step(&step, name, false),
         }
         eo
     }
@@ -963,7 +2105,7 @@ impl<'a> Exec<'a> {
                 vec![(name.clone(), self.lookup(var).unwrap_or_default())]
             }
             ReportStmt::Computed { template, name, .. } => {
-                let value = substitute(template, &self.vars_for());
+                let value = substitute(template, &self.vars_for_source());
                 vec![(name.clone(), value)]
             }
             ReportStmt::Request {
@@ -974,6 +2116,7 @@ impl<'a> Exec<'a> {
                 show,
                 hide,
                 with,
+                ..
             } => self.eval_report_request(
                 name,
                 alias.as_deref(),
@@ -1041,23 +2184,25 @@ impl<'a> Exec<'a> {
                     format!("{alias}.Error"),
                     format!("unresolved request '{name}'"),
                 ));
+                self.note_step(&alias, name, false);
                 return cells;
             }
         };
 
-        let vars = self.vars_for();
         // An unmet `USING` requirement means the request would send something
         // other than what the flow asked for, so it is not sent at all: the row
         // gets an `Error` cell instead of a plausible-looking success.
-        let base = match self.apply_using(name, base, using, &vars) {
+        let base = match self.apply_using(name, base, using, &self.vars_for_source()) {
             Ok(base) => base,
             Err(e) => {
                 self.errors.push(e.clone());
                 cells.push((format!("{alias}.Error"), e));
+                self.note_step(&alias, name, false);
                 return cells;
             }
         };
-        let out = self.ctx.runner.run(&base, &vars);
+        let out = self.ctx.runner.run(&base, &self.vars_for());
+        self.record_generated(&alias, &out.generated);
         let eo = match out.entries.into_iter().next() {
             Some(eo) => eo,
             None => {
@@ -1066,15 +2211,16 @@ impl<'a> Exec<'a> {
                     .unwrap_or_else(|| "request produced no response".into());
                 self.errors.push(format!("{name}: {err}"));
                 cells.push((format!("{alias}.Error"), err));
+                self.note_step(&alias, name, false);
                 return cells;
             }
         };
 
         // Thread real captures forward (report fields are evaluated separately
-        // and never touch the capture chain).
-        for (k, v) in &eo.captures {
-            self.captures.insert(k.clone(), v.clone());
-        }
+        // and never touch the capture chain). The alias doubles as the step
+        // name, so `{{alias.var}}` reaches exactly this statement's captures.
+        self.record_captures(&alias, &eo.captures);
+        self.note_step(&alias, name, eo.ok);
 
         // Resolve the response format: per-statement / WITH override, else the
         // prelude default.
@@ -1247,18 +2393,110 @@ impl<'a> Exec<'a> {
             let rows = sub.exec_block(body);
             IterOut {
                 rows,
+                role_targets: sub.role_targets,
                 columns: sub.column_order,
                 timing_columns: sub.timing_columns,
                 errors: sub.errors,
+                skipped: sub.skipped,
+                warnings: sub.warnings,
             }
         };
         self.run_iterations(items.len(), parallel, run_one)
     }
 
+    /// Run a `GRAPH` region: order its steps by the graph, then execute them.
+    ///
+    /// Two things distinguish this from running the body inline.
+    ///
+    /// The order is computed (see [`super::graph`]) rather than written, with
+    /// written order as the tie-break — so a region with no edges is
+    /// indistinguishable from the block it wraps.
+    ///
+    /// And each step sees only its **transitive ancestors'** captures, instead
+    /// of everything that happens to have run already. That is what converts
+    /// the data half of the author's completeness promise from a promise into a
+    /// checked property: a step that reads a value without depending on the
+    /// step that produces it now fails with an undefined variable, where
+    /// outside a region it would quietly succeed and break the first time
+    /// anything reordered.
+    fn run_graph(
+        &mut self,
+        body: &[FlowNode],
+        parallel: Option<&ParallelSpec>,
+        own: &mut HashMap<String, String>,
+    ) {
+        let plan =
+            match super::graph::build(body, self.ctx.entries, self.ctx.helpers, self.ctx.strings) {
+                Ok(p) => p,
+                Err(errs) => {
+                    // An unorderable region runs nothing. Falling back to written
+                    // order would be the one behaviour guaranteed to be wrong: the
+                    // author declared that written order is not the specification.
+                    self.errors.extend(errs);
+                    return;
+                }
+            };
+
+        let base = self.to_state();
+        // A degree is a *cap*, not an instruction: one at a time is a legal
+        // schedule for any `PARALLEL(n)`, and is what a region without one gets.
+        let degree = match parallel {
+            Some(spec) => self.parallel_degree(spec, plan.steps.len()),
+            None => 1,
+        };
+        let outs = schedule_graph(self.ctx, &plan, body, &base, degree, self.ctx.shuffle);
+
+        // Merged in `plan.order` rather than in the order the steps finished,
+        // so the report a region produces does not depend on how many workers
+        // ran it — column order, error order and last-writer-wins cells are the
+        // same at any degree, and under `--shuffle`. What varies is *execution*
+        // order, which is the only thing shuffling is meant to vary.
+        for &idx in &plan.order {
+            let step = &plan.steps[idx];
+            let Some(out) = &outs[idx] else { continue };
+            self.note_step(&step.name, &out.request, out.ok);
+            if out.was_skipped {
+                self.skipped.push(step.name.clone());
+            }
+            for c in &out.columns {
+                self.note_column(c);
+            }
+            for c in &out.timing_columns {
+                self.note_timing_column(c);
+            }
+            self.errors.extend(out.errors.iter().cloned());
+            self.warnings.extend(out.warnings.iter().cloned());
+            for (k, v) in &out.cells {
+                own.insert(k.clone(), v.clone());
+            }
+        }
+
+        // The closing barrier: everything in the region has run, so everything
+        // it captured is visible to what follows, exactly as if the block had
+        // been sequential.
+        for &idx in &plan.order {
+            let Some(out) = &outs[idx] else { continue };
+            self.step_captures
+                .insert(plan.steps[idx].name.clone(), out.produced.clone());
+            for (k, v) in out.produced.iter() {
+                self.captures.insert(k.clone(), v.clone());
+                self.capture_owner
+                    .insert(k.clone(), plan.steps[idx].name.clone());
+            }
+        }
+    }
+
     /// Run a `FOR <var> IN ENVS <clause>` loop: swap the target-env layer per
-    /// environment and run the body once each. `ENVS` is *not* part of the row
-    /// key (it is the comparison axis); baseline envs run first. Iterations are
-    /// independent and may run in parallel.
+    /// environment and run the body once each. Baseline envs run first.
+    /// Iterations are independent and may run in parallel.
+    ///
+    /// A *role* clause's axis is not part of the row key: baseline and
+    /// candidate are the same logical row seen in two places, and they can only
+    /// be paired if they agree on the key. A plain `ENVS "a","b"` list compares
+    /// nothing, so that reasoning does not reach it — it is an iteration axis
+    /// like `FILES` or a list, and leaving it out collapsed every iteration
+    /// onto one key, where a nested comparison found a single baseline standing
+    /// for the lot.
     fn run_for_envs(
         &mut self,
         node_index: usize,
@@ -1274,55 +2512,113 @@ impl<'a> Exec<'a> {
         // all-live.
         let mut live: Vec<String> = Vec::new();
         let mut files: Vec<String> = Vec::new();
+        // The side each one is being run as. A role is a position in this
+        // comparison, not a property of the name: rolling pairs make the same
+        // environment the candidate here and the baseline next time round, so
+        // the collapse cannot recover it by looking the name up in a set.
+        let mut live_roles: Vec<RowRole> = Vec::new();
+        let mut file_roles: Vec<RowRole> = Vec::new();
         // An environment (or a snapshot path) may be named through a parameter
         // — `BASELINE("{{TARGET}}")` — so the same report can be pointed at
         // another pair of stacks without being edited. Resolved against the
-        // run's parameters only, and identically in `finalize`, so the rows
-        // this loop produces carry the targets the collapse then looks for.
-        // The parameters are bound in the prelude — validation refuses a
-        // `PARAM` written any later — so by the time a loop is reached they are
-        // ordinary variables, and `finalize` reaches the same names from the
-        // declarations themselves.
-        let vars = self.vars_for();
+        // run's whole scope, and the answer is recorded in `role_targets` so
+        // the collapse looks for the same string the rows are tagged with
+        // rather than deriving a second, poorer one of its own.
+        let vars = self.vars_for_source();
         let resolve = |s: &String| crate::environment::substitute(s, &vars);
+        let mut resolved_roles: Vec<(String, String)> = Vec::new();
         match clause {
-            EnvClause::Plain(names) => live = names.iter().map(resolve).collect(),
+            EnvClause::Plain(names) => {
+                live = names.iter().map(resolve).collect();
+                live_roles = vec![RowRole::Unassigned; live.len()];
+            }
             EnvClause::Roles {
                 baseline,
                 comparisons,
                 ..
             } => {
-                for r in baseline.iter().chain(comparisons) {
+                for (r, role) in baseline
+                    .iter()
+                    .map(|r| (r, RowRole::Baseline))
+                    .chain(comparisons.iter().map(|r| (r, RowRole::Candidate)))
+                {
+                    let target = r.target().to_string();
+                    let got = resolve(&target);
+                    resolved_roles.push((target, got.clone()));
                     match r {
-                        RoleRef::Env(n) => live.push(resolve(n)),
-                        RoleRef::File(p) => files.push(resolve(p)),
+                        RoleRef::Env(_) => {
+                            live.push(got);
+                            live_roles.push(role);
+                        }
+                        RoleRef::File(_) => {
+                            files.push(got);
+                            file_roles.push(role);
+                        }
                     }
                 }
             }
+        }
+        // Hand the answers to the collapse, which cannot reach them: it derives
+        // a role's identity from the declared parameters alone, and a role
+        // named through anything else — a capture, a prelude assignment —
+        // resolves here and nowhere else. Accumulated rather than replaced,
+        // since this clause is resolved again on every visit and each answer is
+        // a real environment some rows are tagged with.
+        for (written, got) in resolved_roles {
+            note_role(&mut self.role_targets, written, got);
         }
         let mut seed = self.to_state();
         for (k, v) in inherited {
             seed.broadcast.insert(k.clone(), v.clone());
         }
         let ctx = self.ctx;
+        // A plain list assigns no roles, so nothing pairs across it and its
+        // value belongs in the key like any other loop's.
+        let keyed = matches!(clause, EnvClause::Plain(_));
+        // ...and, for the same reason, it must not displace a comparison it is
+        // written *inside*. A plain `ENVS` nested in a role-bearing one still
+        // produces rows belonging to the enclosing baseline or candidate side;
+        // overwriting the side and the target with the inner environment's name
+        // left every row `Unassigned`, and the whole comparison the report was
+        // written for simply vanished from the output.
+        let inherit = keyed && matches!(self.role, RowRole::Baseline | RowRole::Candidate);
+        // Which comparison a side belongs to. The clause's position in the
+        // tree: constant across its visits, so rolling pairs stay one
+        // comparison, and distinct from any sibling clause, whose rows would
+        // otherwise land on the same key with nothing to tell them apart.
+        let comparison = (!keyed).then(|| {
+            let mut id: Vec<String> = self.path.iter().map(|(n, _)| n.to_string()).collect();
+            id.push(node_index.to_string());
+            id.join("/")
+        });
         let run_one = |i: usize| -> IterOut {
             let name = &live[i];
             let mut sub = Exec::from_state(ctx, seed.clone());
             sub.path.push((node_index, i));
-            sub.target = Some(name.clone());
             sub.target_env = ctx.named_envs.get(name).cloned();
+            if !inherit {
+                sub.target = Some(name.clone());
+                sub.role = live_roles[i];
+                sub.comparison = comparison.clone();
+            }
             if sub.target_env.is_none() {
                 sub.errors
                     .push(format!("environment '{name}' is not loaded"));
             }
             sub.scopes.push(HashMap::new());
             sub.set_var(var, name.clone());
+            if keyed {
+                sub.key_parts.push(name.clone());
+            }
             let rows = sub.exec_block(body);
             IterOut {
                 rows,
+                role_targets: sub.role_targets,
                 columns: sub.column_order,
                 timing_columns: sub.timing_columns,
                 errors: sub.errors,
+                skipped: sub.skipped,
+                warnings: sub.warnings,
             }
         };
         let mut rows = self.run_iterations(live.len(), parallel, run_one);
@@ -1339,6 +2635,10 @@ impl<'a> Exec<'a> {
                     for (ri, br) in snapshot.rows.iter().enumerate() {
                         let mut row = br.to_row();
                         row.target = Some(rel.clone());
+                        row.role = file_roles[fi];
+                        // It stands in for a live run of this role, so it
+                        // belongs to this comparison like any other side.
+                        row.comparison = comparison.clone();
                         // A deterministic structural path (identical between the
                         // dry skeleton pass and the live run) so a streaming
                         // front-end slots the row; file roles come after the live
@@ -1415,6 +2715,13 @@ impl<'a> Exec<'a> {
                 self.note_timing_column(c);
             }
             self.errors.extend(out.errors);
+            self.skipped.extend(out.skipped);
+            self.warnings.extend(out.warnings);
+            for (written, got) in out.role_targets {
+                for one in got {
+                    note_role(&mut self.role_targets, written.clone(), one);
+                }
+            }
             rows.extend(out.rows);
         }
         rows
@@ -1543,7 +2850,7 @@ impl<'a> Exec<'a> {
 
     /// Substitute `{{var}}`s in `s` (after stripping a whole-string quote).
     fn subst_unquoted(&self, s: &str) -> String {
-        substitute(&unquote(s), &self.vars_for())
+        substitute(&unquote(s), &self.vars_for_source())
     }
 }
 
@@ -1565,7 +2872,7 @@ impl<'a> Exec<'a> {
 /// A disabled row that is targeted is re-enabled: an override says "send this
 /// value", and honouring the value while leaving the row switched off would be
 /// a null-op nobody could explain.
-fn apply_override(
+pub(super) fn apply_override(
     entry: &mut HurlEntry,
     target: &OverrideTarget,
     value: String,
@@ -1642,7 +2949,7 @@ fn apply_override(
 }
 
 /// The leaf (last `/`-segment) of a request title — the default alias.
-fn leaf(name: &str) -> &str {
+pub(super) fn leaf(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
@@ -1765,7 +3072,14 @@ fn string_arg(s: &str) -> Option<String> {
 /// dotted path within the element.
 ///
 /// Wildcards and recursive descent remain unimplemented.
-fn json_path_get(root: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
+///
+/// Shared with the `jsonpath()` generator function (see `generators::json_path`,
+/// which wraps this to say *why* a path found nothing). One implementation
+/// rather than two on purpose: the same path written in a report column and in
+/// a `[Gen]` row has to mean the same thing, and two hand-rolled walkers that
+/// agree on the easy paths and differ on the hard ones is the worst outcome
+/// available.
+pub(crate) fn json_path_get(root: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
     let rest = path.strip_prefix('$')?;
     // A filter turns one node into *many*, so the walk carries a set rather
     // than a single node. Before any filter the set is the single root, which
@@ -1911,6 +3225,11 @@ mod tests {
         raw_body: String,
         pretty_body: String,
         captures: Vec<(String, String)>,
+        /// What the request's `[Gen]` block computed for this send. Separate
+        /// from `captures` because the two are produced at different moments —
+        /// before the request leaves and after the answer arrives — and a
+        /// teardown is allowed to trust them differently.
+        generated: Vec<(String, String)>,
         headers: Vec<(String, String)>,
         asserts: Vec<(bool,)>,
         duration_ms: u64,
@@ -1935,6 +3254,9 @@ mod tests {
         active: AtomicUsize,
         max_active: AtomicUsize,
         delay_ms: u64,
+        /// A title whose request panics, standing in for anything that can
+        /// unwind inside a worker thread.
+        panic_on: Option<String>,
     }
 
     impl Fake {
@@ -1949,12 +3271,27 @@ mod tests {
                 active: AtomicUsize::new(0),
                 max_active: AtomicUsize::new(0),
                 delay_ms: 0,
+                panic_on: None,
             }
         }
         /// Add a per-call delay so overlapping (parallel) calls are observable.
         fn with_delay(mut self, ms: u64) -> Self {
             self.delay_ms = ms;
             self
+        }
+        /// Make one request panic, to exercise unwinding out of a worker.
+        fn panicking_on(mut self, title: &str) -> Self {
+            self.panic_on = Some(title.to_string());
+            self
+        }
+        /// The titles sent, in the order they were sent.
+        fn call_order(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(t, _)| t.clone())
+                .collect()
         }
         fn call_vars(&self, title: &str) -> HashMap<String, String> {
             self.calls
@@ -1987,6 +3324,9 @@ mod tests {
         fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
             let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(now, Ordering::SeqCst);
+            if self.panic_on.as_deref() == Some(base.title.as_str()) {
+                panic!("deliberate test panic in {}", base.title);
+            }
             if self.delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
             }
@@ -1998,6 +3338,7 @@ mod tests {
             let c = self.canned.get(&base.title).cloned().unwrap_or_default();
             let eo = EntryOutcome {
                 entry_index: 0,
+                superseded: false,
                 method: base.method.clone(),
                 url: base.url.clone(),
                 status: c.status,
@@ -2028,6 +3369,7 @@ mod tests {
             };
             self.active.fetch_sub(1, Ordering::SeqCst);
             RunOutput {
+                generated: c.generated.into_iter().collect(),
                 entries: vec![eo],
                 error: c.error,
             }
@@ -2079,6 +3421,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -2116,6 +3459,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             sink: None,
+            shuffle: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -2421,6 +3765,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             sink: None,
+            shuffle: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -2535,6 +3880,2097 @@ mod tests {
         // `me` has a [Reports] field (`name`), so has_declared=true and intrinsics
         // are suppressed by default — HttpStatus is not in the output.
         assert_eq!(res.rows[0].cells.get("me.HttpStatus"), None);
+    }
+
+    #[test]
+    fn a_qualified_reference_reaches_past_the_last_writer() {
+        // Two steps capture `token`; the flat chain keeps only the second, so
+        // the bare name is the *later* value. `{{first.token}}` is the way to
+        // ask for the earlier one, and it must actually reach the request.
+        let fake = Fake::new(&[
+            (
+                "login_a",
+                Canned {
+                    status: 200,
+                    captures: vec![("token".into(), "A".into())],
+                    ..Default::default()
+                },
+            ),
+            (
+                "login_b",
+                Canned {
+                    status: 200,
+                    captures: vec![("token".into(), "B".into())],
+                    ..Default::default()
+                },
+            ),
+            (
+                "api",
+                Canned {
+                    status: 200,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let entries = [
+            entry("login_a", &[]),
+            entry("login_b", &[]),
+            entry("api", &[]),
+        ];
+        let res = run(
+            concat!(
+                "REQUEST login_a AS first\n",
+                "REQUEST login_b AS second\n",
+                "REPORT REQUEST api USING(header.X-First = \"{{first.token}}\", ",
+                "header.X-Last = \"{{token}}\")\n",
+            ),
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let sent = fake.sent_entry("api").expect("api was sent");
+        let header = |k: &str| {
+            sent.headers
+                .iter()
+                .find(|h| h.key == k)
+                .map(|h| h.value.clone())
+        };
+        assert_eq!(header("X-First"), Some("A".into()));
+        assert_eq!(header("X-Last"), Some("B".into()));
+    }
+
+    #[test]
+    fn a_qualified_name_is_never_handed_to_hurl() {
+        // Hurl's expression grammar has no dotted path, so a variable *named*
+        // `first.token` in the map it receives is at best ignored and at worst
+        // a parse error. Qualification is resolved before the request is built.
+        let fake = Fake::new(&[
+            (
+                "login_a",
+                Canned {
+                    status: 200,
+                    captures: vec![("token".into(), "A".into())],
+                    ..Default::default()
+                },
+            ),
+            (
+                "api",
+                Canned {
+                    status: 200,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let entries = [entry("login_a", &[]), entry("api", &[])];
+        run(
+            "REQUEST login_a AS first\nREPORT REQUEST api\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let vars = fake.call_vars("api");
+        assert_eq!(vars.get("token"), Some(&"A".to_string()));
+        assert!(
+            vars.keys().all(|k| !k.contains('.')),
+            "dotted names leaked to the runner: {:?}",
+            vars.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ---- GRAPH regions -----------------------------------------------------
+
+    /// An entry that captures `captures` and reads `url_vars` from its URL.
+    fn graph_entry(title: &str, captures: &[&str], url_vars: &[&str]) -> HurlEntry {
+        HurlEntry {
+            title: title.into(),
+            method: "GET".into(),
+            url: format!(
+                "http://x/{}",
+                url_vars
+                    .iter()
+                    .map(|v| format!("{{{{{v}}}}}"))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            ),
+            captures: captures
+                .iter()
+                .map(|c| ((*c).to_string(), "jsonpath \"$.t\"".to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn ok(title: &str) -> (&str, Canned) {
+        (
+            title,
+            Canned {
+                status: 200,
+                captures: Vec::new(),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn ok_capturing<'a>(title: &'a str, caps: &[(&str, &str)]) -> (&'a str, Canned) {
+        (
+            title,
+            Canned {
+                status: 200,
+                captures: caps
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_cleanup_follows_the_capture_that_actually_won() {
+        // An earlier producer that failed was overwritten by a later one that
+        // captured. Treating every declared producer as required skipped the
+        // teardown on the failed one's account and leaked what the successful
+        // one created.
+        let entries = [
+            graph_entry("first", &["sid"], &[]),
+            graph_entry("second", &["sid"], &[]),
+            graph_entry("purge", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[failing("first"), ok_capturing("second", &[("sid", "B")])]);
+        run(
+            "REQUEST first AS first\nREQUEST second AS second\nCLEANUP purge\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            fake.call_order().contains(&"purge".to_string()),
+            "the teardown must still run: {:?}",
+            fake.call_order()
+        );
+        assert_eq!(
+            fake.call_vars("purge").get("sid").map(String::as_str),
+            Some("B"),
+            "and with the value it was ordered against"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_is_gated_on_whichever_step_wrote_the_value_it_gets() {
+        // Captures are recorded whether or not the request passed — Hurl
+        // reports both — so the flat chain is last-*writer*-wins, not
+        // last-successful-writer-wins. Reading it as the latter let a teardown
+        // be authorised by the step that succeeded and then sent with the
+        // identifier captured by the one that failed: the wrong resource
+        // deleted, and the right one leaked.
+        let entries = [
+            graph_entry("first", &["sid"], &[]),
+            graph_entry("second", &["sid"], &[]),
+            graph_entry("purge", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            ok_capturing("first", &[("sid", "A")]),
+            (
+                "second",
+                Canned {
+                    status: 500,
+                    error: Some("boom".into()),
+                    captures: vec![("sid".into(), "B".into())],
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let res = run(
+            "REQUEST first AS first\nREQUEST second AS second\nCLEANUP purge\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            !fake.call_order().contains(&"purge".to_string()),
+            "the teardown must not run against a failed step's value: {:?}",
+            fake.call_order()
+        );
+        assert!(res.skipped.iter().any(|s| s.contains("purge")));
+    }
+
+    #[test]
+    fn a_teardown_is_gated_on_the_sibling_that_writes_the_name_last() {
+        // `open` owned `sid` when the order was worked out, so the teardown was
+        // authorised by a step that succeeded — and then `rotate` ran first and
+        // overwrote `sid` with the session it had failed to make. The value on
+        // the wire was the dead one, the gate had vouched for a different
+        // resource entirely, and the run still read as green.
+        let entries = [
+            graph_entry("open", &["sid"], &[]),
+            graph_entry("purge", &[], &["sid"]),
+            graph_entry("rotate", &["sid"], &[]),
+        ];
+        let fake = Fake::new(&[
+            ok_capturing("open", &[("sid", "S1")]),
+            (
+                "rotate",
+                Canned {
+                    status: 500,
+                    error: Some("boom".into()),
+                    captures: vec![("sid".into(), "S2".into())],
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let res = run(
+            "REQUEST open AS open\nCLEANUP purge\nCLEANUP rotate DEPENDS open\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            !fake.call_order().contains(&"purge".to_string()),
+            "it would have been sent the failed session: {:?}",
+            fake.call_vars("purge")
+        );
+        assert!(res.skipped.contains(&"purge".to_string()));
+    }
+
+    #[test]
+    fn a_skipped_sibling_does_not_strand_a_resource_that_was_really_made() {
+        // `rotate` declares `sid`, so it is ordered ahead of `purge` — but it is
+        // skipped and writes nothing, leaving `open`'s session standing in the
+        // chain. Gating on the sibling anyway abandoned a resource that
+        // demonstrably existed, and the run still read as green.
+        let entries = [
+            graph_entry("open", &["sid"], &[]),
+            graph_entry("flake", &[], &[]),
+            graph_entry("purge", &[], &["sid"]),
+            graph_entry("rotate", &["sid"], &[]),
+        ];
+        let fake = Fake::new(&[ok_capturing("open", &[("sid", "S1")]), failing("flake")]);
+        run(
+            "REQUEST open AS open\nREQUEST flake AS flake\n\
+             CLEANUP purge\nCLEANUP rotate DEPENDS flake\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            fake.call_order().contains(&"purge".to_string()),
+            "the session it tears down was really made: {:?}",
+            fake.call_order()
+        );
+        assert_eq!(
+            fake.call_vars("purge").get("sid").map(String::as_str),
+            Some("S1")
+        );
+    }
+
+    #[test]
+    fn a_sibling_that_declares_a_name_but_writes_nothing_does_not_vouch_for_it() {
+        // The other direction. `rotate` runs and succeeds but captures nothing,
+        // so the value `purge` is handed still belongs to `open` — which
+        // failed. Letting the sibling's success stand in for the writer's
+        // authorised the teardown against a dead session.
+        let entries = [
+            graph_entry("open", &["sid"], &[]),
+            graph_entry("purge", &[], &["sid"]),
+            graph_entry("rotate", &["sid"], &[]),
+        ];
+        let fake = Fake::new(&[
+            (
+                "open",
+                Canned {
+                    status: 500,
+                    error: Some("boom".into()),
+                    captures: vec![("sid".into(), "S1".into())],
+                    ..Default::default()
+                },
+            ),
+            ("rotate", Canned::default()),
+        ]);
+        let res = run(
+            "REQUEST open AS open\nCLEANUP purge\nCLEANUP rotate\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            !fake.call_order().contains(&"purge".to_string()),
+            "it would have been sent the failed step's session: {:?}",
+            fake.call_vars("purge")
+        );
+        assert!(res.skipped.contains(&"purge".to_string()));
+    }
+
+    #[test]
+    fn a_role_named_through_a_loop_variable_collapses_every_iteration() {
+        // One written text is not one target. The clause is resolved again on
+        // each visit, so `BASELINE("prod-{{R}}")` names a different environment
+        // every time — and keeping only the last left the earlier iterations'
+        // rows measured against a stranger's baseline, or against none at all.
+        let entries = [graph_entry("r", &[], &[])];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "LIST REGIONS=[\"eu\",\"us\"]\n\
+             FOR R IN REGIONS\n\
+             \x20 FOR T IN ENVS BASELINE(\"prod-{{R}}\"), COMPARISON(\"staging-{{R}}\")\n\
+             \x20   REPORT REQUEST r SHOW(HttpStatus)\n\
+             \x20 END\n\
+             END\n",
+            &entries,
+            &[],
+            &[
+                ("prod-eu", &[][..]),
+                ("staging-eu", &[][..]),
+                ("prod-us", &[][..]),
+                ("staging-us", &[][..]),
+            ],
+            &fake,
+        );
+        assert!(
+            res.errors.is_empty(),
+            "every environment was loaded: {:?}",
+            res.errors
+        );
+        assert_eq!(
+            res.rows.len(),
+            2,
+            "one collapsed row per region: {:?}",
+            res.rows
+                .iter()
+                .map(|r| r.target.clone())
+                .collect::<Vec<_>>()
+        );
+        for row in &res.rows {
+            let verdict = &row.cells[crate::report::compare::RESULT_COLUMN];
+            assert!(
+                verdict.contains("matched"),
+                "{:?} was not collapsed: {verdict}",
+                row.target
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_envs_row_is_not_dragged_into_someone_elses_comparison() {
+        // A plain list assigns no roles, so its rows compare against nothing —
+        // even when the environment they name is a baseline or candidate for
+        // some *other* clause in the same flow. Treating "no role recorded" and
+        // "no role assigned" as one fact meant these rows were looked up by
+        // name in the other comparison's sets, pulled into its collapse, and
+        // written out with a confident verdict about a comparison they were
+        // never part of.
+        let entries = [graph_entry("r", &[], &[])];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "FOR E IN ENVS \"prod\", \"staging\"\n\
+             \x20 REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20 REPORT \"{{who}}\" AS \"proc.v\"\n\
+             END\n\
+             FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n\
+             \x20 REPORT REQUEST r AS proc2 SHOW(HttpStatus)\n\
+             \x20 REPORT \"{{who}}\" AS \"proc2.v\"\n\
+             END\n",
+            &entries,
+            &[],
+            &[
+                ("prod", &[("who", "P")][..]),
+                ("staging", &[("who", "S")][..]),
+            ],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let plain: Vec<&ReportRow> = res
+            .rows
+            .iter()
+            .filter(|r| r.cells.contains_key("proc.v"))
+            .collect();
+        assert_eq!(plain.len(), 2, "both plain rows survive: {:?}", res.rows);
+        for row in plain {
+            assert!(
+                !row.cells
+                    .contains_key(crate::report::compare::RESULT_COLUMN),
+                "{:?} compares against nothing: {:?}",
+                row.target,
+                row.cells
+            );
+        }
+    }
+
+    #[test]
+    fn an_environment_that_is_a_baseline_once_is_still_a_candidate_elsewhere() {
+        // A role is a position in one comparison, not a property of the name.
+        // Rolling pairs make the same environment the candidate in one
+        // iteration and the baseline in the next; classifying rows by global
+        // name membership tested "is a baseline" first, so the candidate row
+        // was filed as a baseline, its own pair lost its candidate, and the
+        // diff that was asked for came back as "no baseline".
+        let entries = [graph_entry("r", &[], &[])];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "FOR (A, B) IN [(\"v1\", \"v2\"), (\"v2\", \"v3\")]\n\
+             \x20 FOR T IN ENVS BASELINE(\"{{A}}\"), COMPARISON(\"{{B}}\")\n\
+             \x20   REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20   REPORT \"{{who}}\" AS \"proc.v\"\n\
+             \x20 END\n\
+             END\n",
+            &entries,
+            &[],
+            &[
+                ("v1", &[("who", "V1")][..]),
+                ("v2", &[("who", "V2")][..]),
+                ("v3", &[("who", "V3")][..]),
+            ],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let verdicts: Vec<(Option<String>, String)> = res
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.target.clone(),
+                    r.cells
+                        .get(crate::report::compare::RESULT_COLUMN)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(verdicts.len(), 2, "one row per pair: {verdicts:?}");
+        for (target, verdict) in &verdicts {
+            assert!(
+                verdict.contains("(baseline)"),
+                "{target:?} must be diffed against its own pair's baseline: {verdict}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_envs_loop_around_a_comparison_keeps_each_pair_apart() {
+        // The `ENVS` axis is left out of the row key because it is the
+        // comparison axis — baseline and candidate have to share a key to be
+        // paired. That is a statement about the loop assigning the *roles*. A
+        // plain `ENVS "a","b"` list compares nothing; it is an ordinary
+        // iteration axis, and excluding it too collapsed every iteration onto
+        // key `[]`, so one baseline won the lot and each candidate was diffed
+        // against a stranger's — reported confidently, under the foreign
+        // baseline's name, with the other baseline's row gone from the report.
+        let entries = [graph_entry("r", &[], &[])];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "FOR E IN ENVS \"a\", \"b\"\n\
+             \x20 FOR T IN ENVS BASELINE(\"{{E}}-prod\"), COMPARISON(\"{{E}}-stg\")\n\
+             \x20   REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20   REPORT \"{{who}}\" AS \"proc.v\"\n\
+             \x20 END\n\
+             END\n",
+            &entries,
+            &[],
+            &[
+                ("a", &[("who", "A")][..]),
+                ("b", &[("who", "B")][..]),
+                ("a-prod", &[("who", "A-PROD")][..]),
+                ("a-stg", &[("who", "A-STG")][..]),
+                ("b-prod", &[("who", "B-PROD")][..]),
+                ("b-stg", &[("who", "B-STG")][..]),
+            ],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let verdicts: Vec<(Option<String>, String)> = res
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.target.clone(),
+                    r.cells[crate::report::compare::RESULT_COLUMN].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            verdicts.len(),
+            2,
+            "one collapsed row per pair: {verdicts:?}"
+        );
+        for (target, verdict) in &verdicts {
+            let env = target.as_deref().unwrap_or_default();
+            let own = format!("{}-prod (baseline)", &env[..1]);
+            assert!(
+                verdict.contains(&own),
+                "{env} must be measured against {own}: {verdict}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_envs_loop_inside_a_comparison_does_not_erase_it() {
+        // A plain list compares nothing, so it cannot be a *side* of anything —
+        // but it was overwriting the side and the target it had inherited with
+        // its own environment's name, leaving every row `Unassigned`. The
+        // collapse then passed the lot through and the comparison the report
+        // was written for vanished: no `Result` cell anywhere.
+        let entries = [graph_entry("r", &[], &[])];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"stg\")\n\
+             \x20 FOR E IN ENVS \"au\", \"eu\"\n\
+             \x20   REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20   REPORT \"{{T}}-{{E}}\" AS \"proc.v\"\n\
+             \x20 END\n\
+             END\n",
+            &entries,
+            &[],
+            &[
+                // The sides have to differ for the verdict to name the
+                // baseline it measured against, so the cell carries the outer
+                // loop variable — which is the side.
+                ("prod", &[][..]),
+                ("stg", &[][..]),
+                ("au", &[][..]),
+                ("eu", &[][..]),
+            ],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let verdicts: Vec<String> = res
+            .rows
+            .iter()
+            .filter_map(|r| r.cells.get(crate::report::compare::RESULT_COLUMN).cloned())
+            .collect();
+        assert_eq!(
+            verdicts.len(),
+            2,
+            "one collapsed row per inner environment: {:?}",
+            res.rows
+        );
+        for v in &verdicts {
+            assert!(
+                v.contains("prod (baseline)"),
+                "the enclosing comparison still happened: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_comparisons_in_one_flow_do_not_share_a_baseline() {
+        // Both clauses leave their own `ENVS` axis out of the row key — that is
+        // what lets a baseline and its candidate meet — so all four rows land
+        // on key `[]`. Indexed by key alone, the first baseline to arrive won
+        // and the *other* comparison's candidate was measured against it: a
+        // confident verdict about a pair that was never written down, and the
+        // real baseline gone from the report.
+        let entries = [graph_entry("r", &[], &[])];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "FOR T IN ENVS BASELINE(\"prod-a\"), COMPARISON(\"stg-a\")\n\
+             \x20 REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20 REPORT \"{{who}}\" AS \"proc.v\"\n\
+             END\n\
+             FOR T IN ENVS BASELINE(\"prod-b\"), COMPARISON(\"stg-b\")\n\
+             \x20 REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20 REPORT \"{{who}}\" AS \"proc.v\"\n\
+             END\n",
+            &entries,
+            &[],
+            &[
+                // Each side differs from its own baseline, so the verdict has
+                // to name the baseline it was actually measured against.
+                ("prod-a", &[("who", "A1")][..]),
+                ("stg-a", &[("who", "A2")][..]),
+                ("prod-b", &[("who", "B1")][..]),
+                ("stg-b", &[("who", "B2")][..]),
+            ],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let verdicts: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    r.target.clone()?,
+                    r.cells.get(crate::report::compare::RESULT_COLUMN)?.clone(),
+                ))
+            })
+            .collect();
+        assert_eq!(verdicts.len(), 2, "one per comparison: {verdicts:?}");
+        for (target, verdict) in &verdicts {
+            let own = format!("prod-{} (baseline)", &target[target.len() - 1..]);
+            assert!(
+                verdict.contains(&own),
+                "{target} must be measured against {own}: {verdict}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_role_named_through_a_capture_is_the_one_the_collapse_looks_for() {
+        // The run resolves a role target against everything in scope; the
+        // collapse used to re-derive it from the declared parameters alone. A
+        // role named through a capture therefore came back as the literal
+        // `{{setup.stack}}`, matched no row, and every comparison was unmatched
+        // — while a comment above the resolution claimed the two agreed.
+        let entries = [
+            graph_entry("setup", &["stack"], &[]),
+            graph_entry("r", &[], &[]),
+        ];
+        let fake = Fake::new(&[ok_capturing("setup", &[("stack", "prod")])]);
+        let res = run(
+            "REQUEST setup AS setup\n\
+             FOR T IN ENVS BASELINE(\"{{setup.stack}}\"), COMPARISON(\"staging\")\n\
+             \x20 REPORT REQUEST r SHOW(HttpStatus)\n\
+             END\n",
+            &entries,
+            &[],
+            &[("prod", &[][..]), ("staging", &[][..])],
+            &fake,
+        );
+        assert_eq!(
+            res.role_targets.get("{{setup.stack}}"),
+            Some(&vec!["prod".to_string()]),
+            "the run must record what it resolved: {:?}",
+            res.role_targets
+        );
+        assert!(
+            res.errors.is_empty(),
+            "both environments were loaded: {:?}",
+            res.errors
+        );
+        assert_eq!(res.rows.len(), 1, "the baseline row was not collapsed in");
+        assert_eq!(res.rows[0].target.as_deref(), Some("staging"));
+        let verdict = &res.rows[0].cells[crate::report::compare::RESULT_COLUMN];
+        assert!(
+            verdict.contains("matched"),
+            "the collapse looked for the literal role name: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_downstream_of_a_ring_is_not_sent_with_an_unresolved_reference() {
+        // Kahn's leftovers come out in arrival order, so a well-formed cleanup
+        // that depends on a ring member can be dispatched before it. Writing
+        // the ring's verdict as the loop reached each member left this one
+        // asking about a step nothing had recorded yet, so the reference was
+        // dropped, nothing gated it, and it was sent with `{{a.tok}}` literal.
+        let mut a = graph_entry("a", &["tok"], &["sid"]);
+        a.title = "a".into();
+        let mut b = graph_entry("b", &["sid"], &["tok"]);
+        b.title = "b".into();
+        let c = graph_entry("c", &[], &["a.tok"]);
+        let entries = [a, b, c];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "CLEANUP a\nCLEANUP b\nCLEANUP c\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            !fake.call_order().contains(&"c".to_string()),
+            "c depends on ring member 'a' and must be skipped, not sent",
+        );
+        assert!(
+            res.skipped.contains(&"c".to_string()),
+            "c must be reported as skipped: {:?}",
+            res.skipped
+        );
+    }
+
+    #[test]
+    fn a_cleanup_two_hops_from_a_ring_is_not_sent_with_an_unresolved_reference() {
+        // Marking only the ring's *members* left the rest of Kahn's leftovers
+        // unaccounted for. They come out in arrival order, so a teardown could
+        // be dispatched before the leftover it depends on — which had no
+        // verdict yet, so `{{d.dkey}}` matched nothing, was silently dropped,
+        // and went out literal in the URL while the run called it a success.
+        let mut a = graph_entry("a", &["tok"], &["sid"]);
+        a.title = "a".into();
+        let mut b = graph_entry("b", &["sid"], &["tok"]);
+        b.title = "b".into();
+        let mut d = graph_entry("d", &["dkey"], &["a.tok"]);
+        d.title = "d".into();
+        let e = graph_entry("e", &[], &["d.dkey"]);
+        let entries = [a, b, d, e];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "CLEANUP a\nCLEANUP b\nCLEANUP d\nCLEANUP e\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            !fake.call_order().contains(&"e".to_string()),
+            "e follows d, which the ring refused: {:?}",
+            fake.call_order()
+        );
+        assert!(
+            res.skipped.contains(&"e".to_string()),
+            "e must be reported as skipped: {:?}",
+            res.skipped
+        );
+    }
+
+    #[test]
+    fn a_flat_reference_to_a_ring_members_capture_does_not_fire_at_an_older_value() {
+        // Planning resolves a flat `{{tok}}` to the sibling cleanup declaring
+        // it — a capture shadows the environment. Dispatch re-derived the deps
+        // with no siblings, so that rule vanished and the name fell through to
+        // an earlier ordinary step's value: a destructive request aimed at a
+        // live resource belonging to somebody else, and reported green. The
+        // same flow written `{{a.tok}}` was correctly skipped, so the two
+        // spellings of one dependency disagreed and the silent one was the
+        // dangerous one.
+        let old = graph_entry("old", &["sid", "tok"], &[]);
+        let mut a = graph_entry("a", &["tok"], &["sid"]);
+        a.title = "a".into();
+        let mut b = graph_entry("b", &["sid"], &["tok"]);
+        b.title = "b".into();
+        let c = graph_entry("c", &[], &["tok"]);
+        let entries = [old, a, b, c];
+        let fake = Fake::new(&[ok_capturing(
+            "old",
+            &[("sid", "OLD_SID"), ("tok", "OLD_TOK")],
+        )]);
+        let res = run(
+            "REQUEST old AS old\nCLEANUP a\nCLEANUP b\nCLEANUP c\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            !fake.call_order().contains(&"c".to_string()),
+            "c reads a value only the refused ring could write: {:?}",
+            fake.call_order()
+        );
+        assert!(
+            res.skipped.contains(&"c".to_string()),
+            "c must be reported as skipped: {:?}",
+            res.skipped
+        );
+    }
+
+    #[test]
+    fn a_ring_of_cleanups_is_skipped_not_fired_at_stale_values() {
+        // The cycle error says none of them ran. Resolving the gate purely from
+        // what had already happened made that false: neither member could see
+        // the other, so nothing gated either of them and both were sent —
+        // against whatever value an unrelated earlier step had left in the
+        // chain, which is a destructive request aimed at a live resource.
+        let old = graph_entry("old", &["sid", "tok"], &[]);
+        let mut a = graph_entry("a", &["tok"], &["sid"]);
+        a.title = "a".into();
+        let mut b = graph_entry("b", &["sid"], &["tok"]);
+        b.title = "b".into();
+        let entries = [old, a, b];
+        let fake = Fake::new(&[ok_capturing(
+            "old",
+            &[("sid", "OLD_SID"), ("tok", "OLD_TOK")],
+        )]);
+        let res = run(
+            "REQUEST old AS old\nCLEANUP a\nCLEANUP b\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        for m in ["a", "b"] {
+            assert!(
+                !fake.call_order().contains(&m.to_string()),
+                "{m} was fired at a stale value: {:?}",
+                fake.call_vars(m)
+            );
+            assert!(res.skipped.contains(&m.to_string()), "{m} must be skipped");
+        }
+    }
+
+    #[test]
+    fn a_cleanup_between_two_rings_is_named_in_neither() {
+        // Peeling off leftovers with no successor is not the same question as
+        // "is it in a ring": a cleanup downstream of one ring and upstream of
+        // another has a successor throughout, and was named as a member of a
+        // cycle it had nothing to do with.
+        let mut a = graph_entry("a", &["token"], &["sid"]);
+        a.title = "a".into();
+        let mut b = graph_entry("b", &["sid"], &["token"]);
+        b.title = "b".into();
+        let d = graph_entry("d", &["dkey"], &[]);
+        let mut e = graph_entry("e", &["tok2"], &["sid2", "dkey"]);
+        e.title = "e".into();
+        let mut f = graph_entry("f", &["sid2"], &["tok2"]);
+        f.title = "f".into();
+        let entries = [a, b, d, e, f];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "CLEANUP a\nCLEANUP b\nCLEANUP d DEPENDS a\nCLEANUP e\nCLEANUP f\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let ring = res
+            .errors
+            .iter()
+            .find(|e| e.contains("cycle"))
+            .expect("the rings are reported");
+        for m in ["a", "b", "e", "f"] {
+            assert!(ring.contains(m), "{m} is in a ring: {ring}");
+        }
+        assert!(
+            !ring.contains(", d") && !ring.contains("d,"),
+            "'d' sits between the two rings and is in neither: {ring}"
+        );
+    }
+
+    #[test]
+    fn a_cycle_among_cleanups_names_only_the_ones_in_it() {
+        // Kahn leaves the ring *and* everything downstream of it. Naming the
+        // lot told the author of a perfectly well-formed teardown to go break a
+        // cycle it was not part of.
+        let mut a = graph_entry("a", &["token"], &["sid"]);
+        a.title = "a".into();
+        let mut b = graph_entry("b", &["sid"], &["token"]);
+        b.title = "b".into();
+        let c = graph_entry("c", &[], &[]);
+        let entries = [a, b, c];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "CLEANUP a\nCLEANUP b\nCLEANUP c DEPENDS a\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let ring = res
+            .errors
+            .iter()
+            .find(|e| e.contains("cycle"))
+            .expect("the ring is reported");
+        assert!(ring.contains('a') && ring.contains('b'), "{ring}");
+        assert!(
+            !ring.contains(", c") && !ring.contains("c,"),
+            "'c' only depends on the ring, it is not in it: {ring}"
+        );
+    }
+
+    #[test]
+    fn a_sibling_cleanup_that_writes_the_name_is_what_the_teardown_waits_for() {
+        // The environment answers `sid` too, which once looked like reason
+        // enough not to order the two — but a capture shadows the environment
+        // here as it does everywhere else, so the sibling's value is the one on
+        // the wire regardless. Declining the edge only made the ordering
+        // disagree with the value: the teardown was authorised against the
+        // environment and then sent against the sibling's resource.
+        let entries = [
+            graph_entry("purge", &[], &["sid"]),
+            graph_entry("rotate", &["sid"], &[]),
+        ];
+        let fake = Fake::new(&[ok_capturing("rotate", &[("sid", "FRESH")])]);
+        // Written rotate-first, so reverse-written order alone would send the
+        // teardown before the sibling that mints what it tears down.
+        run(
+            "CLEANUP rotate\nCLEANUP purge\n",
+            &entries,
+            &[("sid", "from-env")],
+            &[],
+            &fake,
+        );
+        let order = fake.call_order();
+        assert_eq!(order, vec!["rotate".to_string(), "purge".to_string()]);
+        assert_eq!(
+            fake.call_vars("purge").get("sid").map(String::as_str),
+            Some("FRESH"),
+            "the teardown is sent the value it was ordered against"
+        );
+    }
+
+    #[test]
+    fn a_teardown_is_not_sent_against_a_sibling_that_failed_to_write() {
+        // The other half of the same rule. `sid` is in the environment, so
+        // before the edge existed `purge` ran happily — against the *old*
+        // session, while the one `rotate` was meant to mint was never made.
+        let entries = [
+            graph_entry("purge", &[], &["sid"]),
+            graph_entry("rotate", &["sid"], &[]),
+        ];
+        let fake = Fake::new(&[failing("rotate")]);
+        let res = run(
+            "CLEANUP purge\nCLEANUP rotate\n",
+            &entries,
+            &[("sid", "from-env")],
+            &[],
+            &fake,
+        );
+        assert!(
+            !fake.call_order().contains(&"purge".to_string()),
+            "it would have torn down whatever the environment happened to name: {:?}",
+            fake.call_order()
+        );
+        assert!(res.skipped.contains(&"purge".to_string()));
+    }
+
+    #[test]
+    fn a_ring_of_cleanups_is_an_error_not_a_silent_skip() {
+        // This edge is inferred, so validation cannot see it before the run:
+        // each reads the other's capture. Left alone, every member reads its
+        // prerequisite as unsuccessful and skips, and the whole ring is torn
+        // down by nobody while the run still exits clean.
+        let mut a = graph_entry("a", &["token"], &["sid"]);
+        a.title = "a".into();
+        let mut b = graph_entry("b", &["sid"], &["token"]);
+        b.title = "b".into();
+        let entries = [a, b];
+        let fake = Fake::new(&[]);
+        let res = run("CLEANUP a\nCLEANUP b\n", &entries, &[], &[], &fake);
+        assert!(
+            res.errors
+                .iter()
+                .any(|e| e.contains("a") && e.contains("b")),
+            "the ring has to be said out loud: {:?}",
+            res.errors
+        );
+    }
+
+    #[test]
+    fn a_cleanup_that_reads_another_cleanups_capture_runs_after_it() {
+        // The inferred counterpart of the explicit `DEPENDS` edge. Nothing has
+        // run when the order is worked out, so the prefix of `{{parent.token}}`
+        // can't be recognised from the steps that have — and without the edge
+        // reverse-written order runs `child` first, where the reference
+        // resolves to nothing.
+        let entries = [
+            graph_entry("setup", &[], &[]),
+            graph_entry("parent", &["token"], &[]),
+            graph_entry("child", &[], &[]),
+        ];
+        let fake = Fake::new(&[ok_capturing("parent", &[("token", "T")])]);
+        run(
+            "REQUEST setup\n\
+             CLEANUP parent DEPENDS setup\n\
+             CLEANUP child DEPENDS setup USING(query.token = \"{{parent.token}}\")\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let order = fake.call_order();
+        let at = |n: &str| order.iter().position(|s| s == n);
+        assert!(
+            at("parent") < at("child"),
+            "the cleanup holding the value must run first: {order:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_sole_producer_still_skips_the_cleanup() {
+        // The other half of the same rule: with no successful writer there is
+        // no value to attribute, so the teardown has nothing to tear down.
+        let entries = [
+            graph_entry("create", &["sid"], &[]),
+            graph_entry("purge", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[failing("create")]);
+        let res = run("REQUEST create\nCLEANUP purge\n", &entries, &[], &[], &fake);
+        assert!(!fake.call_order().contains(&"purge".to_string()));
+        assert!(res.skipped.iter().any(|s| s.contains("purge")));
+    }
+
+    #[test]
+    fn a_cleanup_that_depends_on_another_cleanup_runs_after_it() {
+        // Neither has run when the order is worked out, so `step_order` has no
+        // depth to sort them by; without an explicit edge, reverse-written
+        // order ran the dependent first and it skipped itself.
+        let entries = [
+            graph_entry("setup", &[], &[]),
+            graph_entry("c1", &[], &[]),
+            graph_entry("c2", &[], &[]),
+        ];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "REQUEST setup\nCLEANUP c1 DEPENDS setup\nCLEANUP c2 DEPENDS setup, c1\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        let order = fake.call_order();
+        let c1 = order.iter().position(|t| t == "c1").expect("c1 ran");
+        let c2 = order.iter().position(|t| t == "c2").expect("c2 ran");
+        assert!(c1 < c2, "{order:?}");
+    }
+
+    #[test]
+    fn a_dotted_environment_variable_cannot_answer_a_step_reference() {
+        // `.vars` keys are not restricted to identifiers, so an environment can
+        // carry a flat `login.token`. Left in the map it would answer
+        // `{{login.token}}` precisely when the step `login` had *not* captured
+        // one — which is exactly when the reference must fail. Silently sending
+        // a stale credential is the worst outcome available here.
+        let entries = [
+            graph_entry("producer", &["token"], &[]),
+            graph_entry("consumer", &[], &[]),
+        ];
+        let fake = Fake::new(&[failing("producer")]);
+        run(
+            "REQUEST producer AS login\nREQUEST consumer USING(url = \"http://x/{{login.token}}\")\n",
+            &entries,
+            &[("login.token", "STALE")],
+            &[],
+            &fake,
+        );
+        let sent = fake.sent_entry("consumer").expect("consumer was sent");
+        assert!(
+            !sent.url.contains("STALE"),
+            "the environment must not stand in for a capture: {}",
+            sent.url
+        );
+    }
+
+    #[test]
+    fn wrapping_changes_what_happens_after_a_failure_and_that_is_the_point() {
+        // The companion to the no-op test above, pinning the boundary of the
+        // guarantee: while everything succeeds, wrapping changes nothing. Once
+        // something fails, it deliberately does. Flat, every later request goes
+        // out regardless; in a region the steps downstream of the failure are
+        // skipped, because a request that cannot work without a token nobody
+        // captured has nothing to tell you and costs a real call to ask.
+        let entries = [
+            graph_entry("producer", &["token"], &[]),
+            graph_entry("consumer", &[], &["token"]),
+        ];
+        let canned = [failing("producer")];
+
+        let flat_fake = Fake::new(&canned);
+        run(
+            "REPORT REQUEST producer\nREPORT REQUEST consumer\n",
+            &entries,
+            &[],
+            &[],
+            &flat_fake,
+        );
+        assert_eq!(flat_fake.call_order(), ["producer", "consumer"]);
+
+        let wrapped_fake = Fake::new(&canned);
+        let wrapped = run(
+            "GRAPH\n    REPORT REQUEST producer\n    REPORT REQUEST consumer\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &wrapped_fake,
+        );
+        assert_eq!(
+            wrapped_fake.call_order(),
+            ["producer"],
+            "the consumer must not be sent"
+        );
+        assert!(
+            wrapped.skipped.iter().any(|s| s.contains("consumer")),
+            "and it must be reported as skipped: {:?}",
+            wrapped.skipped
+        );
+    }
+
+    #[test]
+    fn wrapping_a_sequential_block_in_a_region_changes_nothing() {
+        // The guarantee the whole migration path rests on. Same flow, same
+        // collection, one wrapped and one not — the rows have to match, or
+        // nobody can adopt the feature by wrapping what they already have.
+        let entries = [
+            graph_entry("a", &[], &[]),
+            graph_entry("b", &[], &[]),
+            graph_entry("c", &[], &[]),
+        ];
+        let canned = [ok("a"), ok("b"), ok("c")];
+        let plain = Fake::new(&canned);
+        let flat = run(
+            "REQUEST a\nREPORT REQUEST b\nREQUEST c\n",
+            &entries,
+            &[],
+            &[],
+            &plain,
+        );
+        let wrapped_fake = Fake::new(&canned);
+        let wrapped = run(
+            "GRAPH\n    REQUEST a\n    REPORT REQUEST b\n    REQUEST c\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &wrapped_fake,
+        );
+        assert_eq!(flat.rows.len(), wrapped.rows.len());
+        assert_eq!(flat.rows[0].cells, wrapped.rows[0].cells);
+        assert_eq!(plain.call_order(), wrapped_fake.call_order());
+    }
+
+    /// Run `src` with a shuffle seed, so the ready-set tie-break is random.
+    fn run_shuffled(src: &str, entries: &[HurlEntry], fake: &Fake, seed: u64) -> ReportResult {
+        let flow = parse_flow(src).expect("flow parses");
+        let ctx = RunContext {
+            entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+            shuffle: Some(seed),
+        };
+        run_flow(&flow, &ctx)
+    }
+
+    #[test]
+    fn a_step_that_panics_ends_the_run_instead_of_hanging_it() {
+        // The failure mode this guards: the panicking worker never decrements
+        // the in-flight count, so every other worker sleeps on the condvar
+        // waiting for an arrival that cannot come, and `thread::scope` blocks
+        // joining those sleepers rather than propagating the panic. A crash
+        // becomes a hang, which is the one failure a CI job cannot diagnose.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let entries = [
+                graph_entry("a", &[], &[]),
+                graph_entry("b", &[], &[]),
+                graph_entry("c", &[], &[]),
+                graph_entry("d", &[], &[]),
+            ];
+            let fake = Fake::new(&[]).with_delay(20).panicking_on("a");
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(
+                    "PARALLEL(2) GRAPH\n    REPORT REQUEST a\n    REPORT REQUEST b\n    REPORT REQUEST c\n    REPORT REQUEST d\nEND\n",
+                    &entries,
+                    &[],
+                    &[],
+                    &fake,
+                )
+            }));
+            let _ = tx.send(outcome.is_err());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(panicked) => assert!(
+                panicked,
+                "the panic must reach the caller, not be swallowed"
+            ),
+            Err(_) => panic!("the region hung instead of failing"),
+        }
+    }
+
+    #[test]
+    fn a_parallel_region_overlaps_steps_that_do_not_depend_on_each_other() {
+        // The point of the degree: four independent steps should not cost four
+        // round trips one after another.
+        let entries = [
+            graph_entry("a", &[], &[]),
+            graph_entry("b", &[], &[]),
+            graph_entry("c", &[], &[]),
+            graph_entry("d", &[], &[]),
+        ];
+        let fake = Fake::new(&[ok("a"), ok("b"), ok("c"), ok("d")]).with_delay(40);
+        let res = run(
+            "PARALLEL(4) GRAPH\n    REQUEST a\n    REQUEST b\n    REQUEST c\n    REQUEST d\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.call_count(), 4);
+        assert!(
+            fake.peak_concurrency() > 1,
+            "a degree of 4 over four independent steps ran them one at a time"
+        );
+    }
+
+    #[test]
+    fn a_degree_never_overlaps_a_step_with_the_one_it_depends_on() {
+        // A cap is permission to overlap what *may* overlap, and nothing else.
+        // The chain here is total, so the correct peak is 1 however high the
+        // degree is set.
+        let entries = [
+            graph_entry("login", &["token"], &[]),
+            graph_entry("order", &["id"], &["token"]),
+            graph_entry("fetch", &[], &["id"]),
+        ];
+        let fake = Fake::new(&[
+            ok_capturing("login", &[("token", "T")]),
+            ok_capturing("order", &[("id", "7")]),
+            ok("fetch"),
+        ])
+        .with_delay(20);
+        let res = run(
+            "PARALLEL(4) GRAPH\n    REQUEST fetch\n    REQUEST order\n    REQUEST login\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.peak_concurrency(), 1, "a chain cannot be overlapped");
+        assert_eq!(
+            fake.call_order(),
+            vec!["login".to_string(), "order".into(), "fetch".into()],
+            "and it still runs in dependency order, not written order"
+        );
+    }
+
+    #[test]
+    fn a_degree_does_not_change_what_a_region_reports() {
+        // Concurrency is an execution detail. If it showed in the output,
+        // nobody could turn it on for a report anyone reads.
+        let entries = [
+            graph_entry("login", &["token"], &[]),
+            graph_entry("a", &[], &["token"]),
+            graph_entry("b", &[], &["token"]),
+        ];
+        let canned = [ok_capturing("login", &[("token", "T")]), ok("a"), ok("b")];
+        let body = "    REQUEST login\n    REPORT REQUEST a\n    REPORT REQUEST b\nEND\n";
+        let one = Fake::new(&canned);
+        let seq = run(&format!("GRAPH\n{body}"), &entries, &[], &[], &one);
+        let many = Fake::new(&canned);
+        let par = run(
+            &format!("PARALLEL(4) GRAPH\n{body}"),
+            &entries,
+            &[],
+            &[],
+            &many,
+        );
+        assert_eq!(seq.rows.len(), par.rows.len());
+        assert_eq!(seq.rows[0].cells, par.rows[0].cells);
+        assert_eq!(
+            seq.column_order, par.column_order,
+            "column order must not depend on which worker finished first"
+        );
+    }
+
+    #[test]
+    fn a_parallel_region_still_skips_a_step_whose_dependency_failed() {
+        // The verdict rule has to survive the scheduler: a dependent must never
+        // be dispatched on the strength of a worker being free.
+        let entries = [
+            graph_entry("login", &["token"], &[]),
+            graph_entry("order", &[], &["token"]),
+            graph_entry("other", &[], &[]),
+        ];
+        let fake = Fake::new(&[failing("login"), ok("order"), ok("other")]);
+        let res = run(
+            "PARALLEL(4) GRAPH\n    REQUEST login\n    REPORT REQUEST order\n    REQUEST other\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(res.skipped, vec!["order".to_string()]);
+        assert!(
+            !fake.call_order().contains(&"order".to_string()),
+            "a skipped step must not be sent: {:?}",
+            fake.call_order()
+        );
+        assert!(
+            fake.call_order().contains(&"other".to_string()),
+            "an unrelated step is not collateral damage"
+        );
+    }
+
+    #[test]
+    fn the_same_shuffle_seed_reproduces_the_same_order() {
+        // A shuffled failure is only useful if it can be replayed, which is why
+        // the seed is printed.
+        let entries = [
+            graph_entry("a", &[], &[]),
+            graph_entry("b", &[], &[]),
+            graph_entry("c", &[], &[]),
+            graph_entry("d", &[], &[]),
+        ];
+        let canned = [ok("a"), ok("b"), ok("c"), ok("d")];
+        let src = "GRAPH\n    REQUEST a\n    REQUEST b\n    REQUEST c\n    REQUEST d\nEND\n";
+        let one = Fake::new(&canned);
+        run_shuffled(src, &entries, &one, 12345);
+        let two = Fake::new(&canned);
+        run_shuffled(src, &entries, &two, 12345);
+        assert_eq!(one.call_order(), two.call_order());
+    }
+
+    #[test]
+    fn shuffling_varies_the_order_among_steps_that_may_run_in_any_order() {
+        // The falsification mode from 07 §6.4. Four independent steps have 24
+        // legal orders; the default tie-break always picks the written one,
+        // which is exactly what hides a missing edge.
+        let entries = [
+            graph_entry("a", &[], &[]),
+            graph_entry("b", &[], &[]),
+            graph_entry("c", &[], &[]),
+            graph_entry("d", &[], &[]),
+        ];
+        let canned = [ok("a"), ok("b"), ok("c"), ok("d")];
+        let src = "GRAPH\n    REQUEST a\n    REQUEST b\n    REQUEST c\n    REQUEST d\nEND\n";
+        let written = vec!["a".to_string(), "b".into(), "c".into(), "d".into()];
+        let plain = Fake::new(&canned);
+        run(src, &entries, &[], &[], &plain);
+        assert_eq!(plain.call_order(), written, "the default is written order");
+
+        let varied = (1..40u64).any(|seed| {
+            let f = Fake::new(&canned);
+            run_shuffled(src, &entries, &f, seed);
+            f.call_order() != written
+        });
+        assert!(varied, "no seed in 39 varied the order of four free steps");
+    }
+
+    #[test]
+    fn shuffling_never_breaks_a_dependency() {
+        // Shuffling picks among the steps that are *ready*. It is not licence
+        // to run a step before the thing it needs — that would make the mode
+        // report failures that say nothing about the graph.
+        let entries = [
+            graph_entry("login", &["token"], &[]),
+            graph_entry("free", &[], &[]),
+            graph_entry("order", &[], &["token"]),
+        ];
+        let canned = [
+            ok_capturing("login", &[("token", "T")]),
+            ok("free"),
+            ok("order"),
+        ];
+        let src = "GRAPH\n    REQUEST login\n    REQUEST free\n    REQUEST order\nEND\n";
+        for seed in 1..30u64 {
+            let f = Fake::new(&canned);
+            let res = run_shuffled(src, &entries, &f, seed);
+            assert!(res.errors.is_empty(), "seed {seed}: {:?}", res.errors);
+            let order = f.call_order();
+            let li = order.iter().position(|t| t == "login").unwrap();
+            let oi = order.iter().position(|t| t == "order").unwrap();
+            assert!(li < oi, "seed {seed} ran order before login: {order:?}");
+        }
+    }
+
+    #[test]
+    fn a_region_runs_a_producer_written_below_its_consumer_first() {
+        // Written order is only the tie-break inside a region, so a flow may be
+        // written in the order that reads best rather than the order that runs.
+        let entries = [
+            graph_entry("api", &[], &["token"]),
+            graph_entry("login", &["token"], &[]),
+        ];
+        let fake = Fake::new(&[ok("api"), ok_capturing("login", &[("token", "T")])]);
+        let res = run(
+            "GRAPH\n    REQUEST api\n    REQUEST login\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.call_order(), ["login", "api"]);
+        assert_eq!(fake.call_vars("api").get("token"), Some(&"T".to_string()));
+    }
+
+    #[test]
+    fn a_step_in_a_region_is_not_handed_a_non_ancestors_captures() {
+        // The payoff: inside a region a step sees only what it depends on, so a
+        // data edge nobody declared fails loudly instead of working by accident
+        // and breaking the first time anything reorders.
+        let entries = [
+            graph_entry("side", &["secret"], &[]),
+            graph_entry("api", &[], &[]),
+        ];
+        let fake = Fake::new(&[ok_capturing("side", &[("secret", "S")]), ok("api")]);
+        let res = run(
+            "GRAPH\n    REQUEST side\n    REQUEST api\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.call_vars("api").get("secret"), None);
+        // Outside a region the same pair leaks, which is the behaviour the
+        // region exists to tighten — and which stays untouched for every flow
+        // that hasn't opted in.
+        let loose = Fake::new(&[ok_capturing("side", &[("secret", "S")]), ok("api")]);
+        run("REQUEST side\nREQUEST api\n", &entries, &[], &[], &loose);
+        assert_eq!(loose.call_vars("api").get("secret"), Some(&"S".to_string()));
+    }
+
+    #[test]
+    fn a_regions_captures_are_all_visible_after_it() {
+        // The closing barrier: everything in the region has run by the time
+        // anything after it does, so the ancestor scoping stops at the `END`.
+        let entries = [
+            graph_entry("side", &["secret"], &[]),
+            graph_entry("api", &[], &[]),
+            graph_entry("after", &[], &["secret"]),
+        ];
+        let fake = Fake::new(&[
+            ok_capturing("side", &[("secret", "S")]),
+            ok("api"),
+            ok("after"),
+        ]);
+        run(
+            "GRAPH\n    REQUEST side\n    REQUEST api\nEND\nREQUEST after\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(
+            fake.call_vars("after").get("secret"),
+            Some(&"S".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unorderable_region_sends_nothing() {
+        // Falling back to written order would be the one behaviour guaranteed
+        // to be wrong: the author declared that written order is not the
+        // specification.
+        let entries = [
+            graph_entry("a", &["x"], &["y"]),
+            graph_entry("b", &["y"], &["x"]),
+        ];
+        let fake = Fake::new(&[ok("a"), ok("b")]);
+        let res = run(
+            "GRAPH\n    REQUEST a\n    REQUEST b\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(fake.call_count(), 0);
+        assert!(!res.errors.is_empty());
+    }
+
+    /// A canned response that fails, so a step can be made to not succeed.
+    fn failing(title: &str) -> (&str, Canned) {
+        (
+            title,
+            Canned {
+                status: 500,
+                error: Some("boom".into()),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// An entry whose `# [Gen]` block declares `generators`, reading `url_vars`
+    /// out of its URL — the shape of a request that mints an id client-side and
+    /// then creates it.
+    fn gen_entry(title: &str, generators: &[&str], url_vars: &[&str]) -> HurlEntry {
+        HurlEntry {
+            generators: generators
+                .iter()
+                .map(|g| ((*g).to_string(), "uuid()".to_string()))
+                .collect(),
+            ..graph_entry(title, &[], url_vars)
+        }
+    }
+
+    /// A send that computed its `[Gen]` values and then succeeded.
+    fn ok_generating<'a>(title: &'a str, gens: &[(&str, &str)]) -> (&'a str, Canned) {
+        (
+            title,
+            Canned {
+                status: 200,
+                generated: gens
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A send that computed its `[Gen]` values and *then* failed — the case the
+    /// whole `Produced` gate exists for. The value is a fact about what went
+    /// out; only the resource's existence is in doubt.
+    fn failing_generating<'a>(title: &'a str, gens: &[(&str, &str)]) -> (&'a str, Canned) {
+        (
+            title,
+            Canned {
+                status: 500,
+                error: Some("boom".into()),
+                generated: gens
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_generated_value_orders_a_region_and_reaches_the_step_that_reads_it() {
+        // The region's no-op promise, end to end: this same flow written as a
+        // plain block already worked, because written order supplied what the
+        // graph had forgotten. The graph did not treat a `# [Gen]` value as an
+        // output, so `fetch` got no edge to `create`, was ordered first by its
+        // written position, and — since a step inside a region is handed only
+        // its ancestors' values — could not have seen `sid` even if it had run
+        // second. Written the "wrong" way round on purpose: that is exactly
+        // what a region is for.
+        let entries = [
+            graph_entry("fetch", &[], &["sid"]),
+            gen_entry("create", &["sid"], &[]),
+        ];
+        let fake = Fake::new(&[ok("fetch"), ok_generating("create", &[("sid", "NEW")])]);
+        let res = run(
+            "GRAPH\n    REQUEST fetch\n    REQUEST create\nEND\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(
+            fake.call_vars("fetch").get("sid").map(String::as_str),
+            Some("NEW"),
+            "the generated value has to reach the step that reads it, not the \
+             environment's stale one"
+        );
+    }
+
+    #[test]
+    fn a_generated_value_reaches_the_steps_that_read_it() {
+        // The bug this replaces: generated values were dropped on the floor at
+        // the end of the send, so `{{sid}}` downstream kept resolving to the
+        // environment's stale value and `{{setup.sid}}` — which validation
+        // explicitly permits — resolved to nothing at all and went out as
+        // literal text.
+        let entries = [
+            gen_entry("create", &["sid"], &[]),
+            graph_entry("fetch", &[], &["sid"]),
+            graph_entry("show", &[], &[]),
+        ];
+        let fake = Fake::new(&[
+            ok_generating("create", &[("sid", "NEW")]),
+            ok("fetch"),
+            ok("show"),
+        ]);
+        let res = run(
+            "REQUEST create AS setup\n\
+             REQUEST fetch\n\
+             REQUEST show USING(query.sid = \"{{setup.sid}}\")\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        // The flat name is answered by the step that generated it, exactly as
+        // it would be by a step that captured it.
+        assert_eq!(
+            fake.call_vars("fetch").get("sid").map(String::as_str),
+            Some("NEW")
+        );
+        // And the qualified spelling names the same value. It is asked for in
+        // PaperTrail's own text, which is the only place a dotted name is
+        // legible — Hurl's grammar has no such path, so request text never
+        // carries one.
+        let sent = fake.sent_entry("show").expect("show was sent");
+        assert_eq!(
+            sent.queries
+                .iter()
+                .find(|q| q.key == "sid")
+                .map(|q| q.value.as_str()),
+            Some("NEW"),
+            "qualified generated value did not reach the send: {:?}",
+            sent.queries
+        );
+    }
+
+    #[test]
+    fn a_cleanup_reading_a_generated_value_waits_for_the_step_that_generated_it() {
+        // Ordering has to see `[Gen]` values as outputs, or the teardown is
+        // free to run before the thing it tears down exists.
+        let entries = [
+            gen_entry("create", &["sid"], &[]),
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[ok_generating("create", &[("sid", "NEW")]), ok("delete")]);
+        let res = run(
+            "REQUEST create AS setup\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert_eq!(fake.call_order(), ["create", "delete"]);
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        // The point of the edge: the teardown carries the id that was minted,
+        // not the one the environment was carrying around beforehand.
+        assert_eq!(
+            fake.call_vars("delete").get("sid").map(String::as_str),
+            Some("NEW")
+        );
+    }
+
+    #[test]
+    fn a_cleanup_still_runs_when_the_step_that_generated_its_value_failed() {
+        // A `[Gen]` value is computed before the request leaves, so a 500 says
+        // nothing about whether the id is right — only about whether the
+        // server managed to store it, which is exactly what a teardown is for.
+        // Skipping here would leak the resource a half-completed create left
+        // behind. Deleting an id we minted ourselves is either our own
+        // resource or a harmless 404.
+        let entries = [
+            gen_entry("create", &["sid"], &[]),
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            failing_generating("create", &[("sid", "NEW")]),
+            ok("delete"),
+        ]);
+        let res = run(
+            "REQUEST create AS setup\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert_eq!(fake.call_order(), ["create", "delete"]);
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        assert_eq!(
+            fake.call_vars("delete").get("sid").map(String::as_str),
+            Some("NEW")
+        );
+    }
+
+    /// An entry that mints a name client-side *and* declares a capture for the
+    /// same name: the id is guessed before the send and confirmed from the
+    /// response, which is the ordinary shape of a create.
+    fn gen_and_capture_entry(title: &str, name: &str, url_vars: &[&str]) -> HurlEntry {
+        HurlEntry {
+            generators: vec![(name.to_string(), "uuid()".to_string())],
+            ..graph_entry(title, &[name], url_vars)
+        }
+    }
+
+    #[test]
+    fn a_minted_value_gates_its_cleanup_even_where_a_capture_was_also_declared() {
+        // The gate asks which value answered, not which clause was written. A
+        // create that mints an id and also reads the server's canonical one
+        // back declares both, and when the send fails the capture never fires:
+        // the minted value is the live one, so the teardown is owed. Reading
+        // the gate off the declarations called it a capture, demanded the step
+        // have succeeded, and left the resource standing.
+        let entries = [
+            gen_and_capture_entry("create", "sid", &[]),
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            failing_generating("create", &[("sid", "NEW")]),
+            ok("delete"),
+        ]);
+        let res = run(
+            "REQUEST create AS setup\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        assert_eq!(fake.call_order(), ["create", "delete"]);
+        assert_eq!(
+            fake.call_vars("delete").get("sid").map(String::as_str),
+            Some("NEW"),
+            "and with the id it actually minted"
+        );
+    }
+
+    #[test]
+    fn a_capture_that_fired_still_gates_its_cleanup_on_the_step_succeeding() {
+        // The other side of the same question, and why provenance has to be
+        // recorded rather than the declaration simply ignored. Here the capture
+        // *did* fire, so the live value came back from the server — and a
+        // teardown on a captured value waits for the step to have succeeded.
+        // Treating every declared `[Gen]` row as a free pass would have run it.
+        let entries = [
+            gen_and_capture_entry("create", "sid", &[]),
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            (
+                "create",
+                Canned {
+                    status: 500,
+                    error: Some("boom".into()),
+                    generated: [("sid".to_string(), "NEW".to_string())]
+                        .into_iter()
+                        .collect(),
+                    captures: vec![("sid".into(), "SERVER".into())],
+                    ..Default::default()
+                },
+            ),
+            ok("delete"),
+        ]);
+        let res = run(
+            "REQUEST create AS setup\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert_eq!(
+            res.skipped,
+            ["delete"],
+            "the capture answered, and it failed"
+        );
+        assert_eq!(fake.call_order(), ["create"]);
+    }
+
+    #[test]
+    fn a_minted_value_from_inside_a_region_still_gates_the_cleanup_outside_it() {
+        // A region step runs on a fork, and a `CLEANUP` for it is written in
+        // the enclosing block. The values came back through the closing
+        // barrier; without their provenance coming with them the enclosing
+        // block saw a live minted id it believed to be a capture, and skipped
+        // the teardown for exactly the resource the region may have created.
+        let entries = [
+            gen_and_capture_entry("create", "sid", &[]),
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            failing_generating("create", &[("sid", "NEW")]),
+            ok("delete"),
+        ]);
+        let res = run(
+            "GRAPH\n    REQUEST create AS setup\nEND\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        assert_eq!(
+            fake.call_vars("delete").get("sid").map(String::as_str),
+            Some("NEW")
+        );
+    }
+
+    #[test]
+    fn a_cleanup_is_skipped_when_the_generated_value_it_reads_was_never_produced() {
+        // The other half of the rule, and the reason `Produced` is a gate at
+        // all rather than a free pass. A step whose `[Gen]` block failed is
+        // refused before the send and generates nothing, so the name falls
+        // through to the environment — and a teardown dispatched on a stale
+        // id destroys somebody else's live resource and reports success.
+        let entries = [
+            gen_entry("create", &["sid"], &[]),
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[failing("create"), ok("delete")]);
+        let res = run(
+            "REQUEST create AS setup\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert_eq!(fake.call_order(), ["create"]);
+        assert_eq!(res.skipped, ["delete"]);
+    }
+
+    #[test]
+    fn a_reporting_request_threads_its_generated_values_forward_too() {
+        // `REPORT REQUEST` dispatches down its own path, and a fix applied to
+        // only one of the two sends is the kind of half-fix that reads as
+        // working until the one flow nobody tested runs a teardown.
+        let entries = [
+            HurlEntry {
+                generators: vec![("sid".to_string(), "uuid()".to_string())],
+                ..graph_entry("create", &["sid"], &[])
+            },
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            (
+                "create",
+                Canned {
+                    status: 200,
+                    captures: vec![("sid".to_string(), "SERVER".to_string())],
+                    generated: vec![("sid".to_string(), "MINTED".to_string())],
+                    ..Default::default()
+                },
+            ),
+            ok("delete"),
+        ]);
+        run(
+            "REPORT REQUEST create AS setup SHOW(HttpStatus)\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        // Same precedence as the ordinary send: the response is written last
+        // and wins over the value the request went out with.
+        assert_eq!(
+            fake.call_vars("delete").get("sid").map(String::as_str),
+            Some("SERVER")
+        );
+    }
+
+    #[test]
+    fn a_captured_name_outranks_the_generated_one_of_the_same_name() {
+        // A request may mint a placeholder id and then read the server's
+        // canonical one out of the answer. The response is written second and
+        // has to win — and the gate that comes with it is the capture's, since
+        // the value downstream is now the one that came off the wire.
+        let entries = [
+            HurlEntry {
+                generators: vec![("sid".to_string(), "uuid()".to_string())],
+                ..graph_entry("create", &["sid"], &[])
+            },
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            (
+                "create",
+                Canned {
+                    status: 200,
+                    captures: vec![("sid".to_string(), "SERVER".to_string())],
+                    generated: vec![("sid".to_string(), "MINTED".to_string())],
+                    ..Default::default()
+                },
+            ),
+            ok("delete"),
+        ]);
+        let res = run(
+            "REQUEST create AS setup\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        assert_eq!(
+            fake.call_vars("delete").get("sid").map(String::as_str),
+            Some("SERVER")
+        );
+    }
+
+    #[test]
+    fn depends_orders_two_steps_that_share_no_data() {
+        // The case inference cannot reach: an upload whose result is fetched
+        // later by an id that was a parameter all along captures nothing, so
+        // nothing in the text ties the two together. `DEPENDS` is how the
+        // author supplies the edge that is genuinely invisible.
+        let entries = [graph_entry("fetch", &[], &[]), graph_entry("put", &[], &[])];
+        let fake = Fake::new(&[ok("fetch"), ok("put")]);
+        let res = run(
+            "GRAPH\n    REQUEST fetch DEPENDS put\n    REQUEST put\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.call_order(), ["put", "fetch"]);
+    }
+
+    #[test]
+    fn a_skip_propagates_through_a_step_whose_other_dependency_succeeded() {
+        // The join is the shape that decides whether a skip can ever release a
+        // step that is ready to *run*: `join` waits on both `mid` and `good`,
+        // and `good` succeeds, so it is `mid` being skipped that finally frees
+        // it. It must still be skipped rather than sent — a half-satisfied step
+        // has no value for the dependency it never got. The scheduler leans on
+        // this: because a skip only ever frees more skips, resolving a cascade
+        // holds no request back.
+        let entries = [
+            graph_entry("boom", &["b"], &[]),
+            graph_entry("good", &["g"], &[]),
+            graph_entry("mid", &["m"], &["b"]),
+            graph_entry("join", &[], &["m", "g"]),
+        ];
+        let fake = Fake::new(&[
+            failing("boom"),
+            ok_capturing("good", &[("g", "G")]),
+            ok_capturing("mid", &[("m", "M")]),
+            ok("join"),
+        ]);
+        let res = run(
+            "PARALLEL(4) GRAPH\n    REQUEST boom\n    REQUEST good\n    REQUEST mid\n    REQUEST join\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let mut sent = fake.call_order();
+        sent.sort();
+        assert_eq!(sent, ["boom", "good"], "the join was sent anyway");
+        assert_eq!(res.skipped, ["mid", "join"]);
+    }
+
+    #[test]
+    fn a_failed_step_skips_everything_downstream_of_it() {
+        // Recursively, and only downstream: `c` depends on `b` depends on `a`,
+        // and `d` on nothing. `a` failing must take `b` and `c` with it and
+        // leave `d` alone — an unrelated branch has no reason to stop.
+        let entries = [
+            graph_entry("a", &["t"], &[]),
+            graph_entry("b", &["u"], &["t"]),
+            graph_entry("c", &[], &["u"]),
+            graph_entry("d", &[], &[]),
+        ];
+        let fake = Fake::new(&[failing("a"), ok("b"), ok("c"), ok("d")]);
+        let res = run(
+            "GRAPH\n    REQUEST a\n    REQUEST b\n    REQUEST c\n    REQUEST d\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(fake.call_order(), ["a", "d"]);
+        assert_eq!(res.skipped, ["b", "c"]);
+    }
+
+    #[test]
+    fn a_skipped_reported_step_says_so_in_its_row() {
+        // The one thing a reader must not be able to conclude is that it
+        // passed, so the cell is filled rather than left blank: an empty cell
+        // is indistinguishable from a request that returned nothing.
+        let entries = [graph_entry("a", &["t"], &[]), graph_entry("b", &[], &["t"])];
+        let fake = Fake::new(&[failing("a"), ok("b")]);
+        let res = run(
+            "GRAPH\n    REQUEST a\n    REPORT REQUEST b\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(res.skipped, ["b"]);
+        let cell = res.rows[0]
+            .cells
+            .get("b.Error")
+            .cloned()
+            .unwrap_or_default();
+        assert!(cell.contains("skipped"), "{cell}");
+        assert!(cell.contains('a'), "{cell}");
+    }
+
+    #[test]
+    fn a_cleanup_runs_after_the_block_not_where_it_is_written() {
+        // Written beside the thing it tears down, run when the work is done.
+        let entries = [
+            graph_entry("purge", &[], &[]),
+            graph_entry("a", &[], &[]),
+            graph_entry("b", &[], &[]),
+        ];
+        let fake = Fake::new(&[ok("purge"), ok("a"), ok("b")]);
+        let res = run(
+            "CLEANUP purge\nREQUEST a\nREQUEST b\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.call_order(), ["a", "b", "purge"]);
+    }
+
+    #[test]
+    fn cleanups_unwind_in_reverse_order_of_what_they_tear_down() {
+        // `close_session` needs the session, `revoke` needs the token, and the
+        // token was obtained first — so the session is closed before the token
+        // is revoked, which is the only order that works.
+        let entries = [
+            graph_entry("login", &["token"], &[]),
+            graph_entry("open", &["sid"], &["token"]),
+            graph_entry("revoke", &[], &["token"]),
+            graph_entry("close", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            ok_capturing("login", &[("token", "T")]),
+            ok_capturing("open", &[("sid", "S")]),
+            ok("revoke"),
+            ok("close"),
+        ]);
+        let res = run(
+            "REQUEST login\nREQUEST open\nCLEANUP revoke\nCLEANUP close\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.call_order(), ["login", "open", "close", "revoke"]);
+    }
+
+    #[test]
+    fn a_cleanup_survives_a_failure_it_does_not_depend_on() {
+        // The whole reason `CLEANUP` is a construct rather than a trailing
+        // `REQUEST`: teardown has to stay alive through exactly the failures it
+        // exists to clean up after. `work` failing must not leak the session.
+        let entries = [
+            graph_entry("login", &["token"], &[]),
+            graph_entry("work", &[], &["token"]),
+            graph_entry("revoke", &[], &["token"]),
+        ];
+        let fake = Fake::new(&[
+            ok_capturing("login", &[("token", "T")]),
+            failing("work"),
+            ok("revoke"),
+        ]);
+        let res = run(
+            "REQUEST login\nREQUEST work\nCLEANUP revoke\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(fake.call_order().contains(&"revoke".to_string()));
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+    }
+
+    #[test]
+    fn a_cleanup_is_skipped_when_the_thing_it_tears_down_was_never_built() {
+        // Nothing to tear down, and saying "failed" about it would bury the
+        // real failure under a second one caused entirely by the first.
+        let entries = [
+            graph_entry("login", &["token"], &[]),
+            graph_entry("revoke", &[], &["token"]),
+        ];
+        let fake = Fake::new(&[failing("login"), ok("revoke")]);
+        let res = run("REQUEST login\nCLEANUP revoke\n", &entries, &[], &[], &fake);
+        assert_eq!(fake.call_order(), ["login"]);
+        assert_eq!(res.skipped, ["revoke"]);
+        assert!(
+            res.warnings.iter().any(|w| w.contains("revoke")),
+            "{:?}",
+            res.warnings
+        );
+    }
+
+    #[test]
+    fn a_cleanup_that_needs_nothing_always_runs() {
+        // The intended degenerate case, not an omission.
+        let entries = [graph_entry("a", &[], &[]), graph_entry("purge", &[], &[])];
+        let fake = Fake::new(&[failing("a"), ok("purge")]);
+        let res = run("REQUEST a\nCLEANUP purge\n", &entries, &[], &[], &fake);
+        assert_eq!(fake.call_order(), ["a", "purge"]);
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+    }
+
+    #[test]
+    fn a_failing_cleanup_warns_rather_than_erroring() {
+        // Letting a leaked test resource turn a green run red would train
+        // everyone to ignore the exit code.
+        let entries = [graph_entry("a", &[], &[]), graph_entry("purge", &[], &[])];
+        let fake = Fake::new(&[ok("a"), failing("purge")]);
+        let res = run("REQUEST a\nCLEANUP purge\n", &entries, &[], &[], &fake);
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(res.warnings.len(), 1, "{:?}", res.warnings);
+        assert!(res.warnings[0].contains("purge"), "{:?}", res.warnings);
     }
 
     #[test]
@@ -2874,6 +6310,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: Some(&sink),
+            shuffle: None,
         };
         let result = run_flow_raw(&flow, &ctx);
         let streamed = streamed.into_inner().unwrap();
@@ -2911,8 +6348,9 @@ mod tests {
         assert_eq!(res.rows.len(), 2);
         assert_eq!(res.rows[0].target, Some("au".to_string()));
         assert_eq!(res.rows[1].target, Some("eu".to_string()));
-        // ENVS is the comparison axis: not part of the row key.
-        assert!(res.rows[0].key.is_empty());
+        // A plain list assigns no roles, so nothing pairs across it: its value
+        // is part of the row key like any other loop's.
+        assert_eq!(res.rows[0].key, vec!["au".to_string()]);
         // The env's vars are visible in the row snapshot.
         assert_eq!(res.rows[0].vars.get("REGION"), Some(&"au-1".to_string()));
     }
@@ -2949,6 +6387,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: Some(&sink),
+            shuffle: None,
         };
         let result = run_flow_raw(&flow, &ctx);
         let streamed = streamed.into_inner().unwrap();
@@ -3024,6 +6463,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: Some(&sink),
+            shuffle: None,
         };
         let result = run_flow_raw(&flow, &ctx);
         let events = events.into_inner().unwrap();
@@ -3147,6 +6587,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -3287,6 +6728,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 2, "one row per matched jpg");
@@ -3334,6 +6776,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 2, "one row per case folder: {:?}", res.rows);
@@ -3379,6 +6822,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.rows.is_empty());
@@ -3464,8 +6908,10 @@ mod tests {
                 let v = vars.get("VERDICT").cloned().unwrap_or_default();
                 let body = format!("{{\"overall\":\"{v}\"}}");
                 RunOutput {
+                    generated: Default::default(),
                     entries: vec![EntryOutcome {
                         entry_index: 0,
+                        superseded: false,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -3516,6 +6962,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -3557,8 +7004,10 @@ mod tests {
                 let v = vars.get("VERDICT").cloned().unwrap_or_default();
                 let body = format!("{{\"overall\":\"{v}\"}}");
                 RunOutput {
+                    generated: Default::default(),
                     entries: vec![EntryOutcome {
                         entry_index: 0,
+                        superseded: false,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -3598,6 +7047,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let first = run_flow(&flow, &ctx);
         let snap_path = dir.join("proc.baseline");
@@ -3618,6 +7068,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let second = run_flow(&flow2, &ctx2);
 
@@ -3661,8 +7112,10 @@ mod tests {
                 let v = vars.get("VERDICT").cloned().unwrap_or_default();
                 let body = format!("{{\"overall\":\"{v}\"}}");
                 RunOutput {
+                    generated: Default::default(),
                     entries: vec![EntryOutcome {
                         entry_index: 0,
+                        superseded: false,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -3703,6 +7156,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let first = run_flow(&base_flow, &base_ctx);
         let snap_path = dir.join("prod.baseline");
@@ -3731,6 +7185,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let cmp = run_flow(&cmp_flow, &cmp_ctx);
 
@@ -3814,6 +7269,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let first = run_flow(&flow, &ctx);
         let snap_path = dir.join("proc.baseline");
@@ -3851,6 +7307,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 1, "rows still produced");
@@ -4578,6 +8035,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -4647,6 +8105,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -4694,8 +8153,10 @@ mod tests {
                 let v = vars.get("VERDICT").cloned().unwrap_or_default();
                 let body = format!("{{\"overall\":\"{v}\"}}");
                 RunOutput {
+                    generated: Default::default(),
                     entries: vec![EntryOutcome {
                         entry_index: 0,
+                        superseded: false,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -4751,6 +8212,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         std::fs::remove_dir_all(&dir).ok();
@@ -4815,6 +8277,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         // The snapshot answers `yes` everywhere: right on row a, wrong on row b.
         let first = run_flow(&parse_flow(body).expect("flow parses"), &ctx);
@@ -4854,6 +8317,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(
@@ -4883,6 +8347,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(
@@ -4918,6 +8383,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.errors.is_empty(), "{:?}", res.errors);
@@ -4953,6 +8419,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(
@@ -4981,6 +8448,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(
@@ -5005,6 +8473,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.verdicts.is_empty() && res.truths.is_empty());
@@ -5031,6 +8500,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.images.is_empty());
@@ -5234,8 +8704,10 @@ mod helper_collection_tests {
             fn run(&self, base: &HurlEntry, _vars: &HashMap<String, String>) -> RunOutput {
                 self.0.lock().unwrap().push(base.title.clone());
                 RunOutput {
+                    generated: Default::default(),
                     entries: vec![EntryOutcome {
                         entry_index: 0,
+                        superseded: false,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -5276,6 +8748,7 @@ mod helper_collection_tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let result = run_flow(&flow, &ctx);
         assert_eq!(
@@ -5317,8 +8790,10 @@ mod timing_column_tests {
             let ms = 100 + n.len() as u64;
             n.push(ms);
             RunOutput {
+                generated: Default::default(),
                 entries: vec![EntryOutcome {
                     entry_index: 0,
+                    superseded: false,
                     method: base.method.clone(),
                     url: base.url.clone(),
                     status: 200,
@@ -5359,6 +8834,7 @@ mod timing_column_tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         run_flow(&flow, &ctx)
     }

@@ -17,6 +17,28 @@ use super::flow::{Header, ImageSpec};
 /// comparison axis, not a row axis) but available as a column source.
 pub const TARGET_COLUMN: &str = "TARGET";
 
+/// Which side of an `ENVS` comparison a row was produced on.
+///
+/// Four states, not three, because "this row was produced under a clause that
+/// assigns no roles" and "nobody recorded a role for this row" are different
+/// facts and only one of them may be guessed at. Collapsing them meant a row
+/// from a plain `ENVS "prod","staging"` loop was looked up by *name* in the
+/// role sets of an unrelated comparison elsewhere in the flow, dragged into
+/// that collapse, and written out with a confident verdict about a comparison
+/// it was never part of.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RowRole {
+    /// No role was recorded: a row from a stored snapshot, or one built outside
+    /// a run. The collapse may fall back to matching its target by name.
+    #[default]
+    Unknown,
+    /// Produced under a clause that assigns no roles — a plain `ENVS` list, so
+    /// this row compares against nothing and passes the collapse through.
+    Unassigned,
+    Baseline,
+    Candidate,
+}
+
 /// One output row: one innermost-loop iteration (or the single row of a
 /// loop-free flow). A row is created at *plan* time (see the streaming/slot
 /// model) and its cells are filled as the run progresses.
@@ -44,6 +66,32 @@ pub struct ReportRow {
     /// The ENVS target (environment name) this row was produced under, if the
     /// flow loops over `ENVS`. `None` for a flow with no `ENVS` loop.
     pub target: Option<String>,
+    /// Which side of a comparison produced this row, when the `ENVS` clause
+    /// assigned it one.
+    ///
+    /// A role is a *position in one comparison*, not a property of the
+    /// environment's name. Rolling pairs — `[("v1","v2"), ("v2","v3")]` with
+    /// `BASELINE("{{A}}"), COMPARISON("{{B}}")` — make `v2` the candidate in
+    /// one iteration and the baseline in the next, so asking whether a name is
+    /// "a baseline" has no single answer. Recorded where the row is produced,
+    /// which is the only place that knows.
+    pub role: RowRole,
+    /// *Which* comparison that role is a position in: an identity for the
+    /// `ENVS` clause the row was produced under, stable across its visits.
+    ///
+    /// A side is meaningless without the comparison it belongs to. Two
+    /// independent clauses in one flow both drop their own environment axis
+    /// from the row key — that is what lets a baseline and its candidate meet
+    /// — so their rows land on the *same* key, and a collapse that indexed
+    /// baselines by key alone kept whichever arrived first and measured the
+    /// other comparison's candidates against it. Rolling pairs share one
+    /// identity on purpose: they are the same clause, told apart by the
+    /// enclosing loop's key part.
+    ///
+    /// `None` for a row with no comparison — and for one restored from a
+    /// snapshot, which is matched leniently so a saved baseline still stands in
+    /// for a live run.
+    pub comparison: Option<String>,
 }
 
 /// A whole run's output: the rows plus the first-seen order of produced column
@@ -52,6 +100,28 @@ pub struct ReportRow {
 #[derive(Debug, Clone, Default)]
 pub struct ReportResult {
     pub rows: Vec<ReportRow>,
+    /// What each `ENVS` role's written target resolved to when the run actually
+    /// visited it, keyed by the text as written.
+    ///
+    /// The collapse has to look for the same string the rows carry, and it runs
+    /// outside the interpreter, where it can only re-derive a role's identity
+    /// from the declared parameters. The run resolves one against everything in
+    /// scope — captures included — so a role written
+    /// `BASELINE(FILE("snap/{{setup.build}}.baseline"))` diverged: the rows were
+    /// tagged with the real path while the collapse looked for the literal, and
+    /// every comparison came back unmatched. Carrying the answer out is the only
+    /// way the two can agree, since the second derivation cannot see what the
+    /// first one saw.
+    ///
+    /// **All** of the answers, in first-seen order, because one written text is
+    /// not one target: a clause inside a `FOR` loop is resolved once per
+    /// iteration, and `BASELINE("prod-{{R}}")` really does name a different
+    /// environment each time. Keeping only the last left every earlier
+    /// iteration's rows measured against a stranger's baseline, or against none
+    /// at all. A role named through a variable now behaves exactly as if every
+    /// value it takes had been written out literally, which is the only story
+    /// that stays true as the scope changes.
+    pub role_targets: HashMap<String, Vec<String>>,
     /// Produced cell-column keys in first-seen order — the default column set.
     pub column_order: Vec<String>,
     /// Row indices whose result hasn't streamed in yet — the skeleton slots a
@@ -71,6 +141,24 @@ pub struct ReportResult {
     /// Non-fatal problems encountered during the run (a request that failed, a
     /// producer that matched nothing, …). Every issue still leaves a row.
     pub errors: Vec<String>,
+    /// Problems that are worth saying but must not change the verdict — a
+    /// `CLEANUP` that failed, so far the only kind.
+    ///
+    /// Teardown failing does not make the run's answer wrong: the requests
+    /// under test already passed or failed on their own terms, and letting a
+    /// leaked test resource turn a green run red would train everyone to
+    /// ignore the exit code.
+    pub warnings: Vec<String>,
+    /// Steps that were not run because something they depend on did not
+    /// succeed, in the order they were skipped.
+    ///
+    /// Kept apart from `errors` because a skip is a distinct verdict, not a
+    /// quieter failure: the step has no result at all, nothing about it is
+    /// known, and the one thing a reader must not conclude is that it passed.
+    /// It is also what separates exit code 3 from exit code 1 — "some of this
+    /// run never happened" is a different fact from "some of it went wrong",
+    /// and a release check wants to act on it differently.
+    pub skipped: Vec<String>,
     /// Summary statistics requested per output-column *header* by a
     /// `REPORT … AS <header> STATISTICS(…)` statement. Merged into the resolved
     /// columns at render time (a `columns:` directive's own `STATISTICS(…)`
@@ -288,59 +376,13 @@ impl ReportResult {
                 })
                 .collect(),
         };
-        // Merge in per-header statistics requested by `REPORT … STATISTICS(…)`
-        // statements — but never override stats a `columns:` spec set inline.
-        if !self.column_stats.is_empty() {
-            for col in &mut columns {
-                if col.stats.is_empty()
-                    && let Some(stats) = self.column_stats.get(&col.header)
-                {
-                    col.stats = stats.clone();
-                }
-                // A `BASELINE(…) SHOW(f STATISTICS(…))` can't name its column
-                // statically: the comparison produces one `baseline.<alias>.f`
-                // per alias that emits `f`, and the aliases are only known once
-                // the run has produced rows. It is recorded as `baseline.*.f`
-                // and matched here by prefix and suffix.
-                if col.stats.is_empty()
-                    && let Some(rest) = col.header.strip_prefix("baseline.")
-                    && let Some((_, field)) = rest.rsplit_once('.')
-                    && let Some(stats) = self.column_stats.get(&format!("baseline.*.{field}"))
-                {
-                    col.stats = stats.clone();
-                }
-            }
-        }
-        // Likewise for `IMAGE(…)` hints, and on the same precedence rule: an
-        // inline hint in the `columns:` directive is the more specific
-        // statement of intent, so it is never overridden.
-        if !self.column_images.is_empty() {
-            for col in &mut columns {
-                if col.image.is_none()
-                    && let Some(img) = self.column_images.get(&col.header)
-                {
-                    col.image = Some(*img);
-                }
-            }
-        }
-        // And for `TRUTH "…"`, on the same precedence rule.
-        if !self.column_truths.is_empty() {
-            for col in &mut columns {
-                if col.truth.is_none()
-                    && let Some(t) = self.column_truths.get(&col.header)
-                {
-                    col.truth = Some(t.clone());
-                }
-            }
-        }
-        // `DETAIL` is a flag rather than a value, so "the directive already said
-        // so" is the whole precedence rule: a `columns:` spec can add the flag,
-        // never take it away.
-        if !self.column_details.is_empty() {
-            for col in &mut columns {
-                col.detail = col.detail || self.column_details.contains(&col.header);
-            }
-        }
+        apply_column_meta(
+            &mut columns,
+            &self.column_stats,
+            &self.column_images,
+            &self.column_truths,
+            &self.column_details,
+        );
         columns
     }
 
@@ -783,6 +825,60 @@ impl OutputColumn {
 /// `columns := column-spec (',' column-spec)*`,
 /// `column-spec := source ('|' source)* ['AS' name]`. A quoted `AS` name may
 /// contain spaces/commas; sources are bare `IDENT('.'IDENT)?` tokens.
+/// Merge what the flow said about each column into the resolved column set.
+///
+/// One rule, stated once, for all four kinds of metadata: **a `columns:`
+/// directive is never overridden.** An inline clause in the directive is the
+/// more specific statement of intent — the author naming that column
+/// deliberately — so the flow's value fills a gap and never replaces an answer.
+/// `DETAIL` is a flag rather than a value, which makes "the directive already
+/// said so" the whole rule there: either source can add it, neither can take it
+/// away.
+///
+/// Shared because it was written twice and the two copies had already drifted:
+/// one consumed each truth as it matched and the other did not, so two columns
+/// resolving to the same header — which `parse_columns` permits, as
+/// `columns: x AS T, y AS T` — disagreed about whether the second one had a
+/// truth. Scoring used the copy that kept it.
+pub fn apply_column_meta(
+    columns: &mut [OutputColumn],
+    stats: &std::collections::HashMap<String, Vec<StatKind>>,
+    images: &std::collections::HashMap<String, ImageSpec>,
+    truths: &std::collections::HashMap<String, String>,
+    details: &std::collections::HashSet<String>,
+) {
+    for col in columns.iter_mut() {
+        if col.stats.is_empty()
+            && let Some(s) = stats.get(&col.header)
+        {
+            col.stats = s.clone();
+        }
+        // A `BASELINE(…) SHOW(f STATISTICS(…))` can't name its column
+        // statically: the comparison produces one `baseline.<alias>.f` per
+        // alias that emits `f`, and the aliases are only known once the run has
+        // produced rows. It is recorded as `baseline.*.f` and matched here by
+        // prefix and suffix.
+        if col.stats.is_empty()
+            && let Some(rest) = col.header.strip_prefix("baseline.")
+            && let Some((_, field)) = rest.rsplit_once('.')
+            && let Some(s) = stats.get(&format!("baseline.*.{field}"))
+        {
+            col.stats = s.clone();
+        }
+        if col.image.is_none()
+            && let Some(img) = images.get(&col.header)
+        {
+            col.image = Some(*img);
+        }
+        if col.truth.is_none()
+            && let Some(t) = truths.get(&col.header)
+        {
+            col.truth = Some(t.clone());
+        }
+        col.detail = col.detail || details.contains(&col.header);
+    }
+}
+
 pub fn parse_columns(spec: &str) -> Vec<OutputColumn> {
     split_top_level(spec, ',')
         .into_iter()
@@ -1252,6 +1348,7 @@ mod tests {
 
     fn row(cells: &[(&str, &str)], vars: &[(&str, &str)], target: Option<&str>) -> ReportRow {
         ReportRow {
+            role: RowRole::default(),
             cells: cells
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1262,6 +1359,7 @@ mod tests {
                 .collect(),
             key: vec![],
             path: Vec::new(),
+            comparison: None,
             target: target.map(str::to_string),
         }
     }

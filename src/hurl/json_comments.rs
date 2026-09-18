@@ -15,7 +15,7 @@ use std::borrow::Cow;
 
 /// What the scanner found at a given span of body text.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Piece {
+pub(super) enum Piece {
     /// Ordinary source outside any string, template or comment.
     Text,
     /// A complete string literal, both quotes included. Opaque: a `//` in here
@@ -35,7 +35,7 @@ enum Piece {
 /// comments simply run to the end of the input rather than being treated as an
 /// error: this runs against whatever the user has typed so far, so half-written
 /// text is the normal case and must not panic or mis-classify the remainder.
-fn scan(src: &str) -> Vec<(Piece, usize, usize)> {
+pub(super) fn scan(src: &str) -> Vec<(Piece, usize, usize)> {
     let b = src.as_bytes();
     let mut out: Vec<(Piece, usize, usize)> = Vec::new();
     let mut i = 0usize;
@@ -247,7 +247,7 @@ fn json_shape(src: &str) -> String {
 }
 
 /// Whether body text is JSON once its templates are stood in for.
-fn parses_as_json(src: &str) -> bool {
+pub(super) fn parses_as_json(src: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(&json_shape(src)).is_ok()
 }
 

@@ -1,7 +1,22 @@
 //! PaperBoy — a Rust-native API client (Postman alternative). Front-ends over
-//! one core: a terminal UI (default), a headless CLI runner
-//! (`-c collection.hurl [-e environment.vars]`), and — behind the `gui` Cargo
-//! feature — a native graphical UI.
+//! one core: a terminal UI (default, behind the `tui` Cargo feature), a
+//! headless CLI runner (`-c collection.hurl [-e environment.vars]`, always
+//! built), and — behind the `gui` Cargo feature — a native graphical UI.
+
+// Dead-code analysis is authoritative in the configurations that include the
+// terminal UI — the default build and `--features gui`. A build without it
+// (`--no-default-features`, with or without `gui`) is a partial configuration:
+// it drops several hundred core items that exist to serve a front-end — wizard
+// state machines, draw helpers, the `Strings` table's rows, and the re-exports
+// that feed them — and reporting each one would be noise, not a finding.
+//
+// Keying the suppression on `tui` works because the terminal UI is the superset
+// front-end: everything shared is used by it, and the items that belong to the
+// GUI alone already carry the mirror-image `not(feature = "gui")` annotation at
+// their definitions. So nothing escapes analysis — an item dead in every
+// configuration is still reported by the two builds above, which CI runs
+// alongside the partial ones.
+#![cfg_attr(not(feature = "tui"), allow(dead_code, unused_imports))]
 
 mod cli;
 mod collection;
@@ -28,31 +43,65 @@ mod probe;
 mod remote_flow;
 mod report;
 mod report_cli;
+// The `.trail` syntax highlighter. It lives at the top level, not under `tui`,
+// because both front-ends draw from it: it emits ratatui spans, which the GUI
+// converts to egui text sections rather than reimplementing the rules and
+// letting the two drift. Keeping it here means a GUI-only build does not have
+// to pull in the terminal UI just to reach it. It is still drawing code, so a
+// headless build leaves it out entirely.
+#[cfg(any(feature = "tui", feature = "gui"))]
+mod report_highlight;
 mod request;
 mod save_flow;
 mod session;
 mod shared_utils;
 mod theme;
 mod tree;
+#[cfg(feature = "tui")]
 mod tui;
+mod vars_view;
 mod workspace;
 
 use clap::Parser;
 
-/// PaperBoy — a Rust API client with a terminal UI and a headless runner.
-#[derive(Parser)]
-#[command(
-    name = "paperboy",
-    version,
-    about = "PaperBoy — a Rust-native API client (a Postman alternative).",
-    long_about = "PaperBoy — a Rust-native API client (a Postman alternative).\n\n\
-Runs in one of four modes:\n\
-\x20 TUI  (default)          a terminal user interface\n\
+/// How this build describes the mode it runs in when given no `-c`/`-r`.
+///
+/// A build without the TUI must not advertise one: the help is the only thing
+/// telling a container user what their binary can actually do, and "TUI
+/// (default)" on a binary that has none is a bug report waiting to happen.
+#[cfg(feature = "tui")]
+const DEFAULT_MODE: &str = "\x20 TUI  (default)          a terminal user interface\n";
+#[cfg(all(not(feature = "tui"), feature = "gui"))]
+const DEFAULT_MODE: &str =
+    "\x20 GUI  (-g/--gui)         a native graphical interface (this build has no TUI)\n";
+#[cfg(all(not(feature = "tui"), not(feature = "gui")))]
+const DEFAULT_MODE: &str = "";
+
+#[cfg(feature = "tui")]
+const DEFAULT_EXAMPLE: &str =
+    "\x20 paperboy                            Launch the terminal UI (default)\n";
+#[cfg(all(not(feature = "tui"), feature = "gui"))]
+const DEFAULT_EXAMPLE: &str = "\x20 paperboy --gui                      Launch the graphical UI\n";
+#[cfg(all(not(feature = "tui"), not(feature = "gui")))]
+const DEFAULT_EXAMPLE: &str = "";
+
+/// Built at first use rather than written as a literal so the mode list and the
+/// examples can differ by feature — see [`DEFAULT_MODE`].
+static LONG_ABOUT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "PaperBoy — a Rust-native API client (a Postman alternative).\n\n\
+Runs in one of these modes:\n\
+{DEFAULT_MODE}\
 \x20 CLI  (-c/--collection)  run a Hurl or Postman collection headlessly, then exit\n\
 \x20 Report (-r/--report)    run a PaperTrail report against a collection, then exit\n\
-\x20 Import (--postman-import)  download a Postman workspace over the API, then exit",
-    after_help = "Examples:\n\
-\x20 paperboy                            Launch the terminal UI (default)\n\
+\x20 Import (--postman-import)  download a Postman workspace over the API, then exit"
+    )
+});
+
+static AFTER_HELP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "Examples:\n\
+{DEFAULT_EXAMPLE}\
 \x20 paperboy -c collection.hurl         Run a collection headlessly\n\
 \x20 paperboy -c collection.hurl -e environment.vars   Run a collection with an environment\n\
 \x20 paperboy -c collection.hurl --batch    Run as one batch (preserves cookies across requests)\n\
@@ -61,6 +110,8 @@ Runs in one of four modes:\n\
 \x20 paperboy -c collection.hurl -e prod.vars -e staging.vars -r report.trail   Run a baseline/comparison report\n\
 \x20 paperboy -c collection.hurl -r report.trail --dry-run   Preview a report without sending anything\n\
 \x20 paperboy -c collection.hurl -r report.trail -o out.csv   Write the report to a file (- = stdout)\n\
+\x20 paperboy -r report.trail -o out.html -o out.json   One run, several formats\n\
+\x20 paperboy -r report.trail --param CASES_DIR=./batch-07   Run a report, setting a PARAM it declares\n\
 \x20 paperboy --postman-import                          List the Postman workspaces your API key can see\n\
 \x20 paperboy --postman-import --postman-workspace ID -o ./API   Download a whole Postman workspace\n\
 \x20 paperboy --postman-import --postman-all -o ./API           Download every workspace the key can see\n\n\
@@ -72,6 +123,17 @@ Environment (.vars) entries are KEY=value, where the value is a literal or a\n\
 \x20 AWS SSM parameter   DB_PASSWORD={{ ssm:/path/to/param }}\n\n\
 Collections are Hurl files (.hurl) or Postman collection exports (.json);\n\
 Postman JSON is imported automatically."
+    )
+});
+
+/// PaperBoy — a Rust API client with a terminal UI and a headless runner.
+#[derive(Parser)]
+#[command(
+    name = "paperboy",
+    version,
+    about = "PaperBoy — a Rust-native API client (a Postman alternative).",
+    long_about = LONG_ABOUT.as_str(),
+    after_help = AFTER_HELP.as_str()
 )]
 struct Cli {
     /// Run the given collection (Hurl `.hurl` or Postman `.json`) headlessly and print the results.
@@ -111,13 +173,49 @@ struct Cli {
     #[arg(long, requires = "report")]
     dry_run: bool,
 
-    /// With `-r`: where to write the report output. `-` writes CSV to stdout
-    /// (for piping); a path's extension selects the format (`.csv`, `.json`,
-    /// `.html` or `.xlsx`); omitted derives the file from the report's
-    /// `# output:`/`# name:` headers (next to the report file, honouring the
-    /// `{time}` token).
-    #[arg(short = 'o', long, value_name = "FILE", requires = "report")]
-    output: Option<String>,
+    /// With `-r`: run only these steps and whatever they depend on
+    /// (comma-separated step names). Every named step must be inside a `GRAPH`
+    /// region — only a region declares the complete graph that a closure needs,
+    /// so a target anywhere else is an error rather than a silent full run.
+    #[arg(long, value_name = "STEPS", value_delimiter = ',', requires = "report")]
+    targets: Vec<String>,
+
+    /// With `-r`: vary the order steps are taken within a `GRAPH` region, and
+    /// print the seed used. A region is a *claim* that its dependency edges are
+    /// the complete set, and that claim cannot be verified — but it can be
+    /// falsified. Without this the earliest-written tie-break silently supplies
+    /// the ordering a missing edge forgot, and the gap is never found. Pass
+    /// `--shuffle=SEED` to replay a failure exactly.
+    #[arg(long, value_name = "SEED", num_args = 0..=1, requires = "report")]
+    shuffle: Option<Option<u64>>,
+
+    /// Where to write the output. With `-r`, **repeatable**: give it once per
+    /// format and one run writes them all from the same result — `-o
+    /// report.html -o report.json` yields a rendering to show and a structure
+    /// to parse without running the requests twice. `-` writes CSV to stdout
+    /// (for piping) and may be given at most once; a path's extension selects
+    /// the format (`.csv`, `.json`, `.html`, `.xlsx` or `.pdf`); omitted
+    /// derives a single file from the report's `# output:`/`# name:` headers
+    /// (next to the report file, honouring the `{time}` token). With
+    /// `--postman-import` it is instead the download directory, and takes one
+    /// value.
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    outputs: Vec<String>,
+
+    /// With `-r`: set a `PARAM` declared by the report, as `NAME=VALUE`.
+    /// Repeatable, and the value wins over the default written in the `.trail`
+    /// file (which is never rewritten). This is what lets one report serve many
+    /// runs — `--param CASES_DIR=./batch-07` points a `FOR … IN FOLDERS
+    /// "{{CASES_DIR}}"` loop somewhere new without editing the script. A name
+    /// the report doesn't declare is an error rather than a value that silently
+    /// does nothing.
+    #[arg(
+        long = "param",
+        value_name = "NAME=VALUE",
+        value_parser = report::params::parse_assignment,
+        requires = "report"
+    )]
+    params: Vec<(String, String)>,
 
     /// Launch the native graphical UI (eframe/egui) instead of the terminal UI.
     /// Ignored in the headless modes (`-c`/`-r`). Only available when built
@@ -180,15 +278,36 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
+    // `-o` belongs to a headless mode: `-r` writes the report there and
+    // `--postman-import` downloads into it. clap has no attribute for "requires
+    // one of these two", and the `requires = "report"` this carried instead
+    // rejected the documented `--postman-import --postman-workspace ID -o
+    // ./API` outright. Exit 2, the code clap itself uses for "you invoked me
+    // wrongly", so a caller can still tell a bad command line from a bad API.
+    if !cli.outputs.is_empty() && cli.report.is_none() && !cli.postman_import {
+        eprintln!("error: -o/--output requires -r/--report or --postman-import");
+        std::process::exit(2);
+    }
+
     // Headless Postman import (`--postman-import`): fetch a workspace over the
     // Postman API and exit. Checked before `-c`/`-r` because it produces the
     // collections those modes run, rather than running anything itself.
     if cli.postman_import {
+        // One download, one destination. Repeating `-o` is meaningful for a
+        // report (one result, several formats) and meaningless here, so it is
+        // refused rather than silently resolved to whichever came last.
+        if cli.outputs.len() > 1 {
+            eprintln!(
+                "error: --postman-import downloads into one directory, but -o was given {} times",
+                cli.outputs.len()
+            );
+            std::process::exit(2);
+        }
         std::process::exit(postman_cli::run(postman_cli::Args {
             key: cli.postman_key,
             workspace: cli.postman_workspace,
             all: cli.postman_all,
-            out: cli.output,
+            out: cli.outputs.into_iter().next(),
             what: cli.postman_what,
             base_url: cli.postman_base_url,
             format: cli.postman_format,
@@ -205,8 +324,11 @@ fn main() {
             cli.collection,
             cli.env,
             report,
-            cli.output,
+            cli.outputs,
             cli.dry_run,
+            cli.targets,
+            cli.shuffle,
+            cli.params.into_iter().collect(),
         ));
     }
 
@@ -226,11 +348,47 @@ fn main() {
     }
 
     // Terminal UI (the default).
+    std::process::exit(run_tui());
+}
+
+/// Launch the terminal UI, or explain why this build can't.
+///
+/// A `--no-default-features` build is headless on purpose (CI images, Docker),
+/// so reaching here means the user ran `paperboy` with no `-c`/`-r` and wanted
+/// the interactive front-end. Tell them how to get it rather than failing
+/// silently or, worse, exiting 0 as though something had run.
+#[cfg(feature = "tui")]
+fn run_tui() -> i32 {
     if let Err(e) = tui::run() {
         eprintln!("tui error: {e}");
-        std::process::exit(1);
+        return 1;
     }
-    std::process::exit(0);
+    0
+}
+
+/// A build with the GUI but not the TUI has a front-end — it just isn't this
+/// one. Calling itself headless and telling the user to reinstall would be
+/// advice to rebuild something they already have.
+#[cfg(all(not(feature = "tui"), feature = "gui"))]
+fn run_tui() -> i32 {
+    eprintln!(
+        "This build of PaperBoy has no terminal UI.\n\
+         Pass `-g/--gui` for the graphical one, or `-c <collection.hurl>` or \
+         `-r <report.trail>` to run headlessly."
+    );
+    1
+}
+
+#[cfg(all(not(feature = "tui"), not(feature = "gui")))]
+fn run_tui() -> i32 {
+    eprintln!(
+        "This build of PaperBoy is headless: it runs collections and reports, \
+         but has no user interface.\n\
+         Pass `-c <collection.hurl>` or `-r <report.trail>`, or reinstall with \
+         the terminal UI:\n\
+         \x20   cargo install paperboy --locked"
+    );
+    1
 }
 
 /// Launch the GUI, or explain why this build can't.

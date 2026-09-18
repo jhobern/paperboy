@@ -216,7 +216,7 @@ impl EnvVar {
 /// A loaded environment (one `.vars` file). Environments now live in a single
 /// global list ([`crate::tui::app::TuiApp::global_envs`]) rather than being
 /// owned by a single [`crate::collection::Collection`] — a collection instead
-/// holds an optional `linked_env_id` referencing one of these by [`id`](Self::id),
+/// holds an optional `env_id` referencing one of these by [`id`](Self::id),
 /// and any number of collections may link the same environment.
 #[derive(Debug, Clone)]
 pub struct Environment {
@@ -929,6 +929,28 @@ pub fn substitute(text: &str, vars: &HashMap<String, String>) -> String {
     PLACEHOLDER
         .replace_all(text, |caps: &Captures| match vars.get(&caps[1]) {
             Some(value) => value.clone(),
+            None => caps[0].to_string(),
+        })
+        .into_owned()
+}
+
+/// Rewrite `{{ OLD }}` to `{{ NEW }}` for every entry in `renames`, leaving
+/// every other placeholder — and every other scrap of the text — exactly as it
+/// was.
+///
+/// Renaming the reference rather than the value is what makes it safe to give
+/// a generator a different name than the one written in the file: the request
+/// still asks for the value it always asked for, under a name that now belongs
+/// to it alone. Inner spacing is normalised away (`{{ x }}` becomes `{{new}}`)
+/// because the placeholder is being rewritten wholesale anyway, and the one
+/// shape is what the rest of PaperBoy emits.
+pub fn rename_placeholders(text: &str, renames: &HashMap<String, String>) -> String {
+    if renames.is_empty() || !text.contains("{{") {
+        return text.to_string();
+    }
+    PLACEHOLDER
+        .replace_all(text, |caps: &Captures| match renames.get(&caps[1]) {
+            Some(new) => format!("{{{{{new}}}}}"),
             None => caps[0].to_string(),
         })
         .into_owned()

@@ -584,6 +584,7 @@ pub struct CaptureUpdate {
 
 /// The result of a "Run All" (Alt+F5) pass over an entire collection, routed
 /// back to its collection on the main thread.
+#[derive(Clone)]
 pub struct BatchRunUpdate {
     pub col_id: u64,
     /// Per-entry pass/fail, in the same order as `Collection::entries`.
@@ -600,6 +601,9 @@ pub struct BatchRunUpdate {
     /// than cleared, since that's still the last response actually received
     /// for it.
     pub responses: Vec<Option<ApiResponse>>,
+    /// The entry Hurl is currently retrying, if any: its position in `results`,
+    /// the attempt being made, and how many attempts the request allows. `None` once that entry produces an outcome.
+    pub retrying: Option<(usize, usize, crate::hurl::RetryLimit)>,
 }
 
 /// Build the Hurl entry to run for the selected entry, honoring an edited
@@ -667,6 +671,7 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
         baseline: None,
         last_run: base.last_run,
         last_response: None,
+        retry_attempt: None,
     }
 }
 
@@ -687,7 +692,13 @@ pub fn effective_vars_reporting<'a>(
     base: &HurlEntry,
     vars: &'a HashMap<String, String>,
 ) -> (Cow<'a, HashMap<String, String>>, Vec<GenError>) {
-    effective_vars_with(base, vars, &crate::generators::SystemSource::new())
+    // The source is told which request it is working for, so a block can sign
+    // or record what is about to be sent (`body()`, `url()`, `header(..)`).
+    effective_vars_with(
+        base,
+        vars,
+        &crate::generators::SystemSource::for_request(crate::generators::RequestFacts::of(base)),
+    )
 }
 
 /// [`effective_vars_reporting`] against a chosen world, so a caller that is
@@ -816,6 +827,20 @@ pub fn run_resolved_entry_reporting(
     file_root: Option<&std::path::Path>,
     extra_captures: &[(String, String)],
 ) -> (RunOutput, HashMap<String, String>, Vec<GenError>) {
+    run_resolved_entry_watching(base, vars, file_root, extra_captures, |_, _, _| {})
+}
+
+/// [`run_resolved_entry_reporting`], plus a hook called as each attempt at the
+/// request starts — see [`crate::hurl::run::run_hurl_watching`]. A send that is
+/// retried says nothing at all until the poll settles, so a front-end that
+/// wants to show what the wait is for has to be told as it happens.
+pub fn run_resolved_entry_watching(
+    base: &HurlEntry,
+    vars: &HashMap<String, String>,
+    file_root: Option<&std::path::Path>,
+    extra_captures: &[(String, String)],
+    on_attempt: impl FnMut(usize, usize, crate::hurl::RetryLimit),
+) -> (RunOutput, HashMap<String, String>, Vec<GenError>) {
     // Declared parameters are resolved *here*, not left to Hurl's own late
     // binding, because everything downstream works on resolved text: an
     // unresolved `{{FILE}}` in a `[Multipart]` file path would reach
@@ -829,6 +854,7 @@ pub fn run_resolved_entry_reporting(
             RunOutput {
                 entries: vec![],
                 error: Some(UNREADABLE_REQUEST_ERROR.to_string()),
+                generated: HashMap::new(),
             },
             HashMap::new(),
             Vec::new(),
@@ -849,6 +875,7 @@ pub fn run_resolved_entry_reporting(
             RunOutput {
                 entries: vec![],
                 error: Some(crate::i18n::summarise_gen_errors(&english, &gen_errors).join("; ")),
+                generated: HashMap::new(),
             },
             HashMap::new(),
             gen_errors,
@@ -873,6 +900,7 @@ pub fn run_resolved_entry_reporting(
             RunOutput {
                 entries: vec![],
                 error: Some(format!("Base64 file error: {e}")),
+                generated: generated.clone(),
             },
             generated,
             Vec::new(),
@@ -884,10 +912,16 @@ pub fn run_resolved_entry_reporting(
     let run_root = staged_dir.as_deref().or(file_root);
 
     let content = run_entry.to_hurl();
-    let out = run_hurl(&content, &vars, run_root);
+    let mut out = crate::hurl::run::run_hurl_watching(&content, &vars, run_root, on_attempt);
     if let Some(dir) = &staged_dir {
         let _ = std::fs::remove_dir_all(dir);
     }
+    // The block's results travel with the result as well as beside it. The
+    // tuple is read by the front-ends, which want the generated values to show
+    // the user; the field is read by anything holding only a `RunOutput` —
+    // notably the report interpreter, which threads them forward exactly as it
+    // threads captures, so `{{step.sid}}` names the value this send used.
+    out.generated = generated.clone();
     (out, generated, Vec::new())
 }
 
@@ -946,10 +980,25 @@ pub fn run_collection(
         // and the report interpreter stay in exact lockstep. A base64/staging
         // failure comes back as `RunOutput { entries: [], error }` and surfaces
         // via the `None` arm below.
-        let (out, generated, gen_errors) =
-            run_resolved_entry_reporting(&base, &vars, file_root.as_deref(), &[]);
+        let watch = Arc::clone(&state);
+        let (out, generated, gen_errors) = run_resolved_entry_watching(
+            &base,
+            &vars,
+            file_root.as_deref(),
+            &[],
+            |_, attempt, limit| {
+                if attempt == 0 {
+                    return;
+                }
+                if let Ok(mut r) = watch.lock() {
+                    r.retry_attempt = Some((attempt, limit));
+                }
+            },
+        );
         let mut r = state.lock().unwrap();
         r.loading = false;
+        // The wait is over however it ended, so the hint goes with it.
+        r.retry_attempt = None;
         // Kept structurally as well as in `error`: only the front-end knows
         // the language, and "Request error:" is the wrong heading for a
         // request that was never made (see `ApiResponse::error_text`).
@@ -964,6 +1013,11 @@ pub fn run_collection(
                 r.duration_ms = Some(eo.duration_ms);
                 // Surface a transport failure / failed assert on the status bar.
                 r.error = eo.error.or(out.error).unwrap_or_default();
+                // The `[Captures]` rows alone, kept on the response so the
+                // Captures tab can say what *this* request took. Cloned before
+                // the merge below, which folds the computed values in and so
+                // produces a set that must never be shown.
+                r.captures = eo.captures.clone();
                 // The block's values go back with the captures, so the next
                 // request sees a `nonce` this one computed exactly the way it
                 // sees a token this one captured. A `[Captures]` row of the
@@ -1011,9 +1065,11 @@ fn entry_response(eo: &EntryOutcome) -> ApiResponse {
         status_text: eo.status_text.clone(),
         body: Arc::from(eo.body.as_str()),
         loading: false,
+        retry_attempt: None,
         error: eo.error.clone().unwrap_or_default(),
         headers: eo.headers.clone(),
         assert_results: eo.asserts.clone(),
+        captures: eo.captures.clone(),
         duration_ms: Some(eo.duration_ms),
         // A "Run All" entry that ran has no generator failure to carry: the
         // whole-file block is expanded once, up front, and its failures are
@@ -1107,6 +1163,20 @@ pub fn run_all_entries(
         // request itself (Hurl's own reading). The rest stay in and Hurl
         // applies them, which is what a default should do.
         strip_bound_variable_options(&mut run_entries, &vars);
+        // Batch evaluates every `# [Gen]` block once into one shared variable
+        // set, so two requests computing the same name would be sent the same
+        // value — one request's nonce signing another's body. Give the later
+        // claimants their own names (and rewrite their own references to
+        // match) before the file is serialised, so batch computes a fresh
+        // value per request exactly as streaming does. Nothing is renamed
+        // unless it collides.
+        // What was renamed is not announced from here: the preflight warning
+        // has already named the requests that compute the same thing, before
+        // the run started, and the value itself appears in the captures panel
+        // under the name it was computed as.
+        if batch {
+            uniquify_batch_generators(&mut run_entries, &vars);
+        }
         let content = collection_to_hurl(&run_entries);
 
         let mut results: Vec<Option<bool>> = vec![None; total];
@@ -1156,6 +1226,11 @@ pub fn run_all_entries(
             // Bound *and* reported back as captures: a computed value is as
             // much a result of the run as a `[Captures]` row, and the request
             // after it — run on its own afterwards — needs to see it.
+            // A renamed block reports under its *renamed* name. Reporting both
+            // under the original was the alternative and is worse: the two
+            // requests genuinely computed two values, and one name can only
+            // show one of them, so the panel would quietly drop a value it had.
+            // `nonce_2` appears only where there really are two.
             captures.extend(blocks.bound.iter().map(|(k, v)| (k.clone(), v.clone())));
             vars.extend(blocks.bound);
         }
@@ -1186,6 +1261,21 @@ pub fn run_all_entries(
             // so it can be surfaced as the run's error below.
             let gen_errors: Rc<RefCell<Vec<crate::generators::GenError>>> = Rc::default();
             let record_errs = Rc::clone(&gen_errors);
+            // The cumulative snapshot, shared rather than owned by the
+            // after-each-entry hook: the retry hook pushes an update of its own
+            // between entries, and it has to carry everything already known
+            // (the drain applies a snapshot wholesale) rather than blank the
+            // markers the run has earned so far.
+            let snapshot = Rc::new(RefCell::new(BatchRunUpdate {
+                col_id,
+                results: results.clone(),
+                captures: captures.clone(),
+                responses: responses.clone(),
+                retrying: None,
+            }));
+            let record_entry = Rc::clone(&snapshot);
+            let record_attempt = Rc::clone(&snapshot);
+            let tx_attempt = tx.clone();
             let mut streamed = crate::hurl::run::run_hurl_streaming_with(
                 &content,
                 &vars,
@@ -1201,7 +1291,9 @@ pub fn run_all_entries(
                     let errs = crate::generators::expand(
                         &entry.generators,
                         &mut merged,
-                        &crate::generators::SystemSource::new(),
+                        &crate::generators::SystemSource::for_request(
+                            crate::generators::RequestFacts::of(entry),
+                        ),
                     );
                     // A block that failed leaves its name unbound, and the
                     // environment (or an earlier capture) may well bind the
@@ -1224,25 +1316,46 @@ pub fn run_all_entries(
                     crate::hurl::EntrySetup::Bind(bound)
                 },
                 |eo| {
+                    // A superseded retry attempt is not an outcome: it would
+                    // paint the request red for as long as the poll runs, and
+                    // in batch (where results arrive at the end) it would be
+                    // the reading that stuck.
+                    if eo.superseded {
+                        return;
+                    }
+                    let mut snap = record_entry.borrow_mut();
+                    // An outcome — of any kind — ends whatever wait was being
+                    // reported, including the failing one that ends a poll.
+                    snap.retrying = None;
                     if let Some(&at) = run_positions.get(eo.entry_index) {
-                        results[at] = Some(eo.ok);
+                        snap.results[at] = Some(eo.ok);
                         // Computed values first so a `[Captures]` row of the same
                         // name — the later, more specific statement — still wins.
-                        captures.extend(
-                            generated
-                                .borrow()
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone())),
-                        );
-                        captures.extend(eo.captures.iter().cloned());
-                        responses[at] = Some(entry_response(eo));
+                        let computed: Vec<(String, String)> = generated
+                            .borrow()
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        snap.captures.extend(computed);
+                        snap.captures.extend(eo.captures.iter().cloned());
+                        snap.responses[at] = Some(entry_response(eo));
                     }
-                    let _ = tx.send(BatchRunUpdate {
-                        col_id,
-                        results: results.clone(),
-                        captures: captures.clone(),
-                        responses: responses.clone(),
-                    });
+                    let _ = tx.send(snap.clone());
+                },
+                |i, attempt, limit| {
+                    // Sent as the attempt starts (Hurl reports it before it
+                    // sleeps for the interval), because every attempt's result
+                    // arrives only when the poll finally settles: without this
+                    // a long poll is a still, silent list.
+                    if attempt == 0 {
+                        return;
+                    }
+                    let Some(&at) = run_positions.get(i) else {
+                        return;
+                    };
+                    let mut snap = record_attempt.borrow_mut();
+                    snap.retrying = Some((at, attempt, limit));
+                    let _ = tx_attempt.send(snap.clone());
                 },
             );
             // Prefer the generator error over Hurl's downstream `Undefined
@@ -1264,6 +1377,8 @@ pub fn run_all_entries(
         }
         let mut r = state.lock().unwrap();
         r.loading = false;
+        // The run is over however it ended, so any retry hint goes with it.
+        r.retry_attempt = None;
         match out.entries.last() {
             Some(last) => {
                 r.status = last.status;
@@ -1288,7 +1403,7 @@ pub fn run_all_entries(
         // vectors from the final result set and send a single update.
         // (Streaming already emitted its final cumulative snapshot above.)
         if batch {
-            for eo in out.entries.iter() {
+            for eo in out.entries.iter().filter(|eo| !eo.superseded) {
                 // Keyed by the request Hurl says produced this outcome, not by
                 // the outcome's position: see the streaming path above.
                 let Some(&at) = run_positions.get(eo.entry_index) else {
@@ -1303,6 +1418,7 @@ pub fn run_all_entries(
                 results,
                 captures,
                 responses,
+                retrying: None,
             });
         }
     });
@@ -1375,26 +1491,68 @@ pub fn drain_capture_updates(
 /// never validated, which is the exact bug the validation exists to catch.
 fn for_each_wire_text(entry: &HurlEntry, mut visit: impl FnMut(&str)) {
     visit(&entry.url);
-    for r in entry.headers.iter().chain(&entry.queries) {
+    // Disabled rows are not sent, so a placeholder in one is not a use: it
+    // must not make a variable "needed", and — since this same set feeds the
+    // dependency planner — must not invent an edge from text nothing evaluates.
+    for r in entry
+        .headers
+        .iter()
+        .chain(&entry.queries)
+        .chain(&entry.cookies)
+        .chain(&entry.options)
+        .chain(&entry.response_headers)
+        .filter(|r| r.enabled)
+    {
         visit(&r.key);
         visit(&r.value);
     }
-    for f in &entry.form_fields {
+    for f in entry.form_fields.iter().filter(|f| f.enabled) {
         visit(&f.key);
         visit(&f.value);
-    }
-    for r in &entry.cookies {
-        visit(&r.key);
-        visit(&r.value);
+        if let Some(ct) = &f.content_type {
+            visit(ct);
+        }
+        if let Some(b64) = &f.base64_prefix {
+            visit(b64);
+        }
     }
     if let Some((u, p)) = &entry.basic_auth {
         visit(u);
         visit(p);
     }
     // A `{{ var }}` written inside a comment is never sent, so it doesn't
-    // count as a use of that variable.
+    // count as a use of that variable. A row's `desc` is a comment, which is
+    // why no `desc` is visited above.
     if let Some(body) = entry.body_wire() {
         visit(&body);
+    }
+    if let Some(rb) = &entry.response_body {
+        visit(rb);
+    }
+    // Response-side expressions are templates too — Hurl substitutes into a
+    // `[Captures]` query, an `[Asserts]` predicate and a `[Options]` value just
+    // as it does into a URL. Leaving them out meant a step whose only use of a
+    // capture was in an assert had no edge to the step that produced it, and so
+    // could be ordered before it.
+    for (_, q) in &entry.captures {
+        visit(q);
+    }
+    // `[Reports]` is deliberately *not* scanned, though it looks just like
+    // `[Captures]`: report queries are PaperBoy's own metadata, carried in
+    // comments, and `eval_report_request` hands each one to `eval_field`
+    // verbatim. Nothing substitutes into them, so a `{{…}}` written there is
+    // not a use of that variable — counting it invented a dependency edge that
+    // could reorder a region, and made `--targets` drag in a producer, while
+    // the field itself still failed to match.
+    for a in &entry.asserts {
+        visit(a);
+    }
+    // Only the `{{…}}` a generator expression may contain. Its *bare*
+    // identifiers are variable references too, but they are not placeholders
+    // and so belong to `entry_referenced_keys` alone — see
+    // [`entry_generator_refs`].
+    for (_, expr) in &entry.generators {
+        visit(expr);
     }
 }
 
@@ -1404,7 +1562,38 @@ pub fn entry_referenced_keys(entry: &HurlEntry) -> std::collections::HashSet<Str
     for_each_wire_text(entry, |text| {
         keys.extend(crate::environment::referenced_keys(text))
     });
+    keys.extend(entry_generator_refs(entry));
     keys
+}
+
+/// Variables a request's `# [Gen]` rows read as **bare identifiers**.
+///
+/// A generator expression is not a template: `sig = hmac_sha256(SECRET, body)`
+/// reads `SECRET` and `body` from the same map a `{{…}}` would, without any
+/// braces (see [`crate::generators`]). They are therefore real references —
+/// leaving them out meant a step whose only use of a capture was inside a
+/// generator got no dependency edge, and could be ordered before the step that
+/// produced it.
+///
+/// A name that is a generator function (`uuid`, `timestamp`, …) is a call, not
+/// a reference, and a name this same request declares is resolved from the
+/// block itself; neither reaches the variable map, so neither counts. Nor does
+/// a bare number, which is an argument.
+pub fn entry_generator_refs(entry: &HurlEntry) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for (_, expr) in &entry.generators {
+        for (a, b) in expression_identifier_spans(expr) {
+            let word = &expr[a..b];
+            if word.starts_with(|c: char| c.is_ascii_digit())
+                || crate::generators::is_function(word)
+                || entry.generators.iter().any(|(n, _)| n == word)
+            {
+                continue;
+            }
+            out.insert(word.to_string());
+        }
+    }
+    out
 }
 
 /// Placeholders in `entry` that Hurl would read differently from PaperBoy — see
@@ -1611,10 +1800,10 @@ pub fn generator_problems_all(col: &Collection, env: Option<&Environment>) -> Ve
 /// run can honour (each entry gets its own window) but a batch run cannot: batch
 /// is a single Hurl call over the whole file, so there is no "before this
 /// request" moment to evaluate anything in. Everything is therefore evaluated
-/// once, up front, against the environment alone — and a name two requests each
-/// compute collapses to one value for both, which is the [`collisions`] list.
-///
-/// [`collisions`]: BatchGenerators::collisions
+/// once, up front, against the environment alone. A name two requests each
+/// compute would collapse to one value for both, which is what
+/// [`uniquify_batch_generators`] exists to prevent: it runs first and gives the
+/// later claimants their own names.
 pub struct BatchGenerators {
     /// The names bound for the run. Where two requests compute the same name
     /// the first request's value is kept, matching the order Hurl would have
@@ -1623,11 +1812,6 @@ pub struct BatchGenerators {
     /// What failed, per request, paired with that request's title so the
     /// caller can say which one it was.
     pub errors: Vec<(String, Vec<GenError>)>,
-    /// Names computed by more than one request. In a streaming run each of
-    /// those requests gets its own value; in a batch run they share the first,
-    /// so the caller warns rather than silently sending one request's nonce
-    /// with another's signature.
-    pub collisions: Vec<String>,
     /// Names a `# [Gen]` block computes that an environment variable (or a
     /// carried-over capture) *already* binds. A streaming run shadows the
     /// environment value only from the computing request onwards; a batch run
@@ -1637,6 +1821,299 @@ pub struct BatchGenerators {
     /// environment value in place (see [`expand_batch_generators`]) and lists
     /// the name here so the user is told their generator did nothing in batch.
     pub shadowed: Vec<String>,
+}
+
+/// One generator name a batch run had to rename, so the reason can be shown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenRename {
+    /// Index into the entries slice of the request whose block was renamed.
+    pub entry: usize,
+    /// That request's title, for a message that names it.
+    pub title: String,
+    /// The name as the user wrote it — what results are still reported under.
+    pub original: String,
+    /// The name used for the run instead.
+    pub renamed: String,
+}
+
+/// Every identifier the collection already spoken for, so a minted name cannot
+/// tread on one.
+///
+/// Deliberately over-broad. A name is "taken" if it appears anywhere as a
+/// variable — an environment key, a generator name, a capture, an
+/// `[Options] variable:` — *or* merely as a `{{reference}}` or a bare word in a
+/// generator expression, even where that reference resolves to nothing today.
+/// A reference to a name nothing binds yet is a name someone means to bind
+/// later, and quietly stealing it would break the file the moment they did.
+fn taken_names(
+    entries: &[crate::hurl::HurlEntry],
+    vars: &HashMap<String, String>,
+) -> std::collections::HashSet<String> {
+    let mut taken: std::collections::HashSet<String> = vars.keys().cloned().collect();
+    for e in entries {
+        for (name, expr) in &e.generators {
+            taken.insert(name.clone());
+            // Both halves of an expression: `{{x}}` references and the bare
+            // words a generator call uses, e.g. `hmac_sha256(key, nonce)`.
+            taken.extend(crate::environment::referenced_keys(expr));
+            taken.extend(expression_identifiers(expr));
+        }
+        for (name, _) in &e.captures {
+            taken.insert(name.clone());
+        }
+        for row in &e.options {
+            if row.key.trim() == "variable"
+                && let Some((name, _)) = row.value.split_once('=')
+            {
+                taken.insert(name.trim().to_string());
+            }
+        }
+    }
+    // Anything referenced anywhere in the file, read off the serialised form so
+    // no field can be forgotten as `HurlEntry` grows.
+    taken.extend(crate::environment::referenced_keys(
+        &crate::hurl::collection_to_hurl(entries),
+    ));
+    taken
+}
+
+/// The bare identifiers in a generator expression, ignoring string literals.
+///
+/// A generator expression reads other variables by bare name
+/// (`hmac_sha256(secret, concat(nonce, ts))`), so those words have to be found
+/// and, when their generator is renamed, rewritten. Text inside `"…"` is
+/// skipped: `concat("nonce", x)` names a literal, not a variable, and renaming
+/// it would change the value the request sends.
+fn expression_identifiers(expr: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_str = false;
+    let mut escaped = false;
+    for ch in expr.chars() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_str = true;
+            continue;
+        }
+        if ch.is_alphanumeric() || ch == '_' {
+            cur.push(ch);
+            continue;
+        }
+        if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The byte ranges of the bare words in a generator expression — everything
+/// outside a string literal that could be an identifier.
+///
+/// One definition, shared by the renamer and by [`entry_generator_refs`]: if
+/// "what counts as an identifier here" were written twice, a rename could move
+/// a name the dependency planner still looked for under the old one.
+fn expression_identifier_spans(expr: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, ch) in expr.char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        if ch.is_alphanumeric() || ch == '_' {
+            start.get_or_insert(i);
+            continue;
+        }
+        if let Some(a) = start.take() {
+            out.push((a, i));
+        }
+        if ch == '"' {
+            in_str = true;
+        }
+    }
+    if let Some(a) = start {
+        out.push((a, expr.len()));
+    }
+    out
+}
+
+/// Rewrite the bare identifiers of a generator expression, leaving string
+/// literals (and everything that is not a whole word) alone.
+fn rename_expression_identifiers(expr: &str, renames: &HashMap<String, String>) -> String {
+    if renames.is_empty() {
+        return expr.to_string();
+    }
+    let mut out = String::with_capacity(expr.len());
+    let mut at = 0usize;
+    for (a, b) in expression_identifier_spans(expr) {
+        out.push_str(&expr[at..a]);
+        match renames.get(&expr[a..b]) {
+            Some(new) => out.push_str(new),
+            None => out.push_str(&expr[a..b]),
+        }
+        at = b;
+    }
+    out.push_str(&expr[at..]);
+    out
+}
+
+/// Apply `renames` to every place one request can refer to a variable.
+///
+/// Only this request's own text: a rename exists precisely because the name
+/// means something different one request over, so reaching outside would undo
+/// the separation it was minted for.
+fn rename_within_entry(e: &mut crate::hurl::HurlEntry, renames: &HashMap<String, String>) {
+    let sub = |s: &mut String| *s = crate::environment::rename_placeholders(s, renames);
+    let sub_opt = |s: &mut Option<String>| {
+        if let Some(v) = s {
+            *v = crate::environment::rename_placeholders(v, renames);
+        }
+    };
+    sub(&mut e.url);
+    for row in e
+        .headers
+        .iter_mut()
+        .chain(e.queries.iter_mut())
+        .chain(e.cookies.iter_mut())
+        .chain(e.options.iter_mut())
+        .chain(e.response_headers.iter_mut())
+    {
+        sub(&mut row.key);
+        sub(&mut row.value);
+        // The note travels too, so prose that says which value a row carries
+        // does not end up naming a variable that no longer exists.
+        sub(&mut row.desc);
+    }
+    if let Some((u, p)) = &mut e.basic_auth {
+        sub(u);
+        sub(p);
+    }
+    for f in &mut e.form_fields {
+        sub(&mut f.key);
+        sub(&mut f.value);
+        sub(&mut f.desc);
+        sub_opt(&mut f.content_type);
+        sub_opt(&mut f.base64_prefix);
+    }
+    sub_opt(&mut e.body_src);
+    sub_opt(&mut e.response_body);
+    for (_, q) in e.captures.iter_mut().chain(e.reports.iter_mut()) {
+        sub(q);
+    }
+    for a in &mut e.asserts {
+        sub(a);
+    }
+    for (name, expr) in &mut e.generators {
+        if let Some(new) = renames.get(name.as_str()) {
+            *name = new.clone();
+        }
+        sub(expr);
+        *expr = rename_expression_identifiers(expr, renames);
+    }
+}
+
+/// Give a batch run's colliding `# [Gen]` names one owner each.
+///
+/// A batch run is a single Hurl call over the whole file, so every generator is
+/// evaluated once, up front, into one shared set of variables — which means two
+/// requests that both compute `nonce` get the *same* nonce, and the second
+/// request is sent with the first one's. Streaming has no such problem: each
+/// entry is run in its own window, so each block is evaluated afresh.
+///
+/// Rather than warn and send the wrong thing, the second and later claimants
+/// are renamed — `nonce`, `nonce_2`, `nonce_3` — and their own request rewritten
+/// to ask for the new name. Every request then gets a value computed for it
+/// alone, and batch behaves as streaming does.
+///
+/// Renaming is done only where there is a collision. A run where nothing
+/// collides is left untouched, so the names in the captures panel stay the ones
+/// the user wrote; and the first claimant keeps its name for the same reason.
+/// Results are reported back under the original name (see [`GenRename`]), so a
+/// rename is never something the user has to know about to read the run.
+///
+/// Returns what was renamed, in the order the renames were made.
+pub fn uniquify_batch_generators(
+    entries: &mut [crate::hurl::HurlEntry],
+    vars: &HashMap<String, String>,
+) -> Vec<GenRename> {
+    // Nothing to separate unless at least two requests compute something.
+    if entries.iter().filter(|e| !e.generators.is_empty()).count() < 2 {
+        return Vec::new();
+    }
+    let mut taken = taken_names(entries, vars);
+    let mut claimed: HashMap<String, usize> = HashMap::new();
+    let mut out = Vec::new();
+
+    for i in 0..entries.len() {
+        if entries[i].generators.is_empty() {
+            continue;
+        }
+        let mut renames: HashMap<String, String> = HashMap::new();
+        let names: Vec<String> = entries[i]
+            .generators
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in names {
+            // A name repeated inside one block is that block's own business,
+            // and both rows must keep whichever name this request ends up with.
+            if renames.contains_key(&name) {
+                continue;
+            }
+            match claimed.get(&name) {
+                Some(&first) if first != i => {
+                    let new = mint_name(&name, &taken);
+                    taken.insert(new.clone());
+                    out.push(GenRename {
+                        entry: i,
+                        title: entries[i].title.clone(),
+                        original: name.clone(),
+                        renamed: new.clone(),
+                    });
+                    renames.insert(name, new);
+                }
+                Some(_) => {}
+                None => {
+                    claimed.insert(name, i);
+                }
+            }
+        }
+        if !renames.is_empty() {
+            rename_within_entry(&mut entries[i], &renames);
+        }
+    }
+    out
+}
+
+/// `name_2`, `name_3`, … — the first suffix that belongs to nobody.
+fn mint_name(name: &str, taken: &std::collections::HashSet<String>) -> String {
+    for n in 2u32.. {
+        let candidate = format!("{name}_{n}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("u32 exhausted")
 }
 
 /// Evaluate every entry's `# [Gen]` block once, for a batch (whole-file) run.
@@ -1650,7 +2127,6 @@ pub fn expand_batch_generators(
 ) -> BatchGenerators {
     let mut bound = HashMap::new();
     let mut errors = Vec::new();
-    let mut collisions: Vec<String> = Vec::new();
     let mut shadowed: Vec<String> = Vec::new();
     // Which request first claimed each name, so a second claim is recognised
     // as a collision rather than as the same request being listed twice (a
@@ -1675,14 +2151,12 @@ pub fn expand_batch_generators(
             errors.push((e.title.clone(), errs));
         }
         for (name, _) in &e.generators {
-            match claimed.get(name) {
-                Some(&first) if first != i => {
-                    if !collisions.contains(name) {
-                        collisions.push(name.clone());
-                    }
-                    continue;
-                }
-                _ => {}
+            // A name an earlier request already claimed keeps that request's
+            // value. `uniquify_batch_generators` runs first and renames such
+            // claimants, so in a real run this arm is not reached; it stands
+            // for the callers that expand without uniquifying.
+            if claimed.get(name).is_some_and(|&first| first != i) {
+                continue;
             }
             claimed.entry(name.clone()).or_insert(i);
             // A name the *environment* already binds is left alone: overriding
@@ -1705,15 +2179,15 @@ pub fn expand_batch_generators(
     BatchGenerators {
         bound,
         errors,
-        collisions,
         shadowed,
     }
 }
 
 /// The `# [Gen]` names more than one request in the collection computes.
 ///
-/// Only a batch run has to care (see [`BatchGenerators::collisions`]); the
-/// front-ends call this to warn before starting one.
+/// Only a batch run has to care; the front-ends call this to tell the user,
+/// before starting one, that a name is computed twice and so will be run under
+/// a numbered name (see [`uniquify_batch_generators`]).
 pub fn generator_collisions(col: &Collection) -> Vec<String> {
     let mut claimed: Vec<&str> = Vec::new();
     let mut out: Vec<String> = Vec::new();
@@ -1803,7 +2277,7 @@ fn request_label(e: &crate::hurl::HurlEntry) -> String {
 
 /// Drain background secret-resolution results, applying each to the matching
 /// Global Environment and invalidating every collection's cached preview (any
-/// of them might reference it, linked or active-global). Disconnected
+/// of them might reference it). Disconnected
 /// channels are dropped. Returns `true` while any resolution is still in
 /// flight. Shared by both front-ends' per-frame/per-tick update loop.
 pub fn drain_env_updates(
@@ -2254,46 +2728,186 @@ mod tests {
 
     // ── Whole-file `# [Gen]` handling ──────────────────────────────────
 
-    /// A batch run has one variable set for the whole file, so two requests
-    /// that each compute `nonce` cannot each have their own. Silently picking
-    /// one is how a signature ends up computed over the other request's nonce,
-    /// so the collision is named and the caller warns.
+    /// A minted name must belong to nobody. `nonce_2` is the obvious first
+    /// choice for a second `nonce`, and taking it blind would hand the renamed
+    /// request a value some other part of the collection is already using —
+    /// trading a shared value for a stolen one.
     #[test]
-    fn two_requests_computing_one_name_collide_in_a_batch_run() {
-        let entries = vec![
-            entry_with_generators("https://x/", &[("nonce", "\"first\"")]),
-            entry_with_generators("https://y/", &[("nonce", "\"second\"")]),
+    fn a_minted_name_steps_over_one_something_else_already_uses() {
+        let mut third = entry_with_generators("https://z/{{nonce_2}}", &[("t", "\"x\"")]);
+        third
+            .captures
+            .push(("nonce_3".into(), "jsonpath \"$.n\"".into()));
+        let mut entries = vec![
+            entry_with_generators("https://x/{{nonce}}", &[("nonce", "\"first\"")]),
+            entry_with_generators("https://y/{{nonce}}", &[("nonce", "\"second\"")]),
+            third,
         ];
+        let renames = uniquify_batch_generators(&mut entries, &HashMap::new());
+        assert_eq!(renames.len(), 1);
+        // `nonce_2` is referenced by the third request and `nonce_3` is a
+        // capture there, so the first free name is `nonce_4`.
+        assert_eq!(renames[0].renamed, "nonce_4");
+        assert_eq!(entries[1].url, "https://y/{{nonce_4}}");
+    }
+
+    /// An environment key is a name in use even though no request computes it.
+    #[test]
+    fn a_minted_name_never_takes_an_environment_key() {
+        let vars: HashMap<String, String> =
+            [("nonce_2".to_string(), "from-env".to_string())].into();
+        let mut entries = vec![
+            entry_with_generators("https://x/{{nonce}}", &[("nonce", "\"first\"")]),
+            entry_with_generators("https://y/{{nonce}}", &[("nonce", "\"second\"")]),
+        ];
+        let renames = uniquify_batch_generators(&mut entries, &vars);
+        assert_eq!(renames[0].renamed, "nonce_3");
+    }
+
+    /// A generator expression reads other variables by bare name, so a rename
+    /// has to follow into the expression — but not into a string literal,
+    /// where the same word is a value the request sends, not a variable.
+    #[test]
+    fn a_rename_follows_bare_names_in_expressions_but_not_string_literals() {
+        let mut entries = vec![
+            entry_with_generators("https://x/{{nonce}}", &[("nonce", "uuid()")]),
+            entry_with_generators(
+                "https://y/",
+                &[
+                    ("nonce", "uuid()"),
+                    ("sig", "hmac_sha256(secret, concat(nonce, \"nonce\"))"),
+                ],
+            ),
+        ];
+        let renames = uniquify_batch_generators(&mut entries, &HashMap::new());
+        assert_eq!(renames.len(), 1, "only `nonce` collides, not `sig`");
+        assert_eq!(entries[1].generators[0].0, "nonce_2");
+        assert_eq!(
+            entries[1].generators[1].1, "hmac_sha256(secret, concat(nonce_2, \"nonce\"))",
+            "the bare name moves, the literal stays"
+        );
+    }
+
+    /// The rename reaches every part of the request that can ask for a value,
+    /// not just the URL — a body signed with the wrong nonce is the whole
+    /// point of doing this.
+    #[test]
+    fn a_rename_reaches_headers_body_and_asserts() {
+        let mut second = entry_with_generators("https://y/", &[("nonce", "\"second\"")]);
+        second
+            .headers
+            .push(crate::hurl::KvRow::new("X-N", "{{nonce}}"));
+        second.body_src = Some("{\"n\": \"{{nonce}}\"}".into());
+        second
+            .asserts
+            .push("jsonpath \"$.n\" == \"{{nonce}}\"".into());
+        second
+            .captures
+            .push(("echo".into(), "jsonpath \"$.{{nonce}}\"".into()));
+        let mut entries = vec![
+            entry_with_generators("https://x/{{nonce}}", &[("nonce", "\"first\"")]),
+            second,
+        ];
+        uniquify_batch_generators(&mut entries, &HashMap::new());
+        let e = &entries[1];
+        assert_eq!(e.headers[0].value, "{{nonce_2}}");
+        assert_eq!(e.body_src.as_deref(), Some("{\"n\": \"{{nonce_2}}\"}"));
+        assert_eq!(e.asserts[0], "jsonpath \"$.n\" == \"{{nonce_2}}\"");
+        assert_eq!(e.captures[0].1, "jsonpath \"$.{{nonce_2}}\"");
+        // …and no further than this request: the first is untouched.
+        assert_eq!(entries[0].url, "https://x/{{nonce}}");
+    }
+
+    /// Three requests computing the same name are numbered in file order, and
+    /// a request that repeats a name inside its own block keeps one name for
+    /// both rows.
+    #[test]
+    fn a_third_claimant_is_numbered_on_and_a_repeat_within_a_block_stays_one_name() {
+        let mut entries = vec![
+            entry_with_generators("https://a/", &[("n", "\"1\"")]),
+            entry_with_generators("https://b/", &[("n", "\"2\"")]),
+            entry_with_generators("https://c/{{n}}", &[("n", "\"3\""), ("n", "\"3b\"")]),
+        ];
+        let renames = uniquify_batch_generators(&mut entries, &HashMap::new());
+        assert_eq!(renames.len(), 2);
+        assert_eq!(entries[1].generators[0].0, "n_2");
+        assert_eq!(entries[2].generators[0].0, "n_3");
+        assert_eq!(entries[2].generators[1].0, "n_3");
+        assert_eq!(entries[2].url, "https://c/{{n_3}}");
+    }
+
+    /// Nothing is renamed where nothing collides: the names in the captures
+    /// panel stay the ones the user wrote.
+    #[test]
+    fn a_file_without_collisions_is_left_exactly_as_it_was() {
+        let before = vec![
+            entry_with_generators("https://x/{{a}}", &[("a", "uuid()")]),
+            entry_with_generators("https://y/{{b}}", &[("b", "uuid()")]),
+        ];
+        let mut entries = before.clone();
+        assert!(uniquify_batch_generators(&mut entries, &HashMap::new()).is_empty());
+        assert_eq!(
+            crate::hurl::collection_to_hurl(&entries),
+            crate::hurl::collection_to_hurl(&before)
+        );
+    }
+
+    /// A batch run has one variable set for the whole file, so two requests
+    /// that each compute `nonce` cannot each have their own — one would be sent
+    /// the other's, which is how a signature ends up computed over the wrong
+    /// nonce. The second claimant is therefore renamed, and both values are
+    /// bound.
+    #[test]
+    fn two_requests_computing_one_name_each_get_their_own_in_a_batch_run() {
+        let mut entries = vec![
+            entry_with_generators("https://x/{{nonce}}", &[("nonce", "\"first\"")]),
+            entry_with_generators("https://y/{{nonce}}", &[("nonce", "\"second\"")]),
+        ];
+        let renames = uniquify_batch_generators(&mut entries, &HashMap::new());
+        assert_eq!(renames.len(), 1);
+        assert_eq!(renames[0].original, "nonce");
+        assert_eq!(renames[0].renamed, "nonce_2");
+        assert_eq!(renames[0].entry, 1);
+        // The first request in the file keeps the name it was written with.
+        assert_eq!(entries[0].generators[0].0, "nonce");
+        assert_eq!(entries[0].url, "https://x/{{nonce}}");
+        // The second asks for its own value, everywhere it asked for the old.
+        assert_eq!(entries[1].generators[0].0, "nonce_2");
+        assert_eq!(entries[1].url, "https://y/{{nonce_2}}");
+
         let blocks = expand_batch_generators(
             &entries,
             &HashMap::new(),
             &crate::generators::SystemSource::new(),
         );
-        assert_eq!(blocks.collisions, vec!["nonce".to_string()]);
+        assert_eq!(blocks.bound.get("nonce").map(String::as_str), Some("first"));
         assert_eq!(
-            blocks.bound.get("nonce").map(String::as_str),
-            Some("first"),
-            "the first request in the file keeps its value"
+            blocks.bound.get("nonce_2").map(String::as_str),
+            Some("second")
         );
         assert!(blocks.errors.is_empty(), "{:?}", blocks.errors);
     }
 
     /// Only a *second request* claiming the name is a collision. One request
-    /// listing a name twice is that block's own business, and reporting it as
-    /// a batch-only hazard would send the user looking for a request that
-    /// isn't there.
+    /// listing a name twice is that block's own business, and renaming half of
+    /// it would break the request to fix a problem it doesn't have.
     #[test]
     fn one_request_is_never_in_collision_with_itself() {
-        let entries = vec![entry_with_generators(
-            "https://x/",
-            &[("n", "\"a\""), ("n", "\"b\"")],
-        )];
-        let blocks = expand_batch_generators(
-            &entries,
-            &HashMap::new(),
-            &crate::generators::SystemSource::new(),
+        let col = Collection::new(
+            "c".into(),
+            vec![entry_with_generators(
+                "https://x/",
+                &[("n", "\"a\""), ("n", "\"b\"")],
+            )],
         );
-        assert!(blocks.collisions.is_empty(), "{:?}", blocks.collisions);
+        assert!(generator_collisions(&col).is_empty());
+
+        let mut entries = vec![
+            entry_with_generators("https://x/", &[("n", "\"a\""), ("n", "\"b\"")]),
+            entry_with_generators("https://y/", &[("other", "\"c\"")]),
+        ];
+        assert!(uniquify_batch_generators(&mut entries, &HashMap::new()).is_empty());
+        assert_eq!(entries[0].generators[1].0, "n");
     }
 
     /// A later block may read what an earlier one computed — the same reading
@@ -3071,6 +3685,7 @@ mod tests {
                 )
             },
             |_| {},
+            |_, _, _| {},
         );
 
         assert!(
@@ -3207,6 +3822,7 @@ mod tests {
                 )
             },
             |_| {},
+            |_, _, _| {},
         );
 
         let sent = seen.lock().unwrap().join("\n");

@@ -36,6 +36,20 @@ macro_rules! strings {
                 }
             }
 
+            /// Every row, with `fix` applied to each.
+            ///
+            /// The GUI uses this so that a character the terminal UI renders
+            /// happily but egui's fonts cannot draw is swapped for an icon
+            /// *once, centrally* (see `gui::icons::drawable`). Doing it here
+            /// rather than at the call sites is the whole point: there are
+            /// several hundred call sites and only one constructor, so this is
+            /// the only place that can promise it happened to every string.
+            #[cfg(feature = "gui")]
+            pub fn mapped(lang: &Language, fix: fn(&'static str) -> &'static str) -> Self {
+                let s = Self::for_language(lang);
+                Self { $($field: fix(s.$field),)* }
+            }
+
             /// Every row of the table, as (name, English, French, Danish), so a
             /// test can hold the whole table to a rule. There is no other way
             /// to look at every string: the table is a struct of fields, and a
@@ -57,6 +71,12 @@ strings! {
     app_heading => "PaperBoy", "PaperBoy", "PaperBoy";
     base_url => "Default New Request URL:", "URL par défaut des nouvelles requêtes\u{a0}:", "Standard-URL for nye anmodninger:";
     sending => "Sending…", "Envoi en cours…", "Sender…";
+    // Shown beside the spinner while Hurl is retrying a request (`[Options]
+    // retry`): `{n}` is the attempt being made, `{m}` the stated limit. The
+    // open form is for `retry: -1` (forever) and for a `{{placeholder}}`
+    // limit, neither of which has an honest number to count towards.
+    retry_attempt => "retry {n} of {m}", "tentative {n} sur {m}", "fors\u{f8}g {n} af {m}";
+    retry_attempt_open => "retry {n}", "tentative {n}", "fors\u{f8}g {n}";
     response_heading => "Response", "Réponse", "Svar";
     status_label => "Status:", "Statut :", "Status:";
     response_time_label => "Time:", "Durée :", "Tid:";
@@ -64,7 +84,13 @@ strings! {
     resp_empty_body => "(the server returned no body)", "(le serveur n'a renvoyé aucun corps)", "(serveren returnerede ingen brødtekst)";
     resp_section_body => "Body", "Corps", "Body";
     resp_section_headers => "Headers", "En-têtes", "Headere";
+    resp_section_captures => "Captures", "Captures", "Optagelser";
     resp_no_headers => "(the server returned no headers)", "(le serveur n'a renvoyé aucun en-tête)", "(serveren returnerede ingen headere)";
+    resp_no_captures => "(this request captured nothing)", "(cette requête n'a rien capturé)", "(denne anmodning opfangede intet)";
+    // Marks a value on the Captures tab that another run has since overwritten:
+    // the response keeps its own snapshot indefinitely, so without this the old
+    // figure sits there looking like the one in force.
+    resp_capture_superseded => "superseded", "remplacé", "erstattet";
     req_error_prefix => "Request error:", "Erreur de requête :", "Anmodningsfejl:";
     options_menu => "Settings", "Paramètres", "Indstillinger";
     options_menu_label => "(S)ettings", "Paramètre(s)", "Ind(s)tillinger";
@@ -289,7 +315,10 @@ strings! {
     extract_name_invalid => "A parameter name cannot be empty or contain spaces or braces", "Un nom de paramètre ne peut pas être vide ni contenir d'espaces ou d'accolades", "Et parameternavn må ikke være tomt eller indeholde mellemrum eller krøllede parenteser";
     extract_name_conflict => "This request already declares {} as '{}' — reusing it here would change what this field sends", "Cette requête déclare déjà {} comme «\u{a0}{}\u{a0}» — le réutiliser ici changerait ce que ce champ envoie", "Denne forespørgsel erklærer allerede {} som '{}' — at genbruge det her ville ændre, hvad dette felt sender";
     gui_extract_parameter => "Extract to parameter…", "Extraire en paramètre…", "Udtræk til parameter…";
+    gui_prettify_body => "Format", "Mettre en forme", "Formatér";
+    gui_prettify_body_tooltip => "Lay the JSON body out again. Comments, {{ templates }}, numbers and key order are all kept.", "Remettre en forme le corps JSON. Les commentaires, les {{ templates }}, les nombres et l'ordre des clés sont conservés.", "Formatér JSON-brødteksten igen. Kommentarer, {{ templates }}, tal og nøglerækkefølge bevares.";
     hint_extract_parameter => "^P extract to parameter", "^P extraire en paramètre", "^P udtræk til parameter";
+    hint_prettify_body => "Alt+P format", "Alt+P mettre en forme", "Alt+P formatér";
     hint_declare_parameter => "variable: NAME=value declares a parameter a report can steer", "variable\u{a0}: NOM=valeur déclare un paramètre qu'un rapport peut piloter", "variable: NAVN=værdi erklærer en parameter, som en rapport kan styre";
     wizard_options_parameters => "Parameters: {}", "Paramètres\u{a0}: {}", "Parametre: {}";
     hint_toggle_enabled => "^E toggle enabled", "^E activer/désactiver", "^E slå til/fra";
@@ -312,18 +341,33 @@ strings! {
     load_environment => "Load Environment…", "Charger l'environnement…", "Indlæs miljø…";
     env_heading => "Global Environments", "Environnements globaux", "Globale miljøer";
     env_no_env => "(no environment loaded)", "(aucun environnement chargé)", "(intet miljø indlæst)";
+    // The `v` popup lists more than one environment's variables now — the
+    // environment's own rows *and* the values requests have captured — so it is
+    // titled for the question it answers rather than for one of its two sources.
+    vars_heading => "Variables", "Variables", "Variabler";
+    // Group headings inside the `v` popup. Both groups are labelled, not just
+    // the second: an unlabelled block above a labelled one reads as though the
+    // label annotates the rows above it rather than the ones below.
+    vars_group_env => "Environment", "Environnement", "Miljø";
+    vars_group_captures => "Captures", "Captures", "Optagelser";
+    vars_no_captures => "(nothing captured yet)", "(rien de capturé pour l'instant)", "(intet opfanget endnu)";
+    vars_none => "(no variables)", "(aucune variable)", "(ingen variabler)";
+    // Marks an environment row whose value a capture of the same name is
+    // overriding. Substitution gives the capture precedence, so the value
+    // printed beside the name is not the one that gets sent.
+    vars_overridden => "overridden by a capture", "remplacé par une capture", "erstattet af en optagelse";
+    vars_shadows_env => "overrides the environment", "remplace l'environnement", "erstatter miljøet";
+    gui_overridden_tooltip => "A capture of this name is in force; the value sent is the one under Captures in the Variables tab.", "Une capture de ce nom est en vigueur ; la valeur envoyée est celle sous Captures dans l'onglet Variables.", "En optagelse med dette navn er gældende; værdien der sendes er den under Optagelser i fanen Variabler.";
     env_loading => "Loading secret…", "Chargement du secret…", "Indlæser hemmelighed…";
     env_waiting_secrets => "Waiting for secrets:", "En attente des secrets\u{a0}:", "Venter på hemmeligheder:";
     env_reloading_var => "Reloading", "Rechargement de", "Genindlæser";
     env_activated => "Activated", "Activé", "Aktiveret";
     env_deactivated => "Deactivated", "Désactivé", "Deaktiveret";
     env_rename_title => "Rename Environment", "Renommer l'environnement", "Omdøb miljø";
-    env_link_picker_title => "Link Environment", "Lier un environnement", "Tilknyt miljø";
-    env_link_none => "(none)", "(aucun)", "(ingen)";
     env_delete_confirm => "Delete this environment?", "Supprimer cet environnement\u{a0}?", "Slet dette miljø?";
     request_delete_confirm => "Delete this request?", "Supprimer cette requête\u{a0}?", "Slet denne anmodning?";
     env_no_envs => "(no environments — Load Environment… to add one)", "(aucun environnement — Charger l'environnement… pour en ajouter un)", "(ingen miljøer — Indlæs miljø… for at tilføje et)";
-    env_active_label => "Active: ", "Actif : ", "Aktiv: ";
+    env_active_label => "This tab: ", "Cet onglet : ", "Denne fane: ";
     env_active_none => "(none active)", "(aucun actif)", "(intet aktivt)";
     env_filter_label => "Filter: ", "Filtre : ", "Filter: ";
     list_filter_label => "Find: ", "Chercher : ", "Find: ";
@@ -445,10 +489,9 @@ strings! {
     subst_hint_undefined => "undefined", "non défini", "udefineret";
     subst_hint_generated => "generated", "généré", "genereret";
     env_undefined_vars => "⚠ Sent with undefined variables:", "⚠ Envoyé avec des variables non définies :", "⚠ Sendt med udefinerede variabler:";
-    env_undefined_in_loaded_env => "— defined in {envs}, which is loaded but neither active nor linked. Activate or link it in the Environments panel.", "— définies dans {envs}, qui est chargé mais ni actif ni lié. Activez-le ou liez-le dans le panneau Environnements.", "— defineret i {envs}, som er indlæst, men hverken aktivt eller tilknyttet. Aktivér eller tilknyt det i Miljøer-panelet.";
+    env_undefined_in_loaded_env => "— defined in {envs}, which is loaded but not active on this tab. Activate it in the Environments panel.", "— définies dans {envs}, qui est chargé mais pas actif sur cet onglet. Activez-le dans le panneau Environnements.", "— defineret i {envs}, som er indlæst, men ikke aktivt på denne fane. Aktivér det i Miljøer-panelet.";
     gui_undefined_banner_one => "1 variable in this request is undefined", "1 variable de cette requête n'est pas définie", "1 variabel i denne anmodning er udefineret";
     gui_undefined_banner_many => "{n} variables in this request are undefined", "{n} variables de cette requête ne sont pas définies", "{n} variabler i denne anmodning er udefinerede";
-    subst_hint_shadowed => "shadowed by linked env", "masqué par l'environnement lié", "skygget af tilknyttet miljø";
     json_invalid => "⚠ Invalid JSON — fix before running", "⚠ JSON invalide — corrigez avant d'exécuter", "⚠ Ugyldig JSON — ret før kørsel";
     foot_focus => "focus", "focus", "fokus";
     foot_run => "run", "exécuter", "kør";
@@ -457,13 +500,17 @@ strings! {
     foot_env_source => "source", "source", "kilde";
     // The Environments panel's "jump to the active environment" key. Short
     // because it shares a one-line border with two other hints.
-    foot_env_goto_active => "go to active", "aller à l'actif", "gå til aktivt";
-    foot_env_link => "link env", "lier env", "link miljø";
+    foot_env_goto_active => "go to this tab's", "aller à celui de l'onglet", "gå til fanens";
     foot_new => "New Request", "Nouvelle requête", "Ny forespørgsel";
     foot_rename => "rename", "renommer", "omdøb";
     foot_close => "delete", "supprimer", "fjern";
     foot_copy_selection => "copy", "copier", "kopiér";
     foot_compact => "compact", "compact", "kompakt";
+    // The Captures mask toggle, shown as "m reveal" / "m hide" on the border.
+    // Two words rather than one label, because a toggle that always reads the
+    // same gives no clue which way it is about to go.
+    foot_reveal => "reveal", "révéler", "vis";
+    foot_hide => "hide", "masquer", "skjul";
     foot_probe => "assert/capture", "vérifier/capturer", "kontrollér/opsaml";
     foot_response_section => "section", "section", "sektion";
     foot_help => "help", "aide", "hjælp";
@@ -486,8 +533,6 @@ strings! {
     glossary_desc_pending => "A secret reference still being fetched in the background; kept as \"{{ VAR }}\" until it resolves.", "Une référence à un secret encore en cours de récupération en arrière-plan\u{a0}; reste affichée sous forme \"{{ VAR }}\" jusqu'à sa résolution.", "En hemmelighedsreference, der stadig hentes i baggrunden; vises som \"{{ VAR }}\" indtil den er løst.";
     glossary_label_failed => "missing", "manquant", "mangler";
     glossary_desc_failed => "Failed to resolve, or a response capture not yet initialised — kept as \"{{ VAR }}\".", "Échec de la résolution, ou capture de réponse pas encore initialisée — reste affichée sous forme \"{{ VAR }}\".", "Kunne ikke løses, eller en svar-fangst der endnu ikke er initialiseret — vises som \"{{ VAR }}\".";
-    glossary_label_shadowed => "shadowed", "masqué", "skygget";
-    glossary_desc_shadowed => "This value comes from the active Global Environment, but is being overridden by the collection's linked Environment — the linked value is the one actually substituted.", "Cette valeur provient de l'environnement global actif, mais est masquée par l'environnement lié de la collection — c'est la valeur liée qui est réellement substituée.", "Denne værdi kommer fra det aktive globale miljø, men bliver overskygget af samlingens tilknyttede miljø — det er den tilknyttede værdi, der faktisk indsættes.";
     glossary_heading_icons => "Other icons used throughout the app", "Autres icônes utilisées dans l'application", "Andre ikoner brugt i appen";
     glossary_label_modified => "modified", "modifié", "ændret";
     glossary_desc_modified => "A pencil marks a request, header, or variable that has been edited away from its originally loaded value.", "Un crayon marque une requête, un en-tête ou une variable modifiée par rapport à sa valeur chargée d'origine.", "En blyant markerer en request, header eller variabel, der er redigeret væk fra sin oprindeligt indlæste værdi.";
@@ -501,8 +546,6 @@ strings! {
     glossary_desc_running => "A request that is still running as part of a batch \"Run All\".", "Une requête encore en cours d'exécution dans un lot \"Tout exécuter\".", "En request, der stadig kører som en del af en batch \"Kør alle\".";
     glossary_label_git => "git-linked", "lié à git", "git-tilknyttet";
     glossary_desc_git => "This Collection, Environment, or Workspace was loaded from, and is linked to, a git remote.", "Cette collection, cet environnement ou cet espace de travail a été chargé depuis, et reste lié à, une origine git distante.", "Denne samling, dette miljø eller denne Workspace blev indlæst fra, og er stadig tilknyttet, en git-fjernserver.";
-    glossary_label_linked => "linked environment", "environnement lié", "tilknyttet miljø";
-    glossary_desc_linked => "Joins a Collection's tab/title to the Global Environment linked to it.", "Relie l'onglet/titre d'une collection à l'environnement global qui lui est lié.", "Forbinder en samlings faneblad/titel til det globale miljø, den er tilknyttet.";
     glossary_label_folder => "folder", "dossier", "mappe";
     glossary_desc_folder => "A subfolder grouping requests in the list, or — next to a File-type form value — a hint that pressing Enter opens a file picker.", "Un sous-dossier regroupant des requêtes dans la liste, ou — à côté d'une valeur de formulaire de type Fichier — une indication que Entrée ouvre un sélecteur de fichier.", "En undermappe, der grupperer requests i listen, eller — ved siden af en formularværdi af typen Fil — et hint om, at Enter åbner en filvælger.";
     glossary_label_scroll_hint => "more text", "plus de texte", "mere tekst";
@@ -530,16 +573,17 @@ strings! {
     help_prev_next_tab => "previous / next tab", "onglet précédent / suivant", "forrige / næste fane";
     help_rename_close => "rename tab (F2) · delete request / close collection tab", "renommer l'onglet (F2) · supprimer la requête / fermer l'onglet", "omdøb fane (F2) · slet anmodning / luk samlingsfane";
     help_reload_var => "reload a failed environment entry (env var / 1Password / SSM)", "recharger une entrée d'environnement en échec (var d'env / 1Password / SSM)", "genindlæs en mislykket miljøvariabel (miljøvariabel / 1Password / SSM)";
-    help_env_activate => "activate / deactivate the selected Global Environment", "activer / désactiver l'environnement global sélectionné", "aktivér / deaktivér det valgte globale miljø";
+    help_env_activate => "activate / deactivate the selected Global Environment on this tab", "activer / désactiver l'environnement global sélectionné sur cet onglet", "aktivér / deaktivér det valgte globale miljø på denne fane";
     help_env_delete => "delete the selected Global Environment (unlinks any collections using it)", "supprimer l'environnement global sélectionné (délie les collections qui l'utilisent)", "slet det valgte globale miljø (fjerner link fra samlinger, der bruger det)";
     help_env_reopen => "reopen the most recently deleted Global Environment", "rouvrir l'environnement global supprimé le plus récemment", "genåbn det senest slettede globale miljø";
-    help_env_link => "link / unlink a Global Environment to the active collection", "lier / délier un environnement global à la collection active", "link / afkobl et globalt miljø til den aktive samling";
-    help_env_view_linked => "view the active collection's linked Global Environment", "afficher l'environnement global lié à la collection active", "vis den aktive samlings tilknyttede globale miljø";
+    help_env_view_vars => "view this tab's variables (environment and captures)", "afficher les variables de cet onglet (environnement et captures)", "vis fanens variabler (miljø og optagelser)";
     help_env_rename => "rename the selected Global Environment", "renommer l'environnement global sélectionné", "omdøb det valgte globale miljø";
     help_env_filter => "filter the environments list by name (Esc clears it)", "filtrer la liste des environnements par nom (Échap l'efface)", "filtrér miljølisten efter navn (Esc rydder det)";
     help_env_source => "cycle environment source", "changer la source des environnements", "skift miljøkilde";
     help_env_goto_active => "jump to the active environment (widens the filters if it is hidden)", "aller à l'environnement actif (élargit les filtres s'il est masqué)", "gå til det aktive miljø (udvider filtrene, hvis det er skjult)";
     help_env_activate_workspace => "activate the selected workspace environment file", "activer le fichier d'environnement sélectionné de l'espace de travail", "aktivér arbejdsområdets valgte miljøfil";
+    help_prettify_body => "format the selected request's JSON body (comments and {{ templates }} are kept)", "mettre en forme le corps JSON de la requête sélectionnée (les commentaires et les {{ templates }} sont conservés)", "formatér den valgte anmodnings JSON-brødtekst (kommentarer og {{ templates }} bevares)";
+    help_prettify_body_wizard => "format the Body (request editor)", "mettre en forme le corps (éditeur de requête)", "formatér brødteksten (forespørgselseditor)";
     help_revert_request => "revert the selected request to its last saved version on disk", "rétablir la requête sélectionnée à sa dernière version enregistrée sur le disque", "gendan den valgte anmodning til dens sidst gemte version på disken";
     help_revert_env => "revert the whole environment to its last saved values on disk", "rétablir tout l'environnement à ses dernières valeurs enregistrées sur le disque", "gendan hele miljøet til dets sidst gemte værdier på disken";
     help_resize => "shrink / grow response pane", "réduire / agrandir le panneau de réponse", "formindsk / forøg svarpanelet";
@@ -561,7 +605,9 @@ strings! {
     help_copy_selection => "copy the selection, or the whole panel if nothing is selected (Request JSON / Request Hurl / Response panel)", "copier la sélection, ou tout le panneau si rien n'est sélectionné (panneau JSON de requête / Hurl de requête / réponse)", "kopiér markeringen, eller hele ruden hvis intet er markeret (Request JSON / Request Hurl / Response-rude)";
     help_ctrl_c => "copy the selection; with nothing selected, ask whether to quit", "copier la sélection\u{a0}; si rien n'est sélectionné, demander s'il faut quitter", "kopiér markeringen; hvis intet er markeret, spørg om der skal afsluttes";
     help_compact => "toggle Response compact view (copy still yields the full body)", "basculer l'aperçu compact de la réponse (la copie donne le corps complet)", "slå Response-kompaktvisning til/fra (kopiering giver hele brødteksten)";
-    help_response_section => "step the Response section tabs (Body / Headers); \u{2190} or Shift+I steps back", "parcourir les onglets de section de la réponse (corps / en-têtes)\u{a0}; \u{2190} ou Maj+I revient en arrière", "gennemgå Response-sektionsfanerne (Body / Headere); \u{2190} eller Skift+I går tilbage";
+    help_response_section => "step the Response section tabs (Body / Headers / Captures); \u{2190} or Shift+I steps back", "parcourir les onglets de section de la réponse (corps / en-têtes / captures)\u{a0}; \u{2190} ou Maj+I revient en arrière", "gennemgå Response-sektionsfanerne (Body / Headere / Optagelser); \u{2190} eller Skift+I går tilbage";
+    help_reveal_values => "show/hide captured values (copy still yields the real value)", "afficher/masquer les valeurs capturées (la copie donne la vraie valeur)", "vis/skjul opfangede værdier (kopiering giver stadig den rigtige værdi)";
+    help_reveal_captures => "show/hide the captured values", "afficher/masquer les valeurs capturées", "vis/skjul de opfangede værdier";
     help_multi_select => "Alt+Click+Drag adds another selection region (plain click clears all)", "Alt+Clic+Glisser ajoute une autre zone de sélection (un clic simple efface tout)", "Alt+Klik+Træk tilføjer endnu et markeringsområde (almindeligt klik rydder alt)";
     help_save_editor => "save a multi-line editor", "enregistrer un éditeur multi-lignes", "gem en flerlinjet editor";
     help_cancel => "close menu / cancel edit", "fermer le menu / annuler la modification", "luk menu / annuller redigering";
@@ -806,6 +852,9 @@ strings! {
     probe_no_response => "Send the request first — asserts are built from a response", "Envoyez d’abord la requête — les vérifications se construisent à partir d’une réponse", "Send forespørgslen først — kontroller bygges ud fra et svar";
     probe_nothing_to_probe => "Nothing in this response can be asserted on", "Rien dans cette réponse ne peut être vérifié", "Intet i dette svar kan kontrolleres";
     probe_already_there => "That one is already on the request", "Celle-ci est déjà sur la requête", "Den er der allerede på forespørgslen";
+    body_prettified => "Body formatted", "Corps mis en forme", "Brødtekst formateret";
+    body_already_tidy => "The body is already formatted", "Le corps est déjà mis en forme", "Brødteksten er allerede formateret";
+    body_not_json => "Only a JSON body can be formatted", "Seul un corps JSON peut être mis en forme", "Kun en JSON-brødtekst kan formateres";
     help_text_probe => "Assert/capture from the response", "Vérifier/capturer depuis la réponse", "Kontrollér/opsaml fra svaret";
     gui_probe_button => "Assert…", "Vérifier…", "Kontrollér…";
     gui_probe_button_hint => "Build an assert or a capture from this response", "Construire une vérification ou une capture depuis cette réponse", "Byg en kontrol eller opsamling ud fra dette svar";
@@ -933,6 +982,7 @@ strings! {
     gen_status => "⚠ Generated values not set:", "⚠ Valeurs générées non définies :", "⚠ Genererede værdier ikke angivet:";
     gen_err_empty => "{row}: needs an expression", "{row} : nécessite une expression", "{row}: mangler et udtryk";
     gen_err_syntax => "{row}: can't read the expression ({detail})", "{row} : expression illisible ({detail})", "{row}: kan ikke læse udtrykket ({detail})";
+    gen_err_no_request => "{row}: {function} reads the request being sent, and there isn't one here", "{row} : {function} lit la requête envoyée, or il n'y en a pas ici", "{row}: {function} læser anmodningen, der sendes, og her er ingen";
     gen_err_unknown => "{row}: there is no function called {function}", "{row} : la fonction {function} n'existe pas", "{row}: der findes ingen funktion ved navn {function}";
     gen_err_arity => "{row}: {function} takes {expected} arguments, not {got}", "{row} : {function} prend {expected} arguments, pas {got}", "{row}: {function} tager {expected} argumenter, ikke {got}";
     gen_err_argument => "{row}: {function} can't use that argument ({detail})", "{row} : {function} ne peut pas utiliser cet argument ({detail})", "{row}: {function} kan ikke bruge det argument ({detail})";
@@ -948,8 +998,8 @@ strings! {
     // compute `nonce` get one value between them. Worth naming the row rather
     // than the requests: the user knows where their own `nonce` rows are, and
     // the two titles would make the line twice as long.
-    gen_collision => "⚠ Both requests compute {name} — in one batch they share the first value", "⚠ Les deux requêtes calculent {name} — dans un même lot elles partagent la première valeur", "⚠ Begge anmodninger beregner {name} — i én batch deler de den første værdi";
-    cli_gen_collision => "more than one request computes {name}: in --batch they share the first value (drop --batch to give each its own)", "plusieurs requêtes calculent {name} : avec --batch elles partagent la première valeur (retirez --batch pour que chacune ait la sienne)", "flere anmodninger beregner {name}: med --batch deler de den første værdi (fjern --batch for at give hver sin egen)";
+    gen_collision => "⚠ Both requests compute {name} — in one batch the later one runs under a numbered name so each keeps its own value", "⚠ Les deux requêtes calculent {name} — dans un même lot la suivante s'exécute sous un nom numéroté afin que chacune garde sa propre valeur", "⚠ Begge anmodninger beregner {name} — i én batch kører den senere under et nummereret navn, så hver beholder sin egen værdi";
+    cli_gen_renamed => "{title} computes {name}, which an earlier request already computes: running it as {new} so each keeps its own value", "{title} calcule {name}, que calcule déjà une requête précédente : exécution sous {new} afin que chacune garde sa propre valeur", "{title} beregner {name}, som en tidligere anmodning allerede beregner: kører den som {new}, så hver beholder sin egen værdi";
     gen_shadow => "⚠ {name} is set by the environment — in one batch the generated value is not used", "⚠ {name} est défini par l'environnement — dans un même lot la valeur générée n'est pas utilisée", "⚠ {name} er sat af miljøet — i én batch bruges den genererede værdi ikke";
     cli_gen_shadow => "{name} is set by the environment: in --batch the generated value is not used (drop --batch to let it override from its request on)", "{name} est défini par l'environnement : avec --batch la valeur générée n'est pas utilisée (retirez --batch pour qu'elle prenne effet à partir de sa requête)", "{name} er sat af miljøet: med --batch bruges den genererede værdi ikke (fjern --batch for at lade den tage over fra sin anmodning)";
     gui_body_conflict_headline => "This request has both a raw body and form fields", "Cette requête a à la fois un corps brut et des champs de formulaire", "Denne anmodning har både en rå brødtekst og formularfelter";
@@ -1004,6 +1054,7 @@ strings! {
     gen_desc_urlencode => "Percent-encodes the text for a URL.", "Encode le texte en pourcentage pour une URL.", "Procent-koder teksten til en URL.";
     gen_desc_urldecode => "Decodes percent-encoding back to text.", "Décode l'encodage en pourcentage.", "Afkoder procent-kodning tilbage til tekst.";
     gen_desc_json_string => "Quotes and escapes the text as JSON.", "Met le texte entre guillemets et l'échappe en JSON.", "Sætter teksten i anførselstegn og escaper den som JSON.";
+    gen_desc_jsonpath => "Reads one value out of the JSON text at the given JSONPath.", "Lit une valeur dans le texte JSON au chemin JSONPath indiqué.", "Læser én værdi ud af JSON-teksten på den angivne JSONPath.";
     gen_desc_md5 => "MD5 digest of the text, in hex.", "Empreinte MD5 du texte, en hexadécimal.", "MD5-hash af teksten, i hex.";
     gen_desc_md5_b64 => "MD5 digest of the text, base64-encoded.", "Empreinte MD5 du texte, encodée en base64.", "MD5-hash af teksten, base64-kodet.";
     gen_desc_sha1 => "SHA-1 digest of the text, in hex.", "Empreinte SHA-1 du texte, en hexadécimal.", "SHA-1-hash af teksten, i hex.";
@@ -1022,6 +1073,22 @@ strings! {
     gen_desc_upper => "Upper-cases the text.", "Met le texte en majuscules.", "Gør teksten til store bogstaver.";
     gen_desc_lower => "Lower-cases the text.", "Met le texte en minuscules.", "Gør teksten til små bogstaver.";
     gen_desc_trim => "Removes whitespace from both ends.", "Supprime les espaces aux deux extrémités.", "Fjerner mellemrum i begge ender.";
+    gen_desc_method => "The request's method, in capitals.", "La méthode de la requête, en majuscules.", "Anmodningens metode med store bogstaver.";
+    gen_desc_url => "The request's full URL, with its variables filled in.", "L'URL complète de la requête, variables remplacées.", "Anmodningens fulde URL med variabler indsat.";
+    gen_desc_path => "The path part of the request's URL.", "La partie chemin de l'URL de la requête.", "Stidelen af anmodningens URL.";
+    gen_desc_query => "The query string of the request's URL, without the question mark.", "La chaîne de requête de l'URL, sans le point d'interrogation.", "Forespørgselsstrengen i anmodningens URL, uden spørgsmålstegn.";
+    gen_desc_header => "The named header of this request, or empty if it has none.", "L'en-tête nommé de cette requête, ou vide s'il n'y en a pas.", "Den navngivne header i denne anmodning, eller tom hvis den ikke findes.";
+    gen_desc_body => "This request's body, with its variables filled in.", "Le corps de cette requête, variables remplacées.", "Denne anmodnings brødtekst med variabler indsat.";
+    gen_desc_request_name => "This request's name.", "Le nom de cette requête.", "Denne anmodnings navn.";
+    gen_desc_md5_b64url => "MD5, as URL-safe Base64 without padding.", "MD5, en Base64 URL sans remplissage.", "MD5 som URL-sikker Base64 uden udfyldning.";
+    gen_desc_sha1_b64url => "SHA-1, as URL-safe Base64 without padding.", "SHA-1, en Base64 URL sans remplissage.", "SHA-1 som URL-sikker Base64 uden udfyldning.";
+    gen_desc_sha256_b64url => "SHA-256, as URL-safe Base64 without padding — the encoding a JWT uses.", "SHA-256, en Base64 URL sans remplissage — l'encodage des JWT.", "SHA-256 som URL-sikker Base64 uden udfyldning — den kodning en JWT bruger.";
+    gen_desc_sha512_b64url => "SHA-512, as URL-safe Base64 without padding.", "SHA-512, en Base64 URL sans remplissage.", "SHA-512 som URL-sikker Base64 uden udfyldning.";
+    gen_desc_hmac_sha1_b64url => "HMAC-SHA-1, as URL-safe Base64 without padding.", "HMAC-SHA-1, en Base64 URL sans remplissage.", "HMAC-SHA-1 som URL-sikker Base64 uden udfyldning.";
+    gen_desc_hmac_sha256_b64url => "HMAC-SHA-256, as URL-safe Base64 without padding — a JWT's signature.", "HMAC-SHA-256, en Base64 URL sans remplissage — la signature d'un JWT.", "HMAC-SHA-256 som URL-sikker Base64 uden udfyldning — en JWT-signatur.";
+    gen_desc_hmac_sha512_b64url => "HMAC-SHA-512, as URL-safe Base64 without padding.", "HMAC-SHA-512, en Base64 URL sans remplissage.", "HMAC-SHA-512 som URL-sikker Base64 uden udfyldning.";
+    gen_desc_split => "The nth piece of the text, split on the separator; negative counts from the end.", "La n-ième partie du texte, découpé sur le séparateur\u{a0}; négatif compte depuis la fin.", "Den n'te del af teksten, delt ved separatoren; negativ tæller fra enden.";
+    gen_desc_regex => "The first capture group the pattern matches, or the whole match.", "Le premier groupe capturé par le motif, ou la correspondance entière.", "Den første indfangede gruppe i mønsteret, eller hele match'et.";
     gui_generated_var_note => "A variable this expression can read", "Une variable que cette expression peut lire", "En variabel som dette udtryk kan læse";
     gui_generated_expr_hint => "Type to search functions, or Ctrl+Space to list them all", "Tapez pour chercher une fonction, ou Ctrl+Espace pour les lister toutes", "Skriv for at søge efter funktioner, eller Ctrl+Mellemrum for at vise dem alle";
     gui_generated_bad_name => "This name isn't a valid variable, so the row is dropped when you save", "Ce nom n'est pas une variable valide ; la ligne est supprimée à l'enregistrement", "Dette navn er ikke en gyldig variabel, så rækken fjernes når du gemmer";
@@ -1063,12 +1130,23 @@ strings! {
     gui_copy => "Copy", "Copier", "Kopiér";
     gui_copy_body => "Copy body", "Copier le corps", "Kopiér brødtekst";
     gui_compact => "Compact", "Compact", "Kompakt";
+    gui_reveal => "Reveal", "Révéler", "Vis";
+    gui_reveal_hint => "Show captured values in the clear (copying always yields the real value)", "Afficher les valeurs capturées en clair (la copie renvoie toujours la vraie valeur)", "Vis opfangede værdier i klartekst (kopiering giver altid den rigtige værdi)";
+    gui_no_captures => "This request captured nothing.", "Cette requête n'a rien capturé.", "Denne anmodning opfangede intet.";
+    gui_captures_heading => "Captures", "Captures", "Optagelser";
+    gui_captures_heading_hint => "Values captured from responses, shared by every request on this tab. Not saved with the environment.", "Valeurs capturées depuis les réponses, partagées par toutes les requêtes de cet onglet. Non enregistrées avec l'environnement.", "Værdier opfanget fra svar, delt af alle anmodninger på denne fane. Gemmes ikke med miljøet.";
+    gui_no_captures_yet => "Nothing captured yet.", "Rien de capturé pour l'instant.", "Intet opfanget endnu.";
     gui_compact_hint => "Shorten long string values to a \"head…tail\" overview (copying still yields the full body)", "Raccourcir les longues valeurs de chaîne en un aperçu « début…fin » (la copie renvoie toujours le corps complet)", "Forkort lange strengværdier til et \"start…slut\"-overblik (kopiering giver stadig hele brødteksten)";
     gui_empty_body => "(empty body)", "(corps vide)", "(tom brødtekst)";
     gui_no_headers => "(no headers)", "(aucun en-tête)", "(ingen headere)";
     gui_no_assertions => "No assertions on this request.", "Aucune assertion pour cette requête.", "Ingen assertioner på denne anmodning.";
     // Environments panel.
     gui_environments => "Environments", "Environnements", "Miljøer";
+    // The panel's two tabs. The second is labelled with `vars_heading`, which
+    // the terminal UI's `v` popup already uses for the same view.
+    gui_env_tab_envs_hint => "The environments available, and the variables of the one you pick", "Les environnements disponibles, et les variables de celui que vous choisissez", "De tilgængelige miljøer, og variablerne i det, du vælger";
+    gui_env_tab_vars_hint => "Everything a request on this tab will substitute: this tab's environment, overridden by whatever responses have captured", "Tout ce qu'une requête de cet onglet remplacera : l'environnement de cet onglet, remplacé par ce que les réponses ont capturé", "Alt, som en anmodning på denne fane vil indsætte: fanens miljø, overskrevet af det, svarene har opfanget";
+    gui_env_group_hint => "The variables of the environment bound to this tab. A capture of the same name wins over these.", "Les variables de l'environnement lié à cet onglet. Une capture du même nom l'emporte sur celles-ci.", "Variablerne i miljøet, der er bundet til denne fane. En optagelse med samme navn vinder over disse.";
     gui_load_ellipsis => "Load…", "Charger…", "Indlæs…";
     gui_load_vars_tooltip => "Load a .vars file", "Charger un fichier .vars", "Indlæs en .vars-fil";
     gui_new_environment => "New environment", "Nouvel environnement", "Nyt miljø";
@@ -1085,7 +1163,7 @@ strings! {
     gui_env_source_global => "Global", "Global", "Global";
     gui_env_source_workspace => "Workspace", "Workspace", "Workspace";
     gui_env_source_no_matches => "No environments from this source.", "Aucun environnement de cette source.", "Ingen miljøer fra denne kilde.";
-    gui_env_goto_active_tooltip => "Go to the active environment (clears the filters if they hide it)", "Aller à l'environnement actif (efface les filtres s'ils le masquent)", "Gå til det aktive miljø (rydder filtrene, hvis de skjuler det)";
+    gui_env_goto_active_tooltip => "Go to this tab's environment (clears the filters if they hide it)", "Aller à l'environnement de cet onglet (efface les filtres s'ils le masquent)", "Gå til denne fanes miljø (rydder filtrene, hvis de skjuler det)";
     gui_env_open_workspace_tooltip => "In this workspace — click to open and expand it", "Dans cet espace de travail — cliquez pour l'ouvrir et le développer", "I dette arbejdsområde — klik for at åbne og udvide det";
     gui_ws_revert_request => "Revert request to saved", "Rétablir la requête à la sauvegarde", "Gendan anmodning til gemt";
     gui_ws_revert_file => "Revert file to saved", "Rétablir le fichier à la sauvegarde", "Gendan fil til gemt";
@@ -1093,15 +1171,11 @@ strings! {
     gui_revert_go => "Revert", "Rétablir", "Gendan";
     gui_ws_set_active_env => "Set as active environment", "Définir comme environnement actif", "Angiv som aktivt miljø";
     gui_active => "Active", "Actif", "Aktiv";
-    gui_active_tooltip => "Use this environment for substitution", "Utiliser cet environnement pour la substitution", "Brug dette miljø til substitution";
-    gui_linked => "Linked", "Lié", "Tilknyttet";
-    gui_linked_tooltip => "Pin to the active collection (overrides Active)", "Épingler à la collection active (remplace Actif)", "Fastgør til den aktive samling (tilsidesætter Aktiv)";
+    gui_active_tooltip => "Use this environment for substitution on this tab", "Utiliser cet environnement pour la substitution sur cet onglet", "Brug dette miljø til substitution på denne fane";
     gui_delete => "Delete", "Supprimer", "Slet";
     gui_save_ellipsis => "Save…", "Enregistrer…", "Gem…";
     gui_env_menu_activate => "Activate", "Activer", "Aktivér";
     gui_env_menu_deactivate => "Deactivate", "Désactiver", "Deaktivér";
-    gui_env_menu_link => "Link to this collection", "Lier à cette collection", "Tilknyt denne samling";
-    gui_env_menu_unlink => "Unlink from this collection", "Délier de cette collection", "Fjern tilknytning til denne samling";
     gui_add_variable => "+ Add variable", "+ Ajouter une variable", "+ Tilføj variabel";
     gui_resolving => "resolving…", "résolution…", "løser…";
     gui_unresolved => "unresolved", "non résolu", "uløst";
@@ -1305,6 +1379,11 @@ strings! {
     chip_help_flow_end => "END — where the report finishes. Everything between BEGIN and here runs, top to bottom.", "END — fin du rapport. Tout ce qui se trouve entre BEGIN et ici s'exécute, de haut en bas.", "END — hvor rapporten slutter. Alt mellem BEGIN og her køres oppefra og ned.";
     chip_help_comment => "A comment — ignored when the report runs. Kept exactly as written.", "Un commentaire — ignoré à l'exécution du rapport. Conservé tel quel.", "En kommentar — ignoreres når rapporten kører. Bevares præcis som skrevet.";
     chip_help_end => "END — closes the FOR loop above it. Drop blocks between the loop and its END to repeat them.", "END — ferme la boucle FOR au-dessus. Déposez des blocs entre la boucle et son END pour les répéter.", "END — afslutter FOR-løkken ovenfor. Slip blokke mellem løkken og dens END for at gentage dem.";
+    chip_help_cleanup => "CLEANUP — a request that undoes something. It is written where it belongs but runs at the end of its block, in reverse dependency order.", "CLEANUP — une requête qui annule quelque chose. Elle s'écrit à sa place logique mais s'exécute à la fin de son bloc, dans l'ordre inverse des dépendances.", "CLEANUP — en forespørgsel, der rydder op. Den skrives, hvor den hører hjemme, men køres til sidst i sin blok, i omvendt afhængighedsrækkefølge.";
+    diag_requests_section_empty => "The REQUESTS section declares no requests. {}", "La section REQUESTS ne déclare aucune requête. {}", "REQUESTS-sektionen erklærer ingen forespørgsler. {}";
+    diag_requests_name_collision => "'{}' is declared more than once — an embedded request may not share a name with another request, or a reference means either of two things.", "«\u{a0}{}\u{a0}» est déclaré plusieurs fois — une requête intégrée ne peut pas partager son nom avec une autre, sinon une référence désigne deux choses à la fois.", "'{}' er erklæret mere end én gang — en indlejret forespørgsel må ikke dele navn med en anden, ellers betyder en reference to ting.";
+    diag_requests_unreferenced => "Embedded request '{}' is never called by this report.", "La requête intégrée «\u{a0}{}\u{a0}» n'est jamais appelée par ce rapport.", "Den indlejrede forespørgsel '{}' kaldes aldrig af denne rapport.";
+    chip_help_depends => "DEPENDS — the steps that must run before this one, inside a GRAPH region. It states an order the data doesn't show; edit it in the source view.", "DEPENDS — les étapes qui doivent s'exécuter avant celle-ci, dans une région GRAPH. Elle déclare un ordre que les données ne révèlent pas\u{a0}; modifiez-la dans la vue source.", "DEPENDS — de trin, der skal køre før dette, inde i et GRAPH-område. Det angiver en rækkefølge, som dataene ikke viser; redigér den i kildevisningen.";
     chip_help_using => "USING(…) — the parameters this request must declare, and any per-call field overrides. Tick the parameters in the node form; overrides are edited in the source view.", "USING(…) — les paramètres que cette requête doit déclarer, et les remplacements de champs propres à cet appel. Cochez les paramètres dans le formulaire du nœud\u{a0}; les remplacements se modifient dans la vue source.", "USING(…) — de parametre, denne forespørgsel skal erklære, samt eventuelle felt-overskrivninger for dette kald. Markér parametrene i nodeformularen; overskrivninger redigeres i kildevisningen.";
     chip_help_request => "REQUEST — runs this request from the bound collection. Pick which one from the dropdown.", "REQUEST — exécute cette requête de la collection liée. Choisissez laquelle dans la liste déroulante.", "REQUEST — kører denne forespørgsel fra den tilknyttede samling. Vælg hvilken i rullelisten.";
     chip_help_report => "REPORT — turns the line into report output. Detach it with × to run the request without reporting on it.", "REPORT — transforme la ligne en sortie de rapport. Détachez-le avec × pour exécuter la requête sans la rapporter.", "REPORT — gør linjen til rapportoutput. Fjern det med × for at køre forespørgslen uden at rapportere den.";
@@ -1336,6 +1415,9 @@ strings! {
     gui_pick_loop_folder => "Choose the folder to loop over", "Choisissez le dossier à parcourir", "Vælg mappen der skal løkkes over";
     gui_pick_loop_file => "Choose the file to loop over", "Choisissez le fichier à parcourir", "Vælg filen der skal løkkes over";
     chip_help_parallel => "PARALLEL — runs the loop's iterations at the same time. Type a number to cap how many run at once; leave it blank to use the default.", "PARALLEL — exécute les itérations de la boucle en même temps. Saisissez un nombre pour limiter combien s'exécutent à la fois ; laissez vide pour la valeur par défaut.", "PARALLEL — kører løkkens gennemløb samtidigt. Skriv et tal for at begrænse hvor mange der kører ad gangen; lad det stå tomt for standarden.";
+    // A region is where the declared graph is authoritative — the assertion
+    // that licenses both overlapping execution and pruning a run to a subset.
+    chip_help_graph => "GRAPH — inside this region, order comes from the dependency graph rather than from the order statements are written in.", "GRAPH — dans cette région, l'ordre provient du graphe de dépendances plutôt que de l'ordre d'écriture des instructions.", "GRAPH — inde i denne region kommer rækkefølgen fra afhængighedsgrafen i stedet for den rækkefølge, sætningerne er skrevet i.";
     chip_help_for_envs => "FOR … IN ENVS — runs everything up to its END once per environment listed, with that environment's variables active. The name after FOR is what each run is labelled with in the report, not a value you set. Open it to choose the environments.", "FOR … IN ENVS — exécute tout jusqu'à son END une fois par environnement listé, avec les variables de cet environnement actives. Le nom après FOR sert d'étiquette à chaque exécution dans le rapport, ce n'est pas une valeur que vous définissez. Ouvrez-le pour choisir les environnements.", "FOR … IN ENVS — kører alt frem til sit END én gang pr. angivet miljø, med det miljøs variabler aktive. Navnet efter FOR er det, hver kørsel navngives med i rapporten, ikke en værdi du sætter. Åbn den for at vælge miljøerne.";
     chip_help_baseline_show => "SHOW — the BASELINE's fields carried onto every comparison row. Belongs to the BASELINE beside it; edit it in the ENVS form.", "SHOW — les champs de la BASELINE reportés sur chaque ligne de comparaison. Appartient à la BASELINE voisine ; modifiable dans le formulaire ENVS.", "SHOW — BASELINE-felterne der føres over på hver sammenligningsrække. Hører til den BASELINE ved siden af; redigér den i ENVS-formularen.";
     chip_help_baseline => "BASELINE — the environment the others are compared against. Pick it from the dropdown.", "BASELINE — l'environnement auquel les autres sont comparés. Choisissez-le dans la liste déroulante.", "BASELINE — det miljø de andre sammenlignes med. Vælg det i rullelisten.";
@@ -1596,7 +1678,7 @@ strings! {
     diag_no_columns => "This report emits no columns, so it will produce an empty table — attach REPORT to a request to make it one.", "Ce rapport ne produit aucune colonne, il donnera donc un tableau vide — attachez REPORT à une requête pour en créer une.", "Denne rapport udsender ingen kolonner, så den giver en tom tabel — sæt REPORT på en forespørgsel for at lave en.";
     diag_collection_not_loaded => "The collection isn't loaded, so request names can't be checked yet.", "La collection n'est pas chargée, les noms de requêtes ne peuvent donc pas encore être vérifiés.", "Samlingen er ikke indlæst, så forespørgselsnavne kan ikke tjekkes endnu.";
     diag_list_shadowed => "LIST '{}' hides an earlier list of the same name.", "LIST '{}' masque une liste antérieure du même nom.", "LIST '{}' skjuler en tidligere liste med samme navn.";
-    diag_env_ref_not_a_param => "ENVS names an environment through '{}', but no PARAM declares it — write '{}' as a parameter, or name the environment outright.", "ENVS désigne un environnement via « {} », mais aucun PARAM ne le déclare — déclarez « {} » comme paramètre, ou nommez l'environnement directement.", "ENVS navngiver et miljø via '{}', men ingen PARAM erklærer det — erklær '{}' som en parameter, eller navngiv miljøet direkte.";
+    diag_env_ref_not_in_scope => "ENVS names an environment through '{}', but nothing in scope where the clause is written binds it — declare a PARAM, use a loop variable, or name the environment outright ('{}').", "ENVS désigne un environnement via « {} », mais rien dans la portée où la clause est écrite ne le définit — déclarez un PARAM, utilisez une variable de boucle, ou nommez l'environnement directement (« {} »).", "ENVS navngiver et miljø via '{}', men intet i det omfang, hvor sætningen står, binder det — erklær en PARAM, brug en løkkevariabel, eller navngiv miljøet direkte ('{}').";
     diag_env_ref_default_not_loaded => "ENVS names '{}', which currently means '{}' — an environment that isn't loaded.", "ENVS désigne « {} », qui signifie actuellement « {} » — un environnement qui n'est pas chargé.", "ENVS navngiver '{}', som i øjeblikket betyder '{}' — et miljø, der ikke er indlæst.";
     param_pick_path => "Pick a value for this parameter…", "Choisissez une valeur pour ce paramètre…", "Vælg en værdi til denne parameter…";
     param_row_required => "needs a value", "doit être renseigné", "kræver en værdi";
@@ -1627,6 +1709,43 @@ strings! {
     diag_show_hide_conflict => "Field '{}' is in both SHOW and HIDE — these conflict.", "Le champ '{}' figure à la fois dans SHOW et HIDE — ces clauses sont contradictoires.", "Feltet '{}' er både i SHOW og HIDE — de er i konflikt.";
     diag_hide_unknown => "HIDE field '{}' on request '{}' isn't a field that request produces.", "Le champ HIDE '{}' de la requête '{}' n'est pas un champ produit par cette requête.", "HIDE-feltet '{}' på forespørgslen '{}' er ikke et felt, den forespørgsel producerer.";
     diag_request_ambiguous_title => "Request '{}' is ambiguous — {} requests share that title.", "La requête '{}' est ambiguë — {} requêtes portent ce titre.", "Forespørgslen '{}' er tvetydig — {} forespørgsler deler den titel.";
+    // A *step* is one execution of a request, and its name is the unit of
+    // identity: what a dependency clause refers to and what qualifies a capture
+    // reference. Step names are therefore identifiers, while request names stay
+    // path-like — hence a rule that a request name does not have to satisfy.
+    diag_step_name_invalid => "Step name '{}' isn't a valid name — it must start with a letter or underscore, then letters, digits or underscores.", "Le nom d'étape '{}' n'est pas valide — il doit commencer par une lettre ou un tiret bas, puis des lettres, chiffres ou tirets bas.", "Trinnavnet '{}' er ikke gyldigt — det skal begynde med et bogstav eller en understreg og derefter kun indeholde bogstaver, tal eller understreger.";
+    diag_step_name_duplicate => "Step name '{}' is used {} times — every step needs a name of its own.", "Le nom d'étape '{}' est utilisé {} fois — chaque étape doit avoir son propre nom.", "Trinnavnet '{}' bruges {} gange — hvert trin skal have sit eget navn.";
+    diag_step_name_ambiguous => "Request '{}' is run {} times, so 'AS <step>' is needed to tell the runs apart.", "La requête '{}' est exécutée {} fois : 'AS <étape>' est nécessaire pour les distinguer.", "Forespørgslen '{}' køres {} gange, så 'AS <trin>' er nødvendigt for at skelne dem.";
+    diag_step_name_not_identifier => "Request '{}' can't name its own step — add 'AS <step>' with a name that starts with a letter or underscore.", "La requête '{}' ne peut pas nommer son étape — ajoutez 'AS <étape>' avec un nom commençant par une lettre ou un tiret bas.", "Forespørgslen '{}' kan ikke navngive sit eget trin — tilføj 'AS <trin>' med et navn, der begynder med et bogstav eller en understreg.";
+    // A qualified reference, `{{step.var}}`, names the producer it means. Both
+    // halves are checked: an unknown step, and a step that doesn't produce the
+    // value asked of it, are the two ways the reference can quietly resolve to
+    // somebody else's copy at run time.
+    diag_step_ref_in_hurl => "Request '{}' writes '{}' in its own Hurl, where a step-qualified name means nothing — Hurl has no dotted path. Move it into a USING(…) override in the report.", "La requête « {} » écrit « {} » dans son propre Hurl, où un nom qualifié par étape n'a aucun sens — Hurl n'a pas de chemin pointé. Déplacez-le dans un remplacement USING(…) du rapport.", "Forespørgslen '{}' skriver '{}' i sin egen Hurl, hvor et trin-kvalificeret navn intet betyder — Hurl har ingen punkteret sti. Flyt det til en USING(…)-tilsidesættelse i rapporten.";
+    diag_step_ref_unknown => "'{}' refers to step '{}', which isn't a step in scope here.", "« {} » fait référence à l'étape « {} », qui n'est pas une étape visible ici.", "'{}' henviser til trinnet '{}', som ikke er et trin i omfang her.";
+    diag_step_ref_no_capture => "Step '{}' runs request '{}', which doesn't capture '{}'.", "L'étape « {} » exécute la requête « {} », qui ne capture pas « {} ».", "Trinnet '{}' kører forespørgslen '{}', som ikke fanger '{}'.";
+    // A `GRAPH` region's diagnostics. All are errors: inside a region the
+    // declared graph is the whole specification of order, so an inconsistency
+    // in it has no defensible fallback — picking one would be inventing an
+    // edge the author never wrote.
+    diag_graph_cycle => "These steps depend on one another in a cycle: {}.", "Ces étapes dépendent les unes des autres en cycle : {}.", "Disse trin afhænger af hinanden i en cyklus: {}.";
+    diag_graph_ambiguous_capture => "Step '{}' reads '{}', which {} steps in this region capture ({}) — qualify it, as '<step>.{}'.", "L'étape « {} » lit « {} », que {} étapes de cette région capturent ({}) — qualifiez-la, par « <étape>.{} ».", "Trinnet '{}' læser '{}', som {} trin i denne region fanger ({}) — kvalificér den som '<trin>.{}'.";
+    diag_graph_only_requests => "'{}' can't appear inside a GRAPH region — only requests can. Hoist it above the region.", "« {} » ne peut pas figurer dans une région GRAPH — seules les requêtes le peuvent. Placez-la avant la région.", "'{}' kan ikke stå inde i en GRAPH-region — kun forespørgsler kan. Flyt den op over regionen.";
+    diag_graph_nested => "A GRAPH region can't contain another one — a region is where the graph is authoritative, and that can't be true twice over.", "Une région GRAPH ne peut pas en contenir une autre — une région est l'endroit où le graphe fait autorité, ce qui ne peut pas être vrai deux fois.", "En GRAPH-region kan ikke indeholde en anden — en region er der, hvor grafen er autoritativ, og det kan ikke gælde to gange.";
+    diag_graph_in_loop => "A GRAPH region can't appear inside a FOR loop yet.", "Une région GRAPH ne peut pas encore figurer dans une boucle FOR.", "En GRAPH-region kan endnu ikke stå inde i en FOR-løkke.";
+    diag_graph_loop_inside => "A FOR loop can't appear inside a GRAPH region yet.", "Une boucle FOR ne peut pas encore figurer dans une région GRAPH.", "En FOR-løkke kan endnu ikke stå inde i en GRAPH-region.";
+    diag_cleanup_in_graph => "A CLEANUP can't appear inside a GRAPH region. A region orders the steps that do the work; teardown runs after them, so it belongs after the region.", "Un CLEANUP ne peut pas figurer dans une région GRAPH. Une région ordonne les étapes qui font le travail ; le démontage vient après, il doit donc être placé après la région.", "En CLEANUP kan ikke stå inde i en GRAPH-region. En region ordner de trin, der udfører arbejdet; oprydning sker bagefter og hører derfor til efter regionen.";
+    run_cleanup_skipped => "CLEANUP '{}' skipped — '{}' didn't succeed, so there is nothing to tear down.", "Le CLEANUP « {} » est ignoré — « {} » n'a pas réussi, il n'y a donc rien à démonter.", "CLEANUP '{}' sprunget over — '{}' lykkedes ikke, så der er intet at rydde op efter.";
+    run_cleanup_cycle => "These teardowns depend on one another in a cycle, so none of them could run and whatever they cover has been left behind: {}.", "Ces démontages dépendent les uns des autres en cycle : aucun n'a donc pu s'exécuter et ce qu'ils couvrent a été laissé en place : {}.", "Disse oprydninger afhænger af hinanden i en cyklus, så ingen af dem kunne køre, og det, de dækker, er efterladt: {}.";
+    run_cleanup_failed => "CLEANUP '{}' failed: {}. The run's verdict is unchanged, but something may have been left behind.", "Le CLEANUP « {} » a échoué : {}. Le verdict de l'exécution est inchangé, mais quelque chose a pu rester en place.", "CLEANUP '{}' mislykkedes: {}. Kørslens resultat er uændret, men noget kan være efterladt.";
+    run_step_skipped => "skipped — '{}' didn't succeed", "ignorée — « {} » n'a pas réussi", "sprunget over — '{}' lykkedes ikke";
+    diag_graph_depends_unknown => "Step '{}' depends on '{}', which isn't a step in this region. DEPENDS names a step the graph orders, and only a region's own steps are ordered.", "L'étape « {} » dépend de « {} », qui n'est pas une étape de cette région. DEPENDS nomme une étape ordonnée par le graphe, et seules les étapes propres à une région le sont.", "Trinnet '{}' afhænger af '{}', som ikke er et trin i denne region. DEPENDS navngiver et trin, grafen ordner, og kun en regions egne trin ordnes.";
+    diag_graph_depends_self => "Step '{}' depends on itself.", "L'étape « {} » dépend d'elle-même.", "Trinnet '{}' afhænger af sig selv.";
+    diag_depends_outside_graph => "'{}' uses DEPENDS, but it isn't inside a GRAPH region. Outside a region statements run in the order they are written, so there is no ordering for DEPENDS to change.", "« {} » utilise DEPENDS sans être dans une région GRAPH. Hors d'une région, les instructions s'exécutent dans l'ordre d'écriture ; DEPENDS n'a donc aucun ordre à modifier.", "'{}' bruger DEPENDS, men står ikke i en GRAPH-region. Uden for en region køres sætninger i den rækkefølge, de er skrevet, så DEPENDS har ingen rækkefølge at ændre.";
+    diag_step_ref_cleanup => "'{}' reads a capture made by '{}', which is a CLEANUP. Teardown runs after the steps in its block, so its captures are never available to them — only another cleanup in the same block can read one.", "« {} » lit une capture faite par « {} », qui est un CLEANUP. Le démontage s'exécute après les étapes de son bloc, ses captures ne leur sont donc jamais accessibles — seul un autre nettoyage du même bloc peut en lire une.", "'{}' læser en opsamling fra '{}', som er en CLEANUP. Oprydning kører efter trinnene i sin blok, så dens opsamlinger er aldrig tilgængelige for dem — kun en anden oprydning i samme blok kan læse en.";
+    diag_cleanup_depends_outer => "'{}' depends on '{}', a cleanup in an enclosing block. That block unwinds after this one, so '{}' can never have run in time — move it, or depend on the step it tears down.", "« {} » dépend de « {} », un nettoyage d'un bloc englobant. Ce bloc se termine après celui-ci, donc « {} » ne peut jamais avoir été exécuté à temps — déplacez-le, ou dépendez de l'étape qu'il démonte.", "'{}' afhænger af '{}', en oprydning i en omsluttende blok. Den blok afvikles efter denne, så '{}' kan aldrig nå at have kørt — flyt den, eller afhæng af det trin, den rydder op efter.";
+    diag_graph_target_strands => "'{}' refers to '{}', which the chosen targets leave out of the run. Name it as a target too, or stop referring to it.", "« {} » fait référence à « {} », que les cibles choisies excluent de l'exécution. Nommez-le aussi comme cible, ou cessez d'y faire référence.", "'{}' refererer til '{}', som de valgte mål udelader fra kørslen. Angiv det også som mål, eller lad være med at referere til det.";
+    diag_graph_unknown_target => "'{}' isn't a step inside a GRAPH region, so it can't be a target — only a region promises the complete graph a target needs.", "« {} » n'est pas une étape dans une région GRAPH ; ce ne peut donc pas être une cible — seule une région garantit le graphe complet qu'une cible exige.", "'{}' er ikke et trin inde i en GRAPH-region, så det kan ikke være et mål — kun en region lover den komplette graf, et mål kræver.";
     report_add_helper_collection => "HELPER COLLECTION…", "COLLECTION D'APPOINT…", "HJÆLPESAMLING…";
     report_alias_unset => "alias", "alias", "alias";
     // The two halves of a `# labels:` class. The hints are examples rather than
@@ -1764,6 +1883,7 @@ impl Strings {
             "urlencode" => self.gen_desc_urlencode,
             "urldecode" => self.gen_desc_urldecode,
             "json_string" => self.gen_desc_json_string,
+            "jsonpath" => self.gen_desc_jsonpath,
             "md5" => self.gen_desc_md5,
             "md5_b64" => self.gen_desc_md5_b64,
             "sha1" => self.gen_desc_sha1,
@@ -1782,6 +1902,22 @@ impl Strings {
             "upper" => self.gen_desc_upper,
             "lower" => self.gen_desc_lower,
             "trim" => self.gen_desc_trim,
+            "method" => self.gen_desc_method,
+            "url" => self.gen_desc_url,
+            "path" => self.gen_desc_path,
+            "query" => self.gen_desc_query,
+            "header" => self.gen_desc_header,
+            "body" => self.gen_desc_body,
+            "request_name" => self.gen_desc_request_name,
+            "md5_b64url" => self.gen_desc_md5_b64url,
+            "sha1_b64url" => self.gen_desc_sha1_b64url,
+            "sha256_b64url" => self.gen_desc_sha256_b64url,
+            "sha512_b64url" => self.gen_desc_sha512_b64url,
+            "hmac_sha1_b64url" => self.gen_desc_hmac_sha1_b64url,
+            "hmac_sha256_b64url" => self.gen_desc_hmac_sha256_b64url,
+            "hmac_sha512_b64url" => self.gen_desc_hmac_sha512_b64url,
+            "split" => self.gen_desc_split,
+            "regex" => self.gen_desc_regex,
             _ => "",
         }
     }
@@ -1853,6 +1989,15 @@ pub enum Status {
     /// The assert or capture chosen is already on the request, so nothing was
     /// added. Said out loud: silently doing nothing reads as a broken key.
     ProbeAlreadyThere,
+    /// The JSON body was laid out afresh.
+    BodyPrettified,
+    /// The body was already laid out that way, so the keystroke changed
+    /// nothing. Said out loud rather than passed over in silence: a key that
+    /// appears to do nothing reads as a broken one.
+    BodyAlreadyTidy,
+    /// The body isn't JSON (GraphQL, XML, plain text — or JSON half-typed), so
+    /// there is nothing that can be laid out without risking mangling it.
+    BodyNotJson,
     /// `a` was pressed before the request had been sent. Distinct from
     /// `NoResponse` (a *save* with nothing to write): the palette's problem is
     /// not that a file is missing but that there is nothing to build from yet,
@@ -1882,7 +2027,7 @@ pub enum Status {
     /// so the cause is named at the moment it is introduced.
     ///
     /// `in_envs` names any loaded Global Environment that defines one of them
-    /// but is neither active nor linked: the difference between a typo and a
+    /// but is not active on this tab: the difference between a typo and a
     /// file the user loaded and assumed was in use.
     UndefinedVars {
         keys: Vec<String>,
@@ -2223,6 +2368,8 @@ impl Status {
                     | Status::EnvReverted(_)
                     | Status::WorkspaceTreeFilter(_)
                     | Status::ReportRunSettingsFirst
+                    | Status::BodyPrettified
+                    | Status::BodyAlreadyTidy
             ),
         }
     }
@@ -2239,6 +2386,9 @@ impl Status {
             Status::ProbeStatusSet(code) => format!("{} {code}", s.probe_status_set),
             Status::ProbeCaptureAdded(name) => format!("{} {name}", s.probe_capture_added),
             Status::ProbeAlreadyThere => s.probe_already_there.to_string(),
+            Status::BodyPrettified => s.body_prettified.to_string(),
+            Status::BodyAlreadyTidy => s.body_already_tidy.to_string(),
+            Status::BodyNotJson => s.body_not_json.to_string(),
             Status::ProbeNoResponse => s.probe_no_response.to_string(),
             Status::ProbeNothingToProbe => s.probe_nothing_to_probe.to_string(),
             Status::NoResponse => s.file_no_response.to_string(),
@@ -2584,6 +2734,10 @@ pub fn describe_gen_errors(s: &Strings, errors: &[crate::generators::GenError]) 
                 .gen_err_syntax
                 .replace("{row}", name)
                 .replace("{detail}", detail),
+            G::NoRequest { name, function } => s
+                .gen_err_no_request
+                .replace("{row}", name)
+                .replace("{function}", function),
             G::UnknownFunction { name, function } => s
                 .gen_err_unknown
                 .replace("{row}", name)

@@ -27,7 +27,7 @@ use crate::report::indent::{
 use crate::report::model::ReportResult;
 use crate::report::validate::{Diagnostic, Severity};
 
-use crate::tui::report_highlight::{self, HlCtx};
+use crate::report_highlight::{self, HlCtx};
 
 use super::app::GuiApp;
 use super::report_run::{self, ParkedRun, RowState, RunHandle, RunKey, RunProgress};
@@ -679,7 +679,6 @@ impl ReportEditor {
         match context::report_run_inputs(
             &app.session.collections,
             &app.session.global_envs,
-            app.session.active_env_id,
             &flow,
             self.report.path.as_deref(),
         ) {
@@ -756,12 +755,11 @@ impl ReportEditor {
         match context::report_run_inputs(
             &app.session.collections,
             &app.session.global_envs,
-            app.session.active_env_id,
             &flow,
             self.report.path.as_deref(),
         ) {
             Ok(inputs) => {
-                let strings = Strings::for_language(&app.session.language);
+                let strings = Strings::mapped(&app.session.language, super::icons::drawable);
                 let ctx = RunContext {
                     entries: &inputs.entries,
                     helpers: &inputs.helpers,
@@ -772,6 +770,7 @@ impl ReportEditor {
                     strings: &strings,
                     params: chosen,
                     sink: None,
+                    shuffle: None,
                 };
                 let result = run_flow_raw(&inputs.flow, &ctx);
                 // The non-blocking variable-availability warnings are worth
@@ -1442,8 +1441,38 @@ fn build_node_chips(
         FlowNode::Comment(text) => {
             vec![Chip::base(format!("#{text}"), th.dim).with_help(s.chip_help_comment)]
         }
-        FlowNode::Request { name, using } => {
+        FlowNode::Request {
+            name,
+            alias,
+            using,
+            depends,
+        } => {
             let mut chips = vec![Chip::request(name, req_col).with_help(s.chip_help_request)];
+            if let Some(a) = alias {
+                chips.push(Chip::base(format!("AS {a}"), th.accent).with_help(s.chip_help_alias));
+            }
+            chips.extend(depends_chip(depends, th.subst, s.chip_help_depends));
+            chips.extend(using_chip(using, th.subst, s.chip_help_using));
+            chips
+        }
+        // A cleanup reads as a request with a different verb: it is one, and
+        // what makes it special — running at the end of its block — is not a
+        // property the chips can show, so the keyword carries it.
+        FlowNode::Cleanup {
+            name,
+            alias,
+            depends,
+            using,
+        } => {
+            let mut chips = vec![
+                Chip::modifier("CLEANUP".into(), th.pending, DetachWhich::Report)
+                    .with_help(s.chip_help_cleanup),
+            ];
+            chips.push(Chip::request(name, req_col).with_help(s.chip_help_request));
+            if let Some(a) = alias {
+                chips.push(Chip::base(format!("AS {a}"), th.accent).with_help(s.chip_help_alias));
+            }
+            chips.extend(depends_chip(depends, th.subst, s.chip_help_depends));
             chips.extend(using_chip(using, th.subst, s.chip_help_using));
             chips
         }
@@ -1455,12 +1484,14 @@ fn build_node_chips(
             show,
             hide,
             with,
+            depends,
         }) => {
             let mut chips = vec![
                 Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report)
                     .with_help(s.chip_help_report),
             ];
             chips.push(Chip::request(name, req_col).with_help(s.chip_help_request));
+            chips.extend(depends_chip(depends, th.subst, s.chip_help_depends));
             // Shown as its own chip so a required parameter is visible in the
             // block editor too — a clause the graphical view silently omitted
             // would be worse than no clause at all.
@@ -1593,6 +1624,21 @@ fn build_node_chips(
             };
             vec![Chip::base(node.label(), col).with_help(help)]
         }
+        // A region's head is its own chip pair: the `PARALLEL` cap (when
+        // present) and the `GRAPH` opener with its optional name. Nothing else
+        // belongs on the line — the edges live on the steps inside it.
+        FlowNode::Graph { name, parallel, .. } => {
+            let mut chips = Vec::new();
+            if let Some(spec) = parallel {
+                chips.push(Chip::parallel(spec.degree, th.err).with_help(s.chip_help_parallel));
+            }
+            let head = match name {
+                Some(n) => format!("GRAPH {n}"),
+                None => "GRAPH".to_string(),
+            };
+            chips.push(Chip::base(head, th.accent).with_help(s.chip_help_graph));
+            chips
+        }
         FlowNode::ForEach { parallel, .. } | FlowNode::ForEnvs { parallel, .. } => {
             let mut chips = Vec::new();
             if let Some(spec) = parallel {
@@ -1696,6 +1742,23 @@ fn build_node_chips(
 /// column has no statistics. Tethered, because the statistics belong to the
 /// column named immediately before them rather than to the statement as a
 /// whole — so the two are drawn as one segmented pill (see [`link_tethers`]).
+/// The `DEPENDS` chip for a request statement, or nothing when there is no
+/// clause.
+///
+/// Read-only, for the same reason as [`using_chip`]: the editor can't author a
+/// dependency yet, but a clause the graphical view silently omitted would be
+/// worse than no clause at all — and this one decides when the request runs.
+fn depends_chip(depends: &[String], color: Color32, help: &'static str) -> Option<Chip> {
+    if depends.is_empty() {
+        return None;
+    }
+    Some(
+        Chip::base(format!("DEPENDS {}", depends.join(", ")), color)
+            .with_help(help)
+            .tether(),
+    )
+}
+
 /// The `USING(…)` chip for a request statement, or nothing when there is no
 /// clause.
 ///
@@ -2008,7 +2071,6 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             let key = context::diagnostics_fingerprint(
                 &app.session.collections,
                 &app.session.global_envs,
-                app.session.active_env_id,
                 flow,
                 ed.report.path.as_deref(),
                 &app.strings,
@@ -2017,7 +2079,6 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 ed.diagnostics = context::report_diagnostics(
                     &app.session.collections,
                     &app.session.global_envs,
-                    app.session.active_env_id,
                     flow,
                     ed.report.path.as_deref(),
                     &app.strings,
@@ -2087,14 +2148,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         // as well here, beside the Run button that started it.
         if ed.is_running() {
             ui.separator();
-            ui.colored_label(
-                th.pending,
-                format!(
-                    "{} {}",
-                    super::icons::RUNNING,
-                    app.strings.gui_report_running
-                ),
-            );
+            super::widgets::spinning_icon(ui, th.pending);
+            ui.colored_label(th.pending, app.strings.gui_report_running);
         }
         if let Some(prog) = &ed.progress {
             ui.colored_label(th.dim, format!("{}/{}", prog.done, prog.total));
@@ -2519,7 +2574,7 @@ fn highlight_ctx_key(ed: &ReportEditor, app: &GuiApp) -> u64 {
 
 /// Lay `text` out as a syntax-highlighted [`egui::text::LayoutJob`], reusing the
 /// terminal UI's PaperTrail highlighter so both front-ends colour a script
-/// identically (see [`crate::tui::report_highlight`]).
+/// identically (see [`crate::report_highlight`]).
 ///
 /// The highlighter works a line at a time and drops the line breaks, so the
 /// newlines are re-inserted here as their own sections — otherwise the whole
@@ -2937,7 +2992,7 @@ fn show_param_modal(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context
     let th = app.theme;
     // A copy of its own, so the app is free to be borrowed mutably for the file
     // picker at the end without the form's own words going out of scope.
-    let s = Strings::for_language(&app.session.language);
+    let s = Strings::mapped(&app.session.language, super::icons::drawable);
     let rows = ed.param_rows(&s);
     let envs: Vec<String> = app
         .session
@@ -4978,12 +5033,20 @@ fn results_grid(
                             }
                         }
                         if show_icons {
-                            let (glyph, colour) = match state {
-                                Some(RowState::Running) => (super::icons::RUNNING, th.pending),
-                                Some(RowState::Finished) => (super::icons::PASS, th.ok),
-                                _ => (super::icons::ROW_SCHEDULED, th.dim),
-                            };
-                            ui.colored_label(colour, glyph);
+                            match state {
+                                // Turning, so a row waiting on a slow endpoint
+                                // says "still going" rather than sitting there
+                                // looking like a result.
+                                Some(RowState::Running) => {
+                                    super::widgets::spinning_icon(ui, th.pending);
+                                }
+                                Some(RowState::Finished) => {
+                                    ui.colored_label(th.ok, super::icons::PASS);
+                                }
+                                _ => {
+                                    ui.colored_label(th.dim, super::icons::ROW_SCHEDULED);
+                                }
+                            }
                         }
                         let text_col = match state {
                             Some(RowState::Running) => th.pending,
@@ -5397,7 +5460,9 @@ fn pretty_json_cell(raw: &str) -> String {
 /// Collapse a cell's newlines to a single line (a response body can be huge).
 fn flatten_cell(value: &str) -> String {
     if value.contains(['\n', '\r']) {
-        value.replace("\r\n", "⏎").replace(['\n', '\r'], "⏎")
+        value
+            .replace("\r\n", super::icons::CELL_NEWLINE)
+            .replace(['\n', '\r'], super::icons::CELL_NEWLINE)
     } else {
         value.to_string()
     }
@@ -13626,7 +13691,7 @@ mod results_render_tests {
     /// is cached — but it has to follow every input the highlighter colours by.
     #[test]
     fn the_highlight_key_notices_every_input_it_guards() {
-        use crate::tui::report_highlight::HlCtx;
+        use crate::report_highlight::HlCtx;
         let text = "REPORT REQUEST login AS l\n";
         let ctx = HlCtx {
             error_line: None,
@@ -15136,5 +15201,64 @@ mod chip_spacing_tests {
             gap > 1.0,
             "the label and the box beside it must not touch (gap {gap})"
         );
+    }
+}
+
+#[cfg(test)]
+mod flatten_cell_tests {
+    use super::*;
+
+    /// Lay a string out the way a grid cell does and report whether the font
+    /// stack actually had a glyph for every character. egui substitutes a
+    /// "tofu" replacement glyph when it doesn't, and — crucially — does so
+    /// silently: the code looks right, the layout is the right width, and only
+    /// a human looking at the screen ever finds out.
+    fn every_character_has_a_glyph(text: &str) -> bool {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Light);
+        ctx.set_fonts(fonts);
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(400.0, 200.0),
+                )),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        ctx.fonts_mut(|f| {
+            let font = egui::FontId::new(14.0, egui::FontFamily::Proportional);
+            text.chars().all(|c| f.has_glyph(&font, c))
+        })
+    }
+
+    /// The marker that stands in for a collapsed newline used to be `⏎`
+    /// (U+23CE), which no font egui bundles carries — so every multi-line cell
+    /// in the results grid showed a tofu box where the marker should be.
+    #[test]
+    fn a_collapsed_newline_is_marked_with_something_the_font_can_draw() {
+        let flattened = flatten_cell("first\nsecond\r\nthird\rfourth");
+        assert!(
+            !flattened.contains(['\n', '\r']),
+            "the cell still has line breaks in it: {flattened:?}"
+        );
+        assert_eq!(
+            flattened.matches(crate::gui::icons::CELL_NEWLINE).count(),
+            3,
+            "each break is marked exactly once, and \\r\\n counts as one: {flattened:?}"
+        );
+        assert!(
+            every_character_has_a_glyph(&flattened),
+            "the grid cannot draw {flattened:?} — it will show tofu boxes"
+        );
+    }
+
+    /// A value with nothing to collapse must come through untouched: the
+    /// marker is a repair for a line break, not decoration.
+    #[test]
+    fn a_single_line_cell_is_left_exactly_as_it_was() {
+        assert_eq!(flatten_cell("200 OK"), "200 OK");
     }
 }

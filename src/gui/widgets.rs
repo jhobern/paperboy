@@ -319,6 +319,120 @@ pub fn wrapping_field_font_id(
     })
 }
 
+/// [`super::icons::RUNNING`], turning.
+///
+/// The icon is Phosphor's circle-notch — a ring with a bite out of it, the
+/// shape every spinner is drawn from. Standing still it reads as a broken ring
+/// rather than as work in progress, and the counter beside it in the report
+/// toolbar only moves when a request *finishes*, so a run waiting on one slow
+/// endpoint looked stopped at exactly the moment the user wants reassurance.
+///
+/// **Painted rather than spun as text**, for the same family of reasons as
+/// [`status_dot`]. Rotating the real glyph with a `TextShape` looks right in a
+/// screenshot but jostles in motion: `epaint` rounds a galley's position to a
+/// whole physical pixel before applying the angle (`Tessellator`'s
+/// `round_text_to_pixels`, on by default, and not settable per shape). A glyph
+/// spun about its own middle has to walk its top-left corner around a circle
+/// to stay put, and that circle gets snapped — so the icon hops a pixel at a
+/// time instead of turning. A stroked path has no such rounding (only
+/// *axis-aligned* line segments are snapped, and an arc has none), so it turns
+/// smoothly at sub-pixel precision.
+///
+/// The arc is Phosphor Light's own geometry, measured off the font so that it
+/// sits among the still icons as if it were one of them: the ring's centreline
+/// is at [`NOTCH_RADIUS`] of the em, its stroke is [`NOTCH_STROKE`], and the
+/// notch spans [`NOTCH_GAP`] radians at the top. The footprint reserved is
+/// whatever a label of the real glyph would take, which matters because every
+/// Phosphor glyph is exactly one em wide — that is what stops a request row or
+/// a results-grid row from shifting sideways as its marker goes scheduled →
+/// running → finished. (`egui::Spinner` would allocate a square of its own
+/// chosen size instead, and jog the column on every state change.)
+///
+/// Pumps its own repaints, the way `egui::Spinner` does. An animation that
+/// relies on its caller for frames is one refactor away from freezing in
+/// place, and every site that draws this is by definition busy.
+pub fn spinning_icon(ui: &mut egui::Ui, color: Color32) -> egui::Response {
+    /// Radians per second — a shade under a turn and a half, fast enough to
+    /// read as motion at a glance without becoming a distraction on a grid
+    /// where several rows may be turning at once.
+    const SPEED: f32 = 5.0;
+    /// How finely the arc is chopped. At body size the ring is only a few
+    /// pixels across, so this is already far more than the curve needs; it is
+    /// cheap, and it keeps the arc smooth if the icon is ever drawn large.
+    const SEGMENTS: usize = 48;
+
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let em = font.size;
+    let galley = ui
+        .painter()
+        .layout_no_wrap(super::icons::RUNNING.to_owned(), font, color);
+    // Where the glyph's ink sits inside the space it reserves — the ring is
+    // centred in its em box horizontally but not vertically, so anchoring on
+    // the reserved rect's middle would float the spinner off the line the
+    // still icons sit on.
+    let ink = galley
+        .rows
+        .first()
+        .map(|r| r.visuals.mesh_bounds.translate(r.pos.to_vec2()))
+        .unwrap_or(galley.rect);
+    let (rect, response) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let centre = rect.min + ink.center().to_vec2();
+        let radius = em * NOTCH_RADIUS;
+        let from = (ui.input(|i| i.time) as f32 * SPEED) % std::f32::consts::TAU + NOTCH_GAP / 2.0;
+        let sweep = std::f32::consts::TAU - NOTCH_GAP;
+        let arc = (0..=SEGMENTS)
+            .map(|i| {
+                let t = from + sweep * (i as f32 / SEGMENTS as f32);
+                centre + radius * egui::vec2(t.cos(), t.sin())
+            })
+            .collect();
+        ui.painter().add(egui::Shape::line(
+            arc,
+            egui::Stroke::new(em * NOTCH_STROKE, color),
+        ));
+        ui.ctx().request_repaint();
+    }
+    response
+}
+
+/// Radius of the circle-notch ring's centreline, as a fraction of the em.
+///
+/// Measured off Phosphor Light's `CIRCLE_NOTCH` outline rather than guessed:
+/// fitting a circle to it gives inner and outer edges at 365.6 and 410.9 of
+/// the font's 1024 units, centred 0.5 em across.
+const NOTCH_RADIUS: f32 = 388.3 / 1024.0;
+
+/// Stroke width of the ring, likewise as a fraction of the em (45.3/1024).
+const NOTCH_STROKE: f32 = 45.3 / 1024.0;
+
+/// The notch: how much of the ring is missing, in radians. The glyph's gap
+/// spans 69.2°–110.8°, i.e. 41.6° centred on straight up.
+const NOTCH_GAP: f32 = 41.6 * std::f32::consts::PI / 180.0;
+
+/// A small filled circle used as a status marker — the GUI's counterpart to
+/// the terminal UI's `●`.
+///
+/// Painted rather than typed, because the obvious `\u{25cf}` renders as a tofu
+/// box here. Of the fonts egui bundles, only **Hack** carries U+25CF, and Hack
+/// is in the *monospace* family — the proportional family every label uses is
+/// Ubuntu-Light + the two emoji fonts, none of which has the glyph, and egui
+/// does not fall back from proportional into monospace. Phosphor (which covers
+/// every other icon here, see [`super::icons`]) has no replacement either: in
+/// the Light weight the app registers, its `DOT` is a speck 8% of an em across
+/// and `CIRCLE` is a thin ring. A disc is a centre and a radius, so drawing it
+/// needs no font at all — and it can then be sized to the surrounding text.
+pub fn status_dot(ui: &mut egui::Ui, color: Color32) -> egui::Response {
+    // Roughly the ink of a `●` at the same text size, and tied to the text so
+    // it tracks the app's font scaling rather than pinning to a fixed pixel.
+    let d = (ui.text_style_height(&egui::TextStyle::Body) * 0.42).round();
+    // A horizontal layout centres a short item vertically, so this sits on the
+    // midline of the label beside it.
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(d, d), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), d / 2.0, color);
+    response
+}
+
 /// A selectable label whose footprint never changes between the
 /// unselected, hovered and selected states.
 ///
@@ -2766,6 +2880,174 @@ mod tests {
         assert!(
             jwt <= one_line * (FIELD_MAX_LINES + 1.0),
             "a huge value took the whole panel ({jwt}px for a {one_line}px row)"
+        );
+    }
+
+    /// One frame stamped at `time`: what the body reserved, and every stroked
+    /// path it painted, as its point list.
+    fn spun_frame(time: f64) -> (egui::Rect, Vec<Vec<egui::Pos2>>) {
+        fn walk(s: &egui::epaint::Shape, out: &mut Vec<Vec<egui::Pos2>>) {
+            match s {
+                egui::epaint::Shape::Path(p) if !p.stroke.is_empty() => out.push(p.points.clone()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let rect = std::cell::Cell::new(egui::Rect::NOTHING);
+        let out = ctx.run_ui(
+            egui::RawInput {
+                time: Some(time),
+                ..a_frame()
+            },
+            |ui| rect.set(spinning_icon(ui, egui::Color32::RED).rect),
+        );
+        let mut shapes = Vec::new();
+        for c in &out.shapes {
+            walk(&c.shape, &mut shapes);
+        }
+        (rect.get(), shapes)
+    }
+
+    /// Where the painted arc starts, as an angle about the ring's centre.
+    fn arc_start(arc: &[egui::Pos2]) -> f32 {
+        let d = arc[0] - ring_centre(arc);
+        d.y.atan2(d.x)
+    }
+
+    /// The centre of the ring the arc lies on, fitted as the circumcircle of
+    /// three well-separated points. Its bounding box is no use for this: the
+    /// notch pulls one side in, and which side changes as it turns.
+    fn ring_centre(arc: &[egui::Pos2]) -> egui::Pos2 {
+        let p = |i: usize| {
+            let q = arc[i * (arc.len() - 1) / 3];
+            (q.x as f64, q.y as f64)
+        };
+        let ((ax, ay), (bx, by), (cx, cy)) = (p(0), p(1), p(2));
+        let (sa, sb, sc) = (ax * ax + ay * ay, bx * bx + by * by, cx * cx + cy * cy);
+        let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+        egui::pos2(
+            ((sa * (by - cy) + sb * (cy - ay) + sc * (ay - by)) / d) as f32,
+            ((sa * (cx - bx) + sb * (ax - cx) + sc * (bx - ax)) / d) as f32,
+        )
+    }
+
+    /// Where a plain label of the same glyph puts that glyph's *ink* — which
+    /// is not the middle of the box it reserves, because the ring sits on the
+    /// text line rather than filling the em vertically.
+    fn still_icon_ink_centre() -> egui::Pos2 {
+        fn walk(s: &egui::epaint::Shape, out: &mut Option<egui::Pos2>) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    if let Some(row) = t.galley.rows.first() {
+                        *out = Some(
+                            t.pos + row.pos.to_vec2() + row.visuals.mesh_bounds.center().to_vec2(),
+                        );
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let out = ctx.run_ui(a_frame(), |ui| {
+            ui.colored_label(egui::Color32::RED, super::super::icons::RUNNING);
+        });
+        let mut found = None;
+        for c in &out.shapes {
+            walk(&c.shape, &mut found);
+        }
+        found.expect("the label painted its glyph")
+    }
+
+    #[test]
+    fn the_running_icon_turns_as_time_passes() {
+        let (_, first) = spun_frame(0.30);
+        let (_, later) = spun_frame(0.45);
+        assert_eq!(first.len(), 1, "one arc painted");
+        assert_eq!(later.len(), 1);
+        assert!(
+            (arc_start(&first[0]) - arc_start(&later[0])).abs() > 0.1,
+            "a later frame draws the notch somewhere else, which is the animation"
+        );
+    }
+
+    /// The whole reason the arc is painted rather than spun as text: `epaint`
+    /// rounds a galley's position to a whole pixel before applying its angle,
+    /// so a rotating glyph advances in 1px hops — it stands still for several
+    /// frames and then jumps. A path is rounded nowhere, so equal slices of
+    /// time move it by equal (and, here, sub-pixel) amounts.
+    #[test]
+    fn the_running_icon_turns_smoothly_rather_than_a_pixel_at_a_time() {
+        let steps: Vec<f32> = (0..24)
+            .map(|i| {
+                let (_, now) = spun_frame(i as f64 * 0.004);
+                now[0][0]
+            })
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|w| (w[1] - w[0]).length())
+            .collect();
+        let (small, large) = steps
+            .iter()
+            .fold((f32::MAX, 0.0_f32), |(a, b), s| (a.min(*s), b.max(*s)));
+        assert!(
+            small > 0.0,
+            "the arc stalled between frames, which is what pixel snapping looks like"
+        );
+        assert!(
+            large < 1.0,
+            "a 4ms step moved the arc {large}px — that is a jump, not a turn"
+        );
+        assert!(
+            large / small < 1.5,
+            "the arc moves {small}px on one step and {large}px on another, so it is turning in lurches"
+        );
+    }
+
+    /// Turning must move the notch, not the ring. The ring also has to land
+    /// exactly where the still icons' ink lands, or the spinner floats above
+    /// or below the line its neighbours sit on.
+    #[test]
+    fn the_turning_icon_sits_still_and_on_the_line() {
+        let still = still_icon_ink_centre();
+        for time in [0.0, 0.4, 0.9, 1.7] {
+            let (rect, shapes) = spun_frame(time);
+            let arc = &shapes[0];
+            let bbox = arc.iter().fold(egui::Rect::NOTHING, |b, p| {
+                b.union(egui::Rect::from_pos(*p))
+            });
+            assert!(
+                rect.contains_rect(bbox),
+                "at t={time} the arc spills out of the {rect:?} it reserved: {bbox:?}"
+            );
+            let centre = ring_centre(arc);
+            assert!(
+                (centre - still).length() < 0.1,
+                "at t={time} the ring is centred on {centre:?}, but a still icon's ink is at {still:?}"
+            );
+        }
+    }
+
+    /// Every Phosphor glyph is exactly one em wide, which is what stops a
+    /// request row or a results-grid row from shifting sideways as its marker
+    /// goes scheduled → running → finished. The turning icon has to reserve
+    /// what the still ones do or it reintroduces the jitter.
+    #[test]
+    fn the_turning_icon_reserves_what_a_plain_icon_label_would() {
+        let ctx = egui::Context::default();
+        let plain = std::cell::Cell::new(egui::Rect::NOTHING);
+        let _ = ctx.run_ui(a_frame(), |ui| {
+            plain.set(
+                ui.colored_label(egui::Color32::RED, super::super::icons::PASS)
+                    .rect,
+            );
+        });
+        let (spun, _) = spun_frame(0.5);
+        let (a, b) = (plain.get().size(), spun.size());
+        assert!(
+            (a.x - b.x).abs() < 0.5 && (a.y - b.y).abs() < 0.5,
+            "the turning icon reserved {b:?} where a still one reserves {a:?}"
         );
     }
 }

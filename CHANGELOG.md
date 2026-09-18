@@ -8,9 +8,998 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.6.0] - 2026-09-18
+
+### Added
+
+- **`-o` is repeatable: one run, several output formats.** `paperboy -r
+  report.trail -o out.html -o out.json` runs the requests **once** and renders
+  the same result to every format asked for. It is what an application
+  embedding PaperBoy needs — a rendering to drop into its own UI and a
+  structure to parse alongside it — where running the report twice risked two
+  answers that disagreed, took twice the traffic, and left no way to say which
+  was the real one. `-` may be given at most once (two formats down one pipe
+  would interleave into neither of them), the same path twice is refused as the
+  typo it almost certainly is, and every requested format is checked *before*
+  any request goes out, so a misspelled extension costs nothing rather than a
+  full run. If one file can't be written the rest are left in place and the run
+  exits `1`: they are faithful renderings of a run that really happened.
+
+- **`--param NAME=VALUE` sets a report's declared `PARAM`s from the command
+  line.** Repeatable, and documented in half a dozen places already — including
+  the error a required parameter raises ("set it before running (--param
+  NAME=…)") — but never actually implemented: the headless runner passed an
+  empty set, so a `PARAM` could only ever take the default written in the
+  `.trail`, and one with no default made a headless run impossible. It is now
+  the answer to "one report, run against a different folder each time": a
+  caller shelling out to PaperBoy passes `--param CASES_DIR=./batch-07` and the
+  `FOR … IN FOLDERS "{{CASES_DIR}}"` loop follows, with the file left untouched.
+
+  The value beats the declared default, is split on the *first* `=` only and
+  taken verbatim afterwards (a path may contain `=` and may end in a space), and
+  is held to the declaration's own rules — a `CHOICE` must be one of its
+  options, a `NUMBER` must parse. A name the report doesn't declare is a setup
+  error naming the ones it does, rather than a value that silently does nothing:
+  the usual way a scripted command line drifts from the script it calls is that
+  a parameter gets renamed, and the run would otherwise go on quietly using the
+  default the caller believed it had replaced. Malformed arguments exit `2`
+  (clap's "you invoked me wrongly"), an undeclared name exits `1`. The values in
+  force are echoed in the run's header block, so "which folder did last night's
+  run actually look at?" is answerable from the log rather than from the calling
+  shell's history.
+
+- **`AS` now names a step on a plain `REQUEST`, not just `REPORT REQUEST`.** A
+  *step* is one execution of a request, and its name — not the request's name —
+  is what identifies it. `REQUEST auth/session AS sess` is now legal, and `AS`
+  may be written on either side of `USING(…)`, as it already could on a reported
+  request. With no `AS`, the request's leaf name is used.
+
+- **PaperTrail now checks that every step can be named, and that a name
+  identifies one step.** Running the same request twice in one block without
+  naming the two invocations is reported rather than silently treated as one
+  thing, and a request whose name can't be an identifier (an imported
+  `43_ocr_result`, say) is told to carry an `AS`.
+
+  Uniqueness is lexical: a name must be unique along any one path from the top
+  of the flow to the statement, which is exactly the set of steps a reference
+  can see. Two sibling loops may therefore each contain a `CreateSession`, and
+  may each report `AS Liveness` so that both halves fill one shared set of
+  columns — a column is identified by its name, not by which statement filled
+  it. A nested block may not reuse a name from a block enclosing it.
+
+- **A capture reference can now say which step it means: `{{step.var}}`.** Two
+  requests that both capture `token` used to leave only one of them reachable —
+  the chain is flat and last-writer-wins, so `{{token}}` silently meant whichever
+  ran most recently. `{{login.token}}` reaches that step's copy regardless.
+
+  Qualified names are resolved in PaperTrail's own text — `USING(…)` values,
+  assignments, computed columns — and are never handed to Hurl, whose expression
+  grammar has no dotted path. Requests stay ordinary Hurl, runnable on their own
+  outside any flow.
+
+  Both halves are validated: the step must be one visible from where the
+  reference is written (the same lexical scope rule as step names, so a
+  reference cannot reach sideways into a sibling block, nor back at itself), and
+  it must be a step whose request actually declares that capture.
+
+- **`GRAPH … END` regions: order from dependencies, not from written order.**
+  Inside a region PaperTrail reads what each request needs — the variables its
+  Hurl entry interpolates *after* its `USING(…)` overrides are applied, so an
+  override that replaces a URL or body takes the references it held with it —
+  and what each produces: its captures, and the values its `# [Gen]` rows
+  compute. It runs the ordering those imply. Writing the login after the
+  request that needs its token now works, because the region says the graph is
+  what is meant and the text is just where it was typed.
+
+  A region can be named (`GRAPH release`) so that a run can be asked for part
+  of it. It is otherwise transparent: wrapping an existing block in `GRAPH …
+  END` changes the order requests are sent in and nothing else. The same rows
+  come out, with the same columns, because a region is not a new kind of row —
+  its `REPORT` cells merge into the enclosing block's row exactly as if the
+  statements had been written inline.
+
+  Two things are errors rather than guesses. A cycle — two requests each
+  waiting on the other — stops the run before anything is sent, because the
+  author has just said written order is not the specification, so falling back
+  to it would be the one answer guaranteed to be wrong. And a bare `{{token}}`
+  inside a region where two steps both capture `token` is ambiguous for the
+  same reason: outside a region last-writer-wins has a written order to mean
+  something, and inside one it does not. Qualifying it (`{{login.token}}`)
+  says which.
+
+- **`--targets a,b` runs part of a report.** The named steps and everything
+  they transitively depend on are kept, and the rest of the flow is dropped
+  before the run starts — so `--dry-run --targets` shows exactly what a real
+  run would do. A target that no region declares is an error, not a silent
+  empty run.
+
+- **`--dry-run` lists a region's steps by depth.** Steps that nothing blocks
+  are shown first, then the steps those release, and so on, which is how you
+  check the shape of a region without sending anything. The grouping is a
+  description of the graph, not the schedule: execution still takes each step
+  as soon as it is ready.
+
+  `PARALLEL(n) GRAPH` caps how many steps may overlap (see below).
+
+- **`DEPENDS` states an edge the data does not show.** Inference can only see a
+  value flowing from a capture to a reference, and real dependencies exist that
+  leave no such trace: uploading a document that a later request fetches by an
+  id it held all along ties the two together with nothing passing between them.
+  Written order used to carry that by luck. `REQUEST dfa/result DEPENDS upload`
+  says it, as a comma-separated list of step names.
+
+  A declared edge is added before the inferred ones, so a step named by both
+  keeps the reason the author wrote down. Depending on a name no step carries,
+  or on itself, is an error. `DEPENDS` outside a `GRAPH` is also an error:
+  written order already is the order there, so accepting it would let it look
+  like it had done something.
+
+- **Clauses may be written in any order, and gathered into a group.** `AS`,
+  `DEPENDS`, `USING`, `RESPONSE`, `SHOW` and `HIDE` are now accepted in any
+  order and each at most once, and a long statement may put them in brackets
+  opening on the statement's own line:
+
+  ```
+  REQUEST dfa/result AS result (
+      DEPENDS upload, session
+      USING(query.id = "{{session.id}}")
+  )
+  ```
+
+  Saving writes them back in one canonical order, so a file's shape doesn't
+  depend on the order its author happened to type.
+
+- **`CLEANUP` runs a request at the end of its block, in reverse dependency
+  order.** It is written where it belongs — next to the thing it undoes — and
+  deferred to the end of the flow, or to the end of each iteration inside a
+  `FOR`. What it depends on is read from its own data references, so a logout
+  holding `{{login.token}}` runs after everything else that needed the login,
+  and before nothing.
+
+  A cleanup whose dependency never succeeded is skipped: there is nothing to
+  undo. A cleanup that *fails* is a warning, not an error — a teardown failing
+  is nearly always a consequence of the real failure, and reporting it as a
+  second error buries the first.
+
+- **A step whose dependency failed is skipped rather than run.** Sending a
+  request that is guaranteed to fail wastes a call and produces a second,
+  misleading error. The skip is recursive — anything depending on a skipped
+  step is skipped too — and each skipped step's row records which step it was
+  waiting on, so the report says why it is empty instead of just being empty.
+
+- **`PARALLEL(n) GRAPH` now overlaps steps, taking each the moment its
+  dependencies are done.** Not wave at a time: waves are how the plan is
+  *explained*, not how it runs, and holding a ready step back because a sibling
+  at the same depth is slow would make a region cost the sum of its slowest
+  member per depth — the cost the feature exists to remove. A degree is a cap,
+  so a chain still runs one at a time however high it is set.
+
+  Concurrency does not show in the output. Rows, cells, column order and the
+  order errors are reported are merged in plan order, not completion order, so
+  a report reads identically at any degree. Steps running at the same time also
+  cannot see each other's captures: a step is handed its ancestors' values and
+  nothing else, which is the same visibility rule a sequential region already
+  had.
+
+- **`--shuffle` varies the order among steps that may run in any order, and
+  prints the seed.** A `GRAPH` is a *claim* that the declared and inferred
+  edges are the complete set, and that claim cannot be verified. It can be
+  falsified. With the default earliest-written tie-break, a missing edge is
+  masked forever — written order quietly supplies the ordering the graph
+  forgot, and the gap surfaces the first time something unrelated changes.
+  Picking at random among the ready steps turns that latent hazard into a
+  failure now.
+
+  Seeded so the failure is reproducible rather than intermittent: the seed is
+  printed on every shuffled run, and `--shuffle=SEED` replays it exactly. This
+  is the path `go test -shuffle` and RSpec's `--order random` take for the
+  identical problem. Shuffling only reorders steps that are *ready*; it is
+  never licence to run a step before what it depends on.
+
+- **Exit code 3 means "ran, but incomplete".** A run that skipped steps now
+  exits 3 rather than 1. It implies 1 — a skip only ever follows a failure —
+  and adds that the run did not cover everything, which is the difference
+  between a release check that found a problem and one that never got far
+  enough to look. The summary gained `Warnings` and `Skipped` lines, and the
+  README now documents the exit codes, which it never did.
+
+- **A report can now carry its own requests, in a `REQUESTS` section.** Plain
+  Hurl, last in the file, after which `paperboy -r health.trail` runs with no
+  `# collection:` line and no sibling `.hurl` file at all — the single-file
+  monitor that a container image can hold one copy of. The section is kept
+  verbatim, so the editor never reformats someone's Hurl, and it is split off
+  before the flow grammar sees the text, so neither parser can be confused by
+  the other's syntax. A flow may embed *and* reference a collection; both sets
+  of requests are then available and a name declared by both is an error,
+  because a reference has to mean one thing. An embedded request nothing calls
+  is a warning — dead text in the one file that was supposed to be
+  self-contained.
+
+- **A JSON request body can now be laid out again: `p` in the main view,
+  `Alt+P` in the request editor, and a **Format** button in the GUI's Body
+  section.** A body pasted from a log or a browser's network tab arrives as one
+  long line, and until now the only way to read it was to re-indent it by hand.
+
+  The body is *not* round-tripped through a JSON parser, because four things a
+  PaperBoy body is allowed to contain would not survive that: `//` and `/* */`
+  comments (stripped), a bare `{{ TEMPLATE }}` standing where a value goes
+  (`{"n": {{ COUNT }}}` isn't valid JSON, but it is a valid request), number
+  spelling (`1.50` and `1e3` would come back `1.5` and `1000.0`, and a 19-digit
+  id would lose its last digits to a float), and duplicate keys (a map keeps
+  one). Instead the text is re-indented in place: every token is copied byte for
+  byte and only the whitespace between tokens is rewritten, so key order,
+  comments, templates and number spelling all come back exactly as written.
+
+  The result is checked against the original before it replaces anything — same
+  wire body, same comments — and a body that isn't JSON is refused with a
+  message rather than mangled, so a GraphQL query or a form-encoded string is
+  safe to press the key on. In the editor the cursor stays on the character it
+  was on, and one Ctrl+Z puts the old layout back.
+
+- **Captures are now visible — twice, because there are two questions about
+  them.** `[Captures]` pulled values out of a response and fed them to the next
+  request, and nothing ever showed what they were. Two views now answer the two
+  different questions:
+
+  - **"What did *this* request capture?"** — a **Captures** tab in the Response
+    pane (both front-ends), listing the snapshot that request took when it last
+    ran. A capture that has since been overwritten by a later run is marked
+    *superseded*, so a stale figure can't sit there looking current.
+  - **"What is `{{ VAR }}` worth *right now*?"** — the terminal UI's `v` popup,
+    retitled **Variables**, and a matching **Variables** tab in the GUI's
+    Environments panel. Both list the bound environment's variables and the live
+    capture pool for the active tab, one after the other, in the order
+    substitution applies them.
+
+  This also fixes a view that was giving a wrong answer. Substitution reads the
+  environment's variables *overridden by* the capture pool, but both front-ends
+  listed the environment's rows and nothing else — so a captured `access_token`
+  left the environment's row displaying a value that was **not** the one being
+  sent. Such a row is now marked as overridden, with the winning value listed
+  beside it.
+
+  Captured values are masked by default (`m` in the terminal UI, a **Reveal**
+  toggle in the GUI): a capture is very often a bearer token and, unlike an
+  environment variable, carries no "secret" marking to go by. Copying still
+  yields the real value. Values computed by `# [Gen]` are never listed, for the
+  same reason the request preview refuses to substitute them into view.
+
+  `v` now also opens on a tab with no environment loaded — previously the one
+  case it refused, and the case where captures are the only variables there are.
+
+### Changed
+
+- **An environment now belongs to a tab.** PaperBoy used to have two layers: one
+  environment activated app-wide, and optionally a second one *linked* to a
+  collection, whose values won on a key collision. Both applied to a run, which
+  meant reading a substituted value required knowing which of two environments
+  had supplied it, and there was no way to have two tabs on two different
+  environments at once — the thing people actually wanted the two layers for.
+
+  There is now exactly one environment per tab. `a` in the Environments panel
+  (and double-click, or right-click → Activate, in the GUI) sets the active
+  tab's environment and nothing else's; every other tab keeps what it had. Open
+  the same collection in two tabs and you can run it against staging and prod
+  side by side.
+
+  The 🔗 that joined a tab's title to its environment is gone with the layer it
+  named — there is nothing to link when a tab simply *has* an environment — and
+  the title now uses the same dim middot the Environments panel's own title
+  does. The Glossary drops the icon with it.
+
+  **Migration is automatic and nothing is lost.** A session saved by an earlier
+  build hands its app-wide environment to exactly the tabs that had no linked
+  environment of their own — which is precisely the set that was substituting
+  from it — so a restored session substitutes what it did before. The state file
+  stays readable by older builds.
+
+- **A report bound to a collection no tab has open no longer inherits an
+  environment.** Its base environment is the one on the tab holding that
+  collection, and with no such tab there is none. Name it explicitly with an
+  `# environment:` directive (or a `FOR … IN ENVS` loop, which already named its
+  environments) to pin it down regardless of what is open.
+
+- A dropped step name and where it was legible are one type rather than two
+  structures every reader had to remember to combine, and a step's values now
+  carry how each came to be rather than travelling beside a second map that
+  said so. Both pairs had already failed in the same way — a reader that took
+  one half and not the other — so the halves no longer exist to be taken
+  separately. `Produced` lives in its own module precisely so that its fields
+  can be private: within one file, "these are always written together" is a
+  habit, and a habit is what went wrong.
+- Column metadata (`STATISTICS`, `IMAGE`, `TRUTH`, `DETAIL`) is gathered by a
+  single walk of the flow rather than four near-identical ones, and merged into
+  the resolved columns by a single rule rather than two copies of it. The four
+  walks had already drifted apart once: `SHOW(…)` contributes statistics only
+  (a `SHOW` field has nowhere to write the other three), and a role clause's
+  `BASELINE(…) SHOW(…)` likewise. Both asymmetries are now stated once, and
+  pinned by a test, instead of being implicit in which of four functions
+  happened to have the arm.
+
+- **The GUI's "this request is running" marker now turns.** It has always been
+  a circle-notch — the ring-with-a-bite-out-of-it every spinner is drawn from —
+  but it stood still, which reads as a broken ring rather than as work in
+  progress. That mattered most in the PaperTrail report generator, where the
+  `done/total` counter beside it only moves when a request *finishes*: a run
+  waiting on one slow endpoint looked frozen at exactly the moment a user wants
+  reassurance that it isn't. Running rows in the report's results grid animate
+  too, which they did not before.
+
+  The ring is *painted* rather than spun as text. Rotating the real glyph looks
+  right in a screenshot but jostles in motion, because the text pipeline rounds
+  a glyph's position to a whole physical pixel before applying its angle — and
+  a glyph spun about its own middle has to walk its corner around a circle to
+  stay put, so it hops a pixel at a time instead of turning. A stroked arc is
+  rounded nowhere and turns at sub-pixel precision. Its geometry was measured
+  off the icon font so it sits among the still icons as if it were one of them,
+  and it reserves exactly the width a real icon would: every glyph in that font
+  is one em wide, which is what stops a request row from shifting sideways as
+  its marker goes scheduled → running → finished.
+
+### Removed
+
+- **The `p` "link environment to collection" picker, and the linked/active
+  distinction it existed to set up.** With one environment per tab there is
+  nothing to link: `a` is the whole gesture. The GUI's "Linked" button and its
+  link/unlink context-menu items are gone for the same reason.
+
+- **The shadow-warning icon (`!`) beside a substituted value.** It marked a
+  value the linked environment had overridden. With a single environment per
+  tab a key is defined once or not at all, so there is nothing to shadow and
+  nothing to warn about.
+
+### Fixed
+
+- **Three GUI labels drew tofu boxes where an icon belonged.** "＋ Add assert"
+  and "＋ Add capture" used a full-width plus (U+FF0B), and the Postman key
+  help said "Settings → API keys" with an arrow (U+2192); egui's bundled fonts
+  carry none of the three. Rather than patch three rows, the GUI now maps
+  every string it shows through a substitution table that swaps a character no
+  bundled font can draw for the icon that means the same thing. The shared
+  string table is untouched, so the terminal UI keeps the plain characters —
+  a terminal renders them from the user's own font. A test sweeps the whole
+  table, in all three languages, and fails if any string reaches the GUI
+  carrying a character it cannot draw, so this class of bug cannot come back.
+
+- **A multi-line value in the GUI's report results grid showed a tofu box.**
+  A cell that has to fit a response body onto one row marks each collapsed
+  line break with a symbol, and that symbol was `⏎` (U+23CE) — which none of
+  the fonts egui bundles carries, so what the grid actually drew was an empty
+  rectangle. It now uses a glyph from the icon font the rest of the GUI draws
+  from. The terminal UI is unaffected and keeps `⏎`: a terminal's own font has
+  it.
+
+- **The GUI's status dots rendered as empty boxes.** The coloured dot beside
+  each entry in the substitution legend asked for `●` (U+25CF). Of the fonts
+  egui bundles only Hack carries that character, Hack is the *monospace*
+  family, and a proportional label does not fall back into it — so the legend
+  showed a row of tofu boxes rather than the colour key it exists to be. The
+  icon font the rest of the GUI draws from has no solid disc at text size
+  either, so the dots are now *painted* rather than typed: a disc is a centre
+  and a radius, needs no font at all, and can be sized to the text beside it.
+  The terminal UI was never affected — a terminal's font has the glyph.
+
+- **`--postman-import -o ./API` works again.** `-o` carried a
+  "requires `--report`" rule, so every Postman download that named a
+  destination — including the one in `--help`'s own examples — was rejected
+  before it started, with a usage message demanding a report the command has
+  nothing to do with. `-o` now accepts either headless mode and is refused only
+  when neither is present. Passing it more than once to `--postman-import` is
+  an error rather than a silent "last one wins": a single download has a single
+  destination.
+
+- **The headless runner's documentation described the wrong function.** An
+  earlier change inserted a helper into the middle of `report_cli::run`'s doc
+  comment, so the entire description of the headless entry point — arguments,
+  exit codes, output rules — was attached to a private seed generator, and
+  `run` itself was left undocumented.
+
+- **The GUI's **Compact** and **Reveal** toggles look like buttons when they are
+  off.** Both were drawn with a control that frames itself only while selected,
+  so an unselected toggle sat as bare text beside the framed **Copy** and
+  **Probe** buttons next to it — reading as a label rather than as something
+  clickable, and leaving the row looking half-rendered. They are now framed in
+  both states, like every other toolbar toggle.
+
+- **The build no longer refuses to start on Windows.** `build.rs`'s pre-flight
+  check looked for bare `perl`, `make` and `cc`/`gcc`/`clang` filenames on
+  `PATH`, which on Windows are `perl.exe` and friends — so every machine, however
+  well provisioned, was reported as missing everything and the build was stopped
+  before it began. The `PATH` walk now honours `PATHEXT`, and the checks that
+  cannot be answered on an MSVC target are skipped rather than guessed: libxml2
+  comes from vcpkg, `cl.exe` is found by cc-rs through the registry, and OpenSSL
+  is built with `nmake`, which `openssl-src` finds the same way — none of the
+  three has to be on `PATH`. `nasm`, which OpenSSL's MSVC build does expect
+  there, is now advised about (a warning, never fatal), the libclang search
+  knows about `libclang.dll` and LLVM's `bin` directory, and the install hint
+  offers the vcpkg/winget/choco commands rather than an apt line.
+
+- **The Windows build now gets told how to install libxml2.** On an MSVC target
+  `libxml` consults vcpkg and nothing else, so the check is made against vcpkg's
+  own tree: `build.rs` finds it the way vcpkg-rs does (`VCPKG_ROOT`, then
+  `vcpkg integrate install` — never `vcpkg.exe` on `PATH`), works out the triplet
+  vcpkg-rs will ask for (`x64-windows-static-md` by default, honouring
+  `VCPKGRS_TRIPLET`, `VCPKGRS_DYNAMIC` and `crt-static`), and says which of the
+  two is wrong: no vcpkg tree at all, or a tree without the port. The advice
+  follows suit — bootstrap commands when there is no tree, and a
+  `vcpkg install libxml2:<triplet>` naming the triplet actually wanted. The
+  README gained a Windows section covering the same ground.
+
+- `--targets` no longer misjudges where a pruned name was written when a
+  `CLEANUP` above it has been removed. Position was counted as an index into
+  `flow.nodes`, but removing a teardown shifts everything below it up a place,
+  so a region recorded at index 2 was compared against a loop that had slid
+  from 3 to 1 and "below" read as "above". A reference to a step no longer in
+  the run went unreported and was handed back to be sent verbatim, and a
+  teardown for a pruned step survived to be skipped at run time with an exit
+  code claiming the run was incomplete. Position is now counted among the nodes
+  pruning cannot remove, which nothing shifts.
+- A `TRUTH` template is now read where it is written, like every other
+  reference. Judging all of them against one flat set refused a run whose loop
+  had its own live `gate`, over a name some region further down the file had
+  dropped. Only the template that will actually be scored is checked — a truth
+  a later statement overwrites for the same column is dead text, and refusing a
+  run over one strands nothing.
+- A `CLEANUP` whose value was minted by a `[Gen]` row now runs even when the
+  same request also declared a capture for that name. The gate was read off the
+  declared clauses, so the natural "mint an id, then read the server's
+  canonical one back" create was treated as capture-gated: when the send failed
+  the capture never fired, the minted id was the live value, and the teardown
+  was skipped for a resource the request may well have created. The gate now
+  asks which value actually answered — including for a step inside a `GRAPH`
+  region, whose provenance now travels out of the fork beside the values it
+  describes. A capture that *did* fire still gates on the step succeeding.
+- `--targets` no longer drops a teardown, or refuses a run, over a name that was
+  never in scope. Only top-level regions are pruned, so a pruned step's name is
+  bound where its region is written — and a loop written *above* that region has
+  its own, unrelated `gate`, which is exactly why step validation allows both.
+  Handing the pruned name to every block alike removed a `CLEANUP release
+  DEPENDS gate` whose own `gate` was alive, and reported a perfectly resolvable
+  `{{gate.v}}` inside that loop as stranded, refusing the whole run.
+- A `CLEANUP` written *above* the one it depends on is now dropped with it.
+  Cleanups in one block all run when that block unwinds, so they are
+  order-independent — but they were judged in one forward pass, which asked
+  about `close DEPENDS purge` before `purge` had been dropped and then never
+  asked again. `close` survived naming a teardown that appeared nowhere in the
+  flow, to be skipped at run time with a warning pointing at it and its own
+  resource left standing.
+- A request's `# [Gen]` values are now threaded forward like its captures, and
+  count as the step's outputs. They were computed, used for the send, and then
+  dropped on the floor — so `{{sid}}` downstream kept resolving to whatever the
+  environment was carrying, and `{{step.sid}}`, which validation explicitly
+  permits, resolved to nothing at all. A `CLEANUP` reading a generated id also
+  inferred no dependency on the step that minted it, because only captures were
+  searched: with a stale `sid` in the environment the teardown deleted somebody
+  else's live resource and reported success, while the qualified spelling of the
+  same reference correctly skipped. A generated value now gates a teardown on
+  having been *produced* rather than on the send having succeeded — it is known
+  before the request leaves, so a create that failed after minting its id still
+  lets the teardown run, which is exactly when the resource may need reclaiming.
+- A dropped `CLEANUP` no longer drops a same-named one in a sibling scope. A
+  step name means whatever it means in the block it is written in, and two
+  sibling loops may each hold a `CLEANUP … AS gate` — step validation allows it
+  precisely because neither can see the other. Recording dropped names in one
+  flat set could not tell them apart, so pruning one loop's `gate` also removed
+  the other loop's `release DEPENDS gate`, whose own `gate` was alive and well:
+  a teardown silently dropped and its resource left standing, with the run
+  still reading as green.
+
+- An `ENVS` clause may name its environment through **anything in scope where
+  it is written** — a parameter, a loop variable, an assignment, a capture —
+  not only a parameter. The clause is resolved when the run *reaches* it,
+  against everything then bound, so `BASELINE("prod-{{region}}")` inside a
+  `FOR` has always worked; validation refused it anyway, on a rationale that
+  was never true of the interpreter, and that error blocked the run in all
+  three front ends. Every comparison whose sides are chosen per visit —
+  region-by-region baselines, rolling pairs — was unreachable in practice.
+  A reference nothing in scope can answer is now a warning, and only where the
+  loaded environments' variable names are known, since an environment may
+  supply the name itself.
+- A plain `ENVS` loop written *inside* a comparison no longer erases it. A
+  plain list compares nothing, so it cannot be a side of anything — but it was
+  overwriting the side and the target it had inherited with its own
+  environment's name, leaving every row unassigned. The comparison the report
+  was written for then vanished from the output entirely: not a wrong verdict,
+  no verdict at all.
+- Two comparisons in one flow no longer share a baseline. Both clauses leave
+  their own `ENVS` axis out of the row key — that is what lets a baseline and
+  its candidate meet — so their rows land on the same key, and a collapse that
+  indexed baselines by key alone kept whichever arrived first and measured the
+  other comparison's candidates against a stranger, under a confident verdict,
+  with the real baseline gone from the report. A row now records *which*
+  comparison its side belongs to. Rolling pairs still share one identity, as
+  they must: they are the same clause, told apart by the enclosing loop's key.
+
+- A baseline snapshot taken before the row key changed is now refused outright
+  rather than loaded and matched against nothing. Matching is exact key
+  equality, so a stale file read cleanly, contributed no baseline to any row,
+  and the report said `no baseline` as though none had ever been taken. The
+  snapshot format carries a version; it is now `2`, and an older file asks to be
+  retaken.
+- A row produced under an `ENVS` loop that assigns no roles is no longer swept
+  into somebody else's comparison. "Produced under a clause that assigns no
+  roles" and "no side recorded" are different facts, and only the second may be
+  guessed at by name — collapsing them let a plain `ENVS "a","b"` row be
+  matched by name against an unrelated `BASELINE`/`COMPARISON` pair elsewhere in
+  the flow and given a confident verdict it had no standing to receive.
+- An ordinary step that refreshes a name is once again counted as producing it.
+  "A request that has to be told a value is not the one that supplies it" holds
+  of a request waiting on *its own response* — which is what a `CLEANUP` asks
+  about its own dispatch moment — and of nothing else. An ordinary step captures
+  long before any teardown runs, so the name is bound by then whatever bound it
+  first; applying the exclusion to every statement dropped teardowns that read
+  a perfectly well-supplied name.
+- A binding written *below* a loop no longer vouches for a `CLEANUP` inside it.
+  A loop body's teardowns run at the end of every iteration, so a name bound
+  further down the page is not bound yet on any of them. The teardown survived
+  pruning and went out with `{{sid}}` verbatim, once per item, with the run
+  still reading as green.
+- A `CLEANUP` that depends on a dropped `CLEANUP` is now dropped as well.
+  Pruning recorded only dropped *steps*, so a teardown whose prerequisite had
+  itself been pruned away stayed in the plan with a reference nothing could
+  answer.
+- A `TRUTH`, `STATISTICS`, `IMAGE` or `DETAIL` written inside a `GRAPH` region
+  now reaches the report. A region is a scheduling device, not a scope, but the
+  column collectors walked loop bodies and not region bodies — so the clause was
+  dead text, and silently so, since a column with no metadata still renders.
+
+- An environment that is a baseline in one comparison is no longer mistaken for
+  one everywhere. A role is a position in a single comparison, not a property of
+  the name: rolling pairs — `[("v1","v2"), ("v2","v3")]` against
+  `BASELINE("{{A}}"), COMPARISON("{{B}}")` — make `v2` the candidate in one
+  iteration and the baseline in the next. The collapse asked a set of names
+  whether a row was a baseline, and asked that first, so the candidate row was
+  filed as a baseline, its own pair lost its candidate, and the diff that was
+  asked for came back as `no baseline`. Each row now carries the side it was
+  produced on.
+- Every `CLEANUP` the teardown sort cannot order is now refused, not just the
+  members of the ring itself. Kahn's leftovers come out in arrival order, which
+  throws away the well-formed edges *between* them, so a teardown two hops from
+  a ring could be dispatched before the one it follows — whose verdict did not
+  exist yet, so the reference was silently dropped and the request went out with
+  `{{d.dkey}}` literal in its URL, counted as a success. A leftover is by
+  construction downstream of a ring and could never have run.
+- A `CLEANUP` reading a flat `{{tok}}` that only a refused ring could write is
+  no longer fired at an older step's value — a destructive request aimed at a
+  live resource belonging to somebody else, reported green. The same dependency
+  spelled `{{a.tok}}` was correctly skipped, so the two spellings disagreed and
+  the silent one was the dangerous one.
+- A plain `ENVS "a","b"` loop is now part of the row key. Leaving the `ENVS`
+  axis out is what lets a baseline and its candidate pair up, but that is true
+  only of the loop assigning the *roles*; a plain list compares nothing. With
+  both excluded, a comparison nested inside a plain `ENVS` loop collapsed every
+  iteration onto one key, where a single baseline stood for the lot: each
+  candidate was diffed against a stranger's baseline and labelled with that
+  environment's name, while the other baseline's row vanished from the report.
+  **Baseline snapshots taken before this change carry the old keys** and will
+  not match rows from a plain `ENVS` loop; retake them.
+- A `CLEANUP` that refreshes a name it was given is once again counted as
+  producing it. "A request that reads a value is not the one that supplies it"
+  is true of a request waiting on its own response and of nothing else: a
+  rotate that reads the old `{{sid}}` from an assignment and captures a new one
+  writes that name like anything else, and `--targets` was dropping the
+  teardown that reads it — leaking the resource in silence, with the run still
+  green. Assignments and parameters now count as binding a name too.
+- A `CLEANUP` inside a loop body is no longer kept alive by one written outside
+  it. A loop body is its own block: its teardowns run at the end of *every
+  iteration*, while the enclosing block's run once the whole loop is over, so
+  the outer capture has not happened when the inner one is dispatched. It went
+  out with the placeholder verbatim.
+- `--targets` no longer refuses a run over a `TRUTH` for a column the
+  `columns:` directive never resolves. The directive *is* the resolved column
+  set, so a flow truth whose column it omits — or renames with `AS` — is dead
+  text that is never scored.
+- An `ENVS` role named through anything but a parameter — a capture, a prelude
+  assignment — now collapses. The run resolved the target against everything in
+  scope, but the comparison re-derived it from the declared parameters alone, so
+  it looked for the literal `{{setup.build}}` while the rows carried the real
+  name and every comparison came back unmatched. The run's answer is carried out
+  to the collapse instead of being guessed at twice. One written clause can name
+  more than one target: `BASELINE("prod-{{region}}")` inside a `FOR` resolves
+  afresh on every visit, so each text now carries the whole set of names it took
+  rather than only the last. Keeping just the last measured the earlier
+  iterations' rows against a stranger's baseline — and reported that comparison
+  confidently instead of admitting there was no baseline to compare against.
+- A `TRUTH` the header's `columns:` directive overrides is no longer checked by
+  `--targets`. The header wins at evaluation time, so refusing a run over a
+  template that will never be evaluated rejected a perfectly good report on the
+  strength of dead text.
+- A `CLEANUP` no longer counts as the producer of a name it captures twice. The
+  old rule counted producers and excused the one under test, which a request
+  capturing the same name in two places defeated — and which said nothing at all
+  about a pair of teardowns each vouching for the other. Both fall out of a
+  simpler rule: a request that has to be *told* a value is not the one that
+  supplies it.
+- `--targets` now checks a `TRUTH` template wherever it is attached — `REPORT
+  "…" AS C`, `REPORT v AS C`, a `WITH` field, or the header's `columns:`
+  directive. Only the first was checked, so the other three stranded in silence:
+  the cell the truth names is gone, the placeholder survives substitution, and
+  every row in the column scores `Untested` with nothing said about why.
+- A `CLEANUP` whose request both reads and captures the same name no longer
+  vouches for itself through pruning — nor, by surviving, for every sibling that
+  reads that name. A request cannot answer its own `{{sid}}` out of its own
+  response.
+- A `CLEANUP` that depends on a member of a cycle is now skipped rather than
+  sent with the reference still written `{{a.tok}}` in its URL. The cycle's
+  members are marked before any teardown is dispatched, so the verdict holds
+  whatever order the rest arrive in.
+- A cycle among `CLEANUP`s is no longer *run*. Resolving the gate purely from
+  what had already happened meant neither member of a ring could see the other,
+  so nothing held either of them back and both were sent — a flat name falling
+  through to whatever older step last stood in the capture chain, which is a
+  destructive teardown aimed at somebody else's live resource. The report said
+  none of them ran the whole time.
+- `--targets` now reads a cleanup's `USING(…)` overrides when deciding whether
+  pruning has stranded it. The collection entry alone got it wrong both ways: an
+  override that replaced the text holding the reference had its teardown deleted
+  and its resource leaked, while one that *introduced* a stranded reference was
+  kept and dispatched with the placeholder on the wire.
+- A cleanup can no longer be kept on the strength of a capture written by a
+  sibling cleanup that the same pruning pass removes.
+- A `TRUTH` template naming a step that `--targets` pruned is refused instead of
+  scoring every row in the column `Untested` silently.
+- A `CLEANUP` that reads a name a *sibling* cleanup captures now waits for that
+  sibling. Cleanups run after every ordinary step in their block, so a sibling
+  that captures the name writes it last and its value is the one on the wire —
+  but the teardown was being ordered against an earlier producer and then sent
+  against the sibling's resource.
+
+  What a teardown *waits for* and what it is *gated on* are now answered
+  separately. Ordering has to be settled before anything has run, so it can only
+  ask which steps declare a name; the gate is re-resolved when the teardown is
+  dispatched, against the step that actually wrote the value it is being handed.
+  Deciding both up front was wrong in both directions: a sibling that was
+  skipped wrote nothing, so gating on it abandoned a resource an earlier step
+  had really made, while a sibling that ran without capturing vouched for a
+  value belonging to a step that had failed.
+
+- A cycle between cleanups reported at run time now names only the cleanups in
+  the ring — those that can be reached from themselves. Everything downstream of
+  a cycle also fails to sort, so a well-formed teardown that merely depended on a
+  ring member was named as one of its members and its author sent to break a
+  cycle it was not part of. The
+  message now also says plainly that none of them ran and that what they cover
+  has been left behind.
+
+- A `CLEANUP` can no longer *read* a capture from a cleanup in an enclosing
+  block, and an ordinary step can no longer read one at all. `DEPENDS` already
+  refused the first of these; written as a value reference instead, the same
+  impossible ordering passed validation, produced no edge, and put the literal
+  `{{outer.token}}` on the wire without a word said.
+
+- `--targets` no longer drops a teardown whose value another cleanup still
+  produces. Only ordinary steps counted as producers when pruning, so a cleanup
+  reading a sibling cleanup's capture was pruned as stranded even though the
+  runner orders the two on exactly that reference — and the resource it covered
+  was leaked. A cleanup written inside a region now also sees what is written
+  beside the region.
+
+- An `ENVS BASELINE(FILE("…"))` snapshot path is now checked for step
+  references. It is resolved like a producer path, against the same map, but no
+  check ever read it: a reference to a step that does not exist was accepted at
+  open time, and one that `--targets` removed was not reported as stranded.
+
+- A `CLEANUP` is now gated on the step that actually produced each value it
+  reads, rather than on the last step that succeeded. Captures are recorded
+  whether or not the request passed — a status or assertion can fail on a
+  response that captured perfectly well — so the two are not the same step, and
+  a teardown could be authorised by the one that succeeded and then sent with
+  the identifier captured by the one that failed: the wrong resource deleted,
+  and the right one leaked.
+- A cleanup that reads another cleanup's capture now runs after it. The edge was
+  inferred from the steps that had already run, and no cleanup has when the
+  order is worked out, so the reference was dropped and the dependent could run
+  first and fail substitution.
+- A `DEPENDS` cycle between two or more cleanups is now refused. Nothing could
+  order the ring, so every member read its prerequisite as unsuccessful and
+  skipped — silently leaking every resource the ring was written to reclaim.
+- A variable read by a `# [Gen]` row's expression now creates a dependency.
+  Generator expressions are not templates and their bare identifiers carry no
+  braces, but they are resolved from the same map, so a step whose only use of a
+  capture was a generator got no edge and could be ordered before its producer.
+- A `{{…}}` in a `[Reports]` field no longer creates one. Report queries are
+  PaperBoy's own metadata and are evaluated verbatim, so the edge ordered a
+  region — and made `--targets` drag in a producer — for a field that still
+  failed to match.
+- `--targets` no longer drops a cleanup whose value is still being produced by a
+  surviving step outside the region, and now prunes cleanups written inside loop
+  bodies rather than only those at the top level.
+- `--targets` now refuses a selection that leaves out a step the rest of the
+  report still refers to. The flow is not revalidated after pruning, so the
+  reference would have reached the run as a literal `{{create.sid}}` — reported
+  in a column, or sent in a URL.
+- A dotted name in a producer path (`FILES "{{…}}"`, `TUPLES FROM "{{…}}"`) is
+  now validated like any other step reference, so a prefix naming no step is an
+  error rather than a path that silently resolves to nothing.
+- A helper-qualified call such as `helper/ping` no longer counts as using an
+  embedded request named `ping`. The alias resolves first, so the embedded
+  request really was dead text and the warning was being suppressed.
+- A cleanup is no longer gated on a sibling cleanup that merely declares a
+  capture of the same name. No cleanup has run when the order is worked out, so
+  "nothing wrote this name" was not evidence about any of them: a teardown whose
+  value came from the environment was skipped over a name collision, leaking the
+  resource while the run still read as green. A sibling counts only when nothing
+  else can answer the reference.
+- A cycle among cleanups is now reported as a run error. Validation refuses one
+  written with `DEPENDS`, but an edge can also be inferred from one cleanup
+  reading another's capture, and that ring was skipping itself in silence.
+- A cleanup may no longer `DEPENDS` on one in an enclosing block. The outer
+  block unwinds after the inner one, so it could never have run in time — the
+  teardown was skipped on every iteration of every run, with only a warning.
+- `--targets` no longer keeps a cleanup on the strength of a capture made only
+  inside a loop body. An iteration runs on a fork whose captures are discarded
+  at `END`, so the name never reaches a teardown written after the loop, and the
+  request went out with the placeholder unsubstituted.
+- A reference written in a list literal (`FOR X IN ["{{step.var}}"]`) or a
+  `FOLDERS … WITH` role glob is now validated, and counted by the `--targets`
+  strand check, like any other interpolated text.
+
+- **A step-qualified name can no longer be answered by an environment
+  variable.** `.vars` keys are not restricted to identifiers, so an environment
+  could carry a flat `login.token` — and it answered `{{login.token}}` exactly
+  when the step `login` had *not* captured one, which is precisely when the
+  reference must fail. A run could therefore send a stale credential instead of
+  reporting a missing capture. The qualified namespace is now kept to itself.
+
+- **`CLEANUP` is a step, and is now validated like one.** Its name is checked
+  for validity and uniqueness, its `USING` values for unknown qualified
+  references, and its `DEPENDS` for unknown and self names — a typo in a
+  teardown used to be a runtime warning and exit 0, so CI reported success
+  while the cleanup never ran. Because a cleanup runs at the end of its block,
+  its references are checked against the whole block rather than only what was
+  written above it.
+
+- **A step-qualified name written in a request's own Hurl is now refused.**
+  Hurl has no dotted path, so the placeholder was passed through verbatim and
+  the run failed on an undefined variable with no hint as to why.
+
+- **A `CLEANUP` now follows the capture that actually won.** The flat chain is
+  last-successful-writer-wins, but every step declaring the name was treated as
+  required — so an earlier producer that failed skipped the teardown, leaking
+  what the later, successful one had created.
+
+- **A `CLEANUP` that depends on another `CLEANUP` runs after it.** Neither has
+  run when the order is decided, so there was no depth to sort them by and
+  reverse-written order could run the dependent first, which then skipped
+  itself.
+
+- **The report outline shows `DEPENDS` on a statement with a `WITH` block.**
+  The expanded heading omitted it, which was the only view of such a statement
+  — so the dependency was invisible everywhere in the editor.
+
+- **CI now runs the GUI test suites it was only compiling**, and a build
+  without the terminal UI no longer advertises one. A GUI-only build called
+  itself headless and told the user to reinstall to get a front-end it already
+  had.
+
+- **Dependency inference now sees every field Hurl evaluates.** `[Options]`,
+  `[Asserts]`, `[Captures]` queries, response headers and body, and a form
+  field's content type all carry `{{…}}` and are all substituted, but none of
+  them were scanned. A step whose only use of a capture was in an assert had no
+  edge to the step that produced it and could be ordered before it, failing on
+  an undefined variable. Conversely, *disabled* rows were scanned, inventing
+  edges from text that is never sent. Both are fixed, and because the same scan
+  decides which variables a request "needs", a disabled row no longer blocks a
+  send on a secret it never uses.
+
+- **`--targets` no longer runs the regions it wasn't given a target in.**
+  A region containing none of the named targets was left entirely intact, so
+  `--targets a` still sent every request of every other region — the opposite
+  of what naming a target is for.
+
+- **A comment inside a region no longer shifts what `--targets` keeps.** The
+  filter counted steps while the plan counted body positions, so the two index
+  spaces drifted apart at the first comment and the wrong steps were dropped —
+  including, in the demonstrated case, the producer the target needed.
+
+- **A `CLEANUP` is pruned along with the steps it was undoing.** Left behind, a
+  declared dependency on a pruned step became a skip and an exit code saying
+  the run was incomplete, while an inferred one could send the teardown with a
+  variable nobody in this run ever set.
+
+- **A step that panics no longer hangs the whole run.** The worker that
+  unwound never decremented the region's in-flight count, so every other
+  worker slept waiting for an arrival that could not come and `thread::scope`
+  blocked joining them — turning a crash into a hang, which is the one failure
+  a CI job cannot diagnose. The count is now released by a guard on unwind.
+
+- **A malformed `REQUESTS` section is reported as malformed.** It used to be
+  reported as "no collection to run against", because the check asked how many
+  requests the section yielded rather than whether it existed — burying the one
+  thing the author needed, which is why their Hurl didn't parse. The Hurl
+  parser's reason is now shown, and its line number is counted from the
+  `.trail` file rather than from the section, since the `.trail` is the only
+  file the reader has open.
+
+- **An embedded request is no longer counted as used by a call that resolves
+  elsewhere.** `REQUEST folder/ping` against an external `folder/ping` was
+  treated as a use of an embedded `ping` that in fact never ran, so the
+  "never called" warning stayed silent.
+
+- **A `GRAPH` region no longer trips the "this report emits no columns"
+  warning.** The check looked inside loops but not inside regions, so a report
+  whose only `REPORT` statements were in a `GRAPH` was told it would produce an
+  empty table while producing a perfectly good one.
+
+
+## [0.5.6] - 2026-09-11
+
+### Added
+
+- **The terminal UI is now a Cargo feature, so `--no-default-features` builds a
+  headless-only binary.** A scripted `-c collection.hurl` or `-r report.trail`
+  run in a CI image or Docker container never draws a frame, but it was still
+  paying to compile the whole terminal front-end. Turning `tui` off drops 40
+  dependencies and roughly a third of PaperBoy's own source, and the binary is
+  otherwise identical — same arguments, same output, same reports. Run it with
+  no arguments and it explains that this build is headless and how to get one
+  that is not, rather than exiting silently as though something had run.
+
+  `default = ["tui"]`, so `cargo install paperboy` is unchanged.
+
+- **Continuous integration.** There was none. Every build shape — headless,
+  terminal, terminal + GUI, and GUI alone — is now checked and kept
+  warning-free, and the suite runs for both shipped shapes.
+
+### Fixed
+
+- **`--no-default-features --features gui` did not compile.** The GUI reached
+  into the terminal UI for the `.trail` highlighter and for one remote helper,
+  so asking for the graphical front-end without the terminal one failed
+  outright. Nothing ever built that combination, so nothing caught it. The
+  highlighter now lives alongside the other front-end-agnostic code (both
+  front-ends draw from it, which was always the intent), and the remote helper
+  is taken from `remote_flow`, where it was defined all along — the terminal UI
+  was only re-exporting it.
+
+
 ## [0.5.5] - 2026-09-08
 
 ### Added
+
+- **Two requests that compute the same `# [Gen]` name no longer share one value
+  in a batch run.** A batch run is a single Hurl call over the whole file, so
+  every generator was evaluated once into one shared set of variables — and two
+  requests that each computed a `nonce` were both sent the first one's, which is
+  exactly how a signature ends up computed over the wrong nonce. PaperBoy used
+  to warn about this and send it anyway. The later claimants are now run under a
+  name of their own (`nonce`, `nonce_2`, `nonce_3`), with that request's own
+  references — placeholders *and* the bare names its expressions read — rewritten
+  to match, so each gets a value computed for it and batch behaves as streaming
+  always did. Only a name that actually collides is touched, and a minted name is
+  checked against every environment key, generator name, capture,
+  `[Options] variable:` and `{{reference}}` in the collection first, so it can
+  never take one that is already spoken for.
+
+- **A `jsonpath(text, path)` generator.** The generator language could hash,
+  encode and sign a value but not *look one up*, so a `[Gen]` block that needed
+  one field out of a JSON document had no way to get at it — a signature over
+  `$.order.id` meant pasting the id in by hand. It takes the same notation
+  `[Captures]` does, including `[?(@.name=='x')]` to pick an element out of a
+  list, and it is the same implementation underneath, so the two cannot drift.
+  What it will not do, it says: `..`, `*`, slices and unions are refused by
+  name, pointing at `[Captures]`, rather than quietly returning nothing.
+
+- **An imported pre-request wait becomes `[Options] delay`.** A Postman script
+  that slept before sending — whether written as `setTimeout` or, as half of
+  them are, a spin on the clock — was dropped along with the rest of the
+  script. It now arrives as the Hurl option that means the same thing,
+  *switched off*: the wait is real, but an imported collection that silently
+  runs two seconds slower per request is its own kind of surprise. A wait in a
+  *test* script is only reported, since it belongs to whatever ran next.
+
+- **The import names a polling loop's numbers.** A script that re-ran its own
+  request is the one `setNextRequest` shape Hurl expresses exactly, and the
+  note now quotes the interval, the attempt bound and the assert that ends the
+  poll — read off the script — so the reader can write the `[Options]` block
+  without going back to read the JavaScript a second time. Anything it could
+  not read is left as a blank to fill in rather than guessed at.
+
+- **A retrying request now says so, while it is retrying.** A request carrying
+  `[Options] retry: 5` with a `retry-interval` of a couple of seconds can be in
+  flight for ten seconds or more, and every one of its attempts comes back at
+  once when the poll finally settles — so PaperBoy showed a motionless
+  "Sending…" that was indistinguishable from a hung server. Hurl reports each
+  attempt as it starts (deliberately before it sleeps for the interval), and
+  PaperBoy now listens: the Response pane's spinner reads `⟳ Sending… (retry 2
+  of 5)`, and `paperboy -c` prints a line per attempt as it happens instead of
+  the whole story at the end. `retry: -1` reads `retry 3 of ∞` — "will this
+  stop?" is the question, and the answer is worth keeping in the shape of the
+  sentence. A limit written `retry: {{max_attempts}}` is looked up rather than
+  given up on, so it counts like any other; only a name nothing binds drops the
+  total, since an invented one is worse than none.
+
+- **The request summary lists the request's `[Options]` rows.** They were shown
+  nowhere in the terminal UI, which is a poor place for the setting that
+  decides how long a send can take: `retry`, `retry-interval` and `delay` all
+  change what happens rather than describing what came back. They are listed
+  first, above `[Captures]`, and fold away with the other sections. Disabled
+  rows are left out, exactly as a disabled header is — they round-trip as
+  comments and are not applied.
+
+### Fixed
+
+- **A note written above a request's name is no longer welded onto the name.**
+  A comment block above a request gives no syntactic clue as to which of its
+  lines is the name, and PaperBoy used to join the lot, so
+  `# why this exists` above `# Login` turned into a request called
+  `why this exists Login` — and was written back that way, losing the note for
+  good. Only the last comment line above the method is the name now (which is
+  exactly the line PaperBoy itself writes there), and everything above it is
+  kept verbatim as a lead comment. Such a block now round-trips byte for byte.
+
+- **An edit that only touches a comment is no longer thrown away.** Hurl Mode
+  decided whether you had changed anything by comparing a hand-written list of
+  fields, and that list had fallen behind: comments, `[Options]`, `[Gen]` and
+  the recorded response were all absent from it. Adding a comment — or a
+  `retry:` row — was parsed, judged identical to what you started with, and
+  discarded without a word. The comparison is now made on the Hurl text itself,
+  which covers every field by construction.
+
+- **A request that succeeded after retrying is no longer reported as a
+  failure.** `[Options] retry` means "keep asking until it holds", and Hurl
+  duly hands back every attempt, settling the question with the last one for a
+  given request. PaperBoy counted each attempt as an outcome in its own right,
+  so a poll that answered `ResultUnavailable` twice and then succeeded printed
+  `Passed: 0  Failed: 1` and exited non-zero — the one thing `retry` exists to
+  prevent, undone at the last step. Superseded attempts are now marked at the
+  point the result is read, so the runner, the terminal UI and `paperboy -c`
+  cannot drift apart on the rule; the run's error line ignores them too, rather
+  than reporting a successful poll by quoting the attempt that was thrown away.
+  They are still printed, labelled `(retried)` — that a poll was pending twice
+  is most of what you want to know about it. `[Options] repeat` is untouched:
+  those are N runs that were asked for, and every one of them still counts.
+
+- A `{{name}}` written inside a `[Gen]` expression is now refused, with a
+  message naming what to write instead. Everywhere else in PaperBoy a variable
+  is `{{name}}`, so reaching for the braces here is the natural mistake — but an
+  expression names variables directly, which made `"{{SECRET}}"` a perfectly
+  good *string literal* and `hmac_sha256("{{SECRET}}", m)` a signature over the
+  ten characters of the placeholder: the right length, entirely plausible, and
+  rejected with the same `401` as a wrong secret. That is precisely the class of
+  failure the block exists to prevent, so it is a parse error at the moment it
+  is typed. `\{` is the way out for a string that really does want a brace.
+
+- Importing a Postman script that assembles a value out of other variables —
+  `pm.environment.set("url", "{{base}}/orders")`, which is most of what these
+  scripts do — now emits `concat(base, "/orders")` rather than a row whose value
+  is the braces themselves. Hurl does not expand a value it has just
+  substituted, so the old row sent `{{base}}/orders` to the server verbatim. A
+  placeholder PaperBoy cannot name (`{{$randomFirstName}}`) is left to
+  `CONVERSION-NOTES.md` instead, on the same principle as every other unclaimed
+  dynamic: a plausible wrong value is harder to notice than a written-down gap.
+
+### Added
+
+- **A `[Gen]` block can now read the request it belongs to.** `method`, `url`,
+  `path`, `query`, `header(name)`, `body` and `request_name` answer with what
+  Hurl is about to send — the body as it goes on the wire, without the JSON
+  comments the editor keeps or the header rows the user switched off — which is
+  what a signature over "the thing I am about to send" has to be computed over.
+  Until now the only way to sign a body was to paste it into the block a second
+  time, and the copy that drifted was the one being signed. They read the text
+  as authored and substitute it against the rows above them, so a row reading
+  `body()` sees earlier rows filled in and later ones still as `{{name}}` —
+  the one ordering in which a value cannot depend on a row that depends on it.
+  With no request behind the block (the editor's live check on a row you are
+  still typing) they report rather than answering with nothing: an HMAC over a
+  silently empty body is a signature that authorises nothing.
+
+- Every hash and MAC gained a `_b64url` variant — `sha256_b64url`,
+  `hmac_sha256_b64url` and the rest — returning URL-safe Base64 without
+  padding. That is the encoding a JWT is made of: `header.payload.signature` is
+  three of them joined by dots, and the standard alphabet's `+`, `/` and `=`
+  are all wrong in that position, so the existing `_b64` variants left anyone
+  assembling a token to do the substitution by hand.
+
+- Two text functions for taking a value apart: `split(text, separator, n)`,
+  which counts from the end when `n` is negative — the last segment of a path
+  is `split(path(), "/", -1)`, JavaScript's `.pop()`, which is the shape the
+  scripts being ported are written in — and `regex(text, pattern)`, which
+  answers with the first capture group if the pattern has one and the whole
+  match otherwise. Both treat "no such piece" and "matched nothing" as faults
+  rather than an empty answer, because that text goes on to be signed, sent or
+  asserted against, and quietly nothing is the hardest kind of wrong to find.
 
 - The Response panel's per-assert list now folds too, with the same `z`. A run
   whose checks all passed already says so in the `[Asserts] ✓ 8/8` badge beside
@@ -225,6 +1214,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **The generator function dropdown is in alphabetical order.** The list was in
+  the order the table declares them, grouped by kind — which reads well as
+  source, but left anyone looking for `sha256` scanning two-thirds of a list
+  with nothing to scan against. The related sets that grouping protected keep
+  themselves together through their shared prefix (`random_*`, `hmac_*`), and
+  the variables offered above the functions are still their own block. Both
+  front-ends share the list, so both change together.
+
 - **The banner row is gone.** It spent three rows — a bordered block — on the
   app name, a `[English]` language tag and the occasional runner error. The
   language tag said nothing that every other word on screen doesn't; the name
@@ -339,6 +1336,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   stay where they were.
 
 ### Fixed
+
+- **A response header row's stripe now reaches as far as its highlight.** The
+  zebra striping came from `Grid::striped`, which paints across the grid — as
+  wide as the widest name and value — while the row that hovers is the full
+  width of the panel, so every stripe stopped short of the highlight laid over
+  it. One rectangle now feeds both.
+
 
 - **Postman collections written against the older script API import their
   captures again.** `postman.setEnvironmentVariable(...)` and

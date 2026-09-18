@@ -757,6 +757,12 @@ pub struct HurlEntry {
     /// since it's never persisted.
     #[serde(skip)]
     pub last_response: Option<crate::http::ApiResponse>,
+    /// Set while a "Run All" pass is *retrying* this entry: the attempt being
+    /// made and how many the request allows. See [`crate::http::ApiResponse::retry_attempt`], which says the
+    /// same thing for a single send. Cleared as soon as the entry produces an
+    /// outcome. Transient UI state; `#[serde(skip)]`.
+    #[serde(skip)]
+    pub retry_attempt: Option<(usize, crate::hurl::RetryLimit)>,
 }
 
 /// Why a name typed into the "extract to parameter" prompt can't be used.
@@ -1333,10 +1339,14 @@ impl HurlEntry {
             }
         };
         push_comments(&mut out, Lead);
-        // File-leading comments are separated from the title/method by a blank
-        // line so they aren't re-absorbed into the title on the next load (the
-        // title is the *contiguous* comment block directly above the method).
-        if self.comments.iter().any(|c| c.anchor == Lead) {
+        // A lead comment is separated from the method line by a blank line only
+        // when there is no title to stand between them: the title is the last
+        // comment line above the method, so a lone lead comment written
+        // directly above one would be read back *as* the title. With a title
+        // present the blank line is not needed — and leaving it out is what
+        // lets a user's own note above a request's name round-trip exactly as
+        // they wrote it, rather than growing a blank line on every save.
+        if self.comments.iter().any(|c| c.anchor == Lead) && self.title.trim().is_empty() {
             out.push('\n');
         }
         if !self.title.trim().is_empty() {

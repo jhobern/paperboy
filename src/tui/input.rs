@@ -12,6 +12,7 @@ use ratatui_explorer::{
 };
 
 use crate::collection::Collection;
+use crate::hurl::json_format::Prettified;
 use crate::hurl::{FormField, FormFieldKind, HurlEntry, KvRow, METHODS};
 use crate::i18n::{Language, Status, Strings};
 use crate::persistence::{self, PendingWorkspaceReload, PersistedReport, PersistedState};
@@ -35,7 +36,6 @@ use crate::save_flow::SaveTargetKind;
 const PREF_DISCARD_ON_ESC: usize = 6;
 const PREF_DEFAULT_VIEW: usize = 7;
 use crate::tui::clipboard::copy_to_clipboard;
-use tui_panel_select::selection;
 use tui_panel_select::wrapcache::TextPos;
 use tui_panel_select::{Motion, MultiSelectPanel};
 
@@ -652,7 +652,6 @@ impl TuiApp {
                 popup.idx = row;
                 return;
             }
-            Some(Overlay::EnvLinkPicker(picker)) => picker.sel = row,
             Some(Overlay::EnvCollision(collision)) => collision.sel = row,
             Some(Overlay::ReportColumns(picker)) => picker.selected = row,
             Some(Overlay::ReportBind(picker)) => picker.selected = row,
@@ -1359,35 +1358,44 @@ impl TuiApp {
         }
     }
 
+    /// Whether what the Response panel is *showing* differs from what a copy
+    /// of it should *produce* — the two cases where `draw` publishes
+    /// `resp_full_body` / `resp_compact_line_maps` alongside the panel's own
+    /// content.
+    ///
+    /// Both copy paths — whole-panel ([`Self::whole_panel_text`]) and
+    /// drag-selection ([`Self::resp_full_selected_parts`]) — have to agree on
+    /// this, or the same gesture on the same screen would yield different
+    /// text depending on whether an unrelated toggle happened to be on.
+    fn resp_text_is_abridged(&self) -> bool {
+        self.response_compact
+            || (self.response_section == ResponseSection::Captures && !self.response_reveal)
+    }
+
     /// The entire (unscrolled, unwrapped) text of whichever of Main
     /// (Request JSON) / Response `pane` is — `None` if that panel is
     /// neither, has no content cached yet, or is simply empty. Backs the
     /// "copy the whole panel" fallback that kicks in when `y` is pressed
-    /// with no active selection. For the Main panel, any shadow-warning
-    /// icons (see `main_shadow_icon_positions`) are stripped out first —
-    /// they're a purely visual annotation, so a copied/pasted request must
-    /// never actually contain one.
+    /// with no active selection.
     pub(crate) fn whole_panel_text(&self, pane: Pane) -> Option<String> {
         // With the Response compact overview on, the panel holds the *shortened*
         // text; the whole-panel copy fallback must still yield the untruncated
         // body (the "hard mode" of the compact-view feature), so consult the
         // cached full body first. `resp_full_body` is only non-empty on frames
         // that actually drew a compactable body.
-        if pane == Pane::Response && self.response_compact && !self.resp_full_body.is_empty() {
+        //
+        // A masked Captures section is the same bargain — bullets on screen,
+        // real values on the clipboard — and caches the same two fields, so one
+        // condition covers both.
+        if pane == Pane::Response && self.resp_text_is_abridged() && !self.resp_full_body.is_empty()
+        {
             return Some(self.resp_full_body.to_string());
         }
         let text = self.panel(pane)?.whole_text()?;
         if text.is_empty() {
             return None;
         }
-        if pane == Pane::Main {
-            Some(selection::strip_positions(
-                text,
-                &self.main_shadow_icon_positions,
-            ))
-        } else {
-            Some(text.to_string())
-        }
+        Some(text.to_string())
     }
 
     /// Continue the live selection drag to `point` on whichever panel owns
@@ -1467,20 +1475,14 @@ impl TuiApp {
     /// unit-testable; `None` when there's nothing selected anywhere.
     pub(crate) fn concatenated_selection_text(&self) -> Option<String> {
         let mut parts = Vec::new();
-        // Only the Main panel can ever contain a shadow-warning icon (see
-        // `main_shadow_icon_positions`) — exclude it so a dragged selection
-        // never carries a stray "!" into a pasted request, same as the
-        // whole-panel copy fallback.
-        parts.extend(
-            self.main_panel
-                .selected_parts(Some(&self.main_shadow_icon_positions)),
-        );
+        parts.extend(self.main_panel.selected_parts(None));
         // In the Response pane's compact overview, a drag selects *shortened*
         // text — but a copy must still yield the untruncated values, so expand
         // the selection back through the compaction map (see
-        // `resp_full_selected_parts`). Outside compact mode there's nothing to
-        // expand and we take the panel's own extracted text directly.
-        if self.response_compact {
+        // `resp_full_selected_parts`). A masked Captures section is abridged
+        // the same way and expands through the same map. Outside both there's
+        // nothing to expand and we take the panel's own extracted text.
+        if self.resp_text_is_abridged() {
             parts.extend(self.resp_full_selected_parts());
         } else {
             parts.extend(self.resp_panel.selected_parts(None));
@@ -1591,7 +1593,6 @@ impl TuiApp {
             Overlay::PostmanImport(w) => self.on_key_postman(w, key),
             Overlay::GitSave(w) => self.on_key_git_save(w, key),
             Overlay::EnvPopup(popup) => self.on_key_env_popup(popup, key),
-            Overlay::EnvLinkPicker(picker) => self.on_key_env_link_picker(picker, key),
             Overlay::EnvCollision(collision) => self.on_key_env_collision(*collision, key),
             Overlay::ThemeEditor(state) => self.on_key_theme_editor(state, key),
             Overlay::WorkspacePicker(picker) => self.on_key_workspace_picker(picker, key),
@@ -1809,6 +1810,20 @@ impl TuiApp {
             {
                 self.response_compact = !self.response_compact;
             }
+            // `m` unmasks the Captures section. Scoped to the Response pane, so
+            // it doesn't clash with `m`'s Requests-list "move to workspace", and
+            // to the Captures section, where it is the only thing it could mean.
+            //
+            // Masked by default because a capture is usually a bearer token and
+            // carries no "secret" marking of its own to go by (see
+            // `TuiApp::response_reveal`). Display-only: `y` still copies the
+            // real values, which is the point of being able to see them listed.
+            KeyCode::Char('m')
+                if self.focus == Pane::Response
+                    && self.response_section == ResponseSection::Captures =>
+            {
+                self.response_reveal = !self.response_reveal;
+            }
             // `i` (Response pane) steps the section tab bar — Body → Headers →
             // Body — and Shift+I steps back. Deliberately *not* `[`/`]`: those
             // mean "previous/next collection tab" from every pane, and giving
@@ -1945,6 +1960,11 @@ impl TuiApp {
                 self.help_query.clear();
             }
             KeyCode::Char('b') => self.open_prompt_baseurl(),
+            // `p` lays the selected request's JSON body out again. It is not
+            // restricted to the Requests list: the body is what the Main panel
+            // is showing, so the key means the same thing from either side of
+            // the screen.
+            KeyCode::Char('p') => self.prettify_selected_body(),
             // Fold the request's captures/asserts/generated summary away. A
             // request with a dozen asserts can otherwise fill the pane with
             // description and leave three rows for the request itself. The flip
@@ -2130,27 +2150,22 @@ impl TuiApp {
             KeyCode::Char('a') if self.focus == Pane::List => {
                 self.activate_selected_workspace_env();
             }
-            // 'p' in the Requests list links/unlinks a Global Environment to
-            // the active collection.
-            KeyCode::Char('p') if self.focus == Pane::List => {
-                let ci = self.active_tab;
-                let linked = self.collections[ci].linked_env_id;
-                let sel = linked
-                    .and_then(|id| self.global_envs.iter().position(|e| e.id == id))
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                self.overlay = Some(Overlay::EnvLinkPicker(EnvLinkPicker { ci, sel }));
-            }
-            // 'v' views the active collection's Linked Environment (if any)
-            // in the same entries popup used by the Global Environments
-            // list. Deliberately available from every pane (not just the
-            // Tabs bar) since which environment a collection substitutes
-            // from is relevant no matter what's focused; it's a no-op when
-            // nothing is linked.
+            // 'v' views the active tab's variables — its Environment's, and
+            // the captures the tab has collected — in the same popup used by
+            // the Global Environments list. Deliberately available from every
+            // pane (not just the Tabs bar) since what `{{ VAR }}` is worth is
+            // relevant no matter what's focused.
+            //
+            // It opens with no environment too. That used to be the one case
+            // the key refused, back when the popup only listed an environment's
+            // rows; but a tab with no environment can still have captured a
+            // token, and refusing to open left the only view of it unreachable.
             KeyCode::Char('v') => {
-                if let Some(env_id) = self.collections[self.active_tab].linked_env_id {
-                    self.overlay = Some(Overlay::EnvPopup(EnvPopupState::new(env_id)));
-                }
+                let popup = match self.collections[self.active_tab].env_id {
+                    Some(env_id) => EnvPopupState::new(env_id),
+                    None => EnvPopupState::unlinked(),
+                };
+                self.overlay = Some(Overlay::EnvPopup(popup));
             }
             // 'w' (re)opens the Workspace file-tree popup for the active
             // tab, so the user can choose a different collection from the
@@ -2562,7 +2577,7 @@ impl TuiApp {
     /// [`crate::env_panel::reveal_plan`], which the GUI's button follows too so
     /// the two panels behave the same.
     pub(crate) fn jump_to_active_env(&mut self) -> bool {
-        let Some(id) = self.active_env_id else {
+        let Some(id) = self.collections[self.active_tab].env_id else {
             return false;
         };
         let files = self.workspace_env_files();
@@ -3355,7 +3370,9 @@ impl TuiApp {
                 };
                 // "Make this active", not "toggle": right-clicking the active
                 // environment shouldn't turn substitution off.
-                if self.active_env_id != self.global_envs.get(idx).map(|e| e.id) {
+                if self.collections[self.active_tab].env_id
+                    != self.global_envs.get(idx).map(|e| e.id)
+                {
                     self.toggle_activate_env(idx);
                 }
                 true
@@ -3411,7 +3428,7 @@ impl TuiApp {
         };
         // `toggle_activate_env` would *deactivate* one that's already active,
         // which isn't what "make this the active environment" asks for.
-        if self.active_env_id != Some(self.global_envs[idx].id) {
+        if self.collections[self.active_tab].env_id != Some(self.global_envs[idx].id) {
             self.toggle_activate_env(idx);
         }
         self.select_env_row_by_id(self.global_envs[idx].id);
@@ -4318,6 +4335,47 @@ impl TuiApp {
         }
     }
 
+    /// Lay the selected request's JSON body out again.
+    ///
+    /// The body is rewritten in place — there is nothing to confirm, because
+    /// nothing is lost: comments, templates, numbers and key order all survive
+    /// the reformat (see [`crate::hurl::json_format`]), and an undo is one
+    /// `Ctrl+R` revert away for a saved request. Every outcome says something,
+    /// including "it was already like that": a key that appears dead is worse
+    /// than one that reports doing nothing.
+    pub(crate) fn prettify_selected_body(&mut self) {
+        let ci = self.active_tab;
+        let Some(entry) = self
+            .collections
+            .get_mut(ci)
+            .and_then(|c| c.entries.get_mut(c.selected_entry))
+        else {
+            return;
+        };
+        let Some(src) = entry.body_src.as_deref() else {
+            self.status = Some(Status::BodyNotJson);
+            return;
+        };
+        match crate::hurl::json_format::prettify_json(src) {
+            Prettified::Changed(text) => {
+                entry.body_src = Some(text);
+                entry.mark_edited();
+                if let Some(col) = self.collections.get_mut(ci) {
+                    col.invalidate_request_json();
+                }
+                // The Request JSON preview is cached per selected entry and is
+                // not rebuilt while the selection stays put, so without this
+                // the Main pane keeps drawing the pre-format body — visibly so
+                // for the bodies this feature exists for, where the preview
+                // embeds the raw source because it won't parse.
+                self.status = Some(Status::BodyPrettified);
+                self.save_state();
+            }
+            Prettified::Unchanged => self.status = Some(Status::BodyAlreadyTidy),
+            Prettified::NotJson => self.status = Some(Status::BodyNotJson),
+        }
+    }
+
     pub(crate) fn begin_revert_request(&mut self) {
         let ci = self.active_tab;
         let revertable = self.collections.get(ci).is_some_and(|c| {
@@ -4729,10 +4787,13 @@ impl TuiApp {
     /// Environment panel had: n=add var, r=reload failed, Enter=edit
     /// secret/value, F2=rename the environment).
     fn on_key_env_popup(&mut self, mut popup: EnvPopupState, key: KeyEvent) {
+        // Selection stays on the environment's rows: the capture group below
+        // them is a read-only statement of fact, with nothing to edit, reload
+        // or revert, so there is nothing to land on.
         let len = self
             .global_envs
             .iter()
-            .find(|e| e.id == popup.env_id)
+            .find(|e| Some(e.id) == popup.env_id)
             .map(|e| e.vars.len())
             .unwrap_or(0);
         match key.code {
@@ -4753,7 +4814,7 @@ impl TuiApp {
                 let row_len = self
                     .global_envs
                     .iter()
-                    .find(|e| e.id == popup.env_id)
+                    .find(|e| Some(e.id) == popup.env_id)
                     .and_then(|e| e.vars.get(popup.idx))
                     .map(|v| v.key.chars().count() + 3 + v.display_value().chars().count())
                     .unwrap_or(0);
@@ -4764,19 +4825,30 @@ impl TuiApp {
                 let row_len = self
                     .global_envs
                     .iter()
-                    .find(|e| e.id == popup.env_id)
+                    .find(|e| Some(e.id) == popup.env_id)
                     .and_then(|e| e.vars.get(popup.idx))
                     .map(|v| v.key.chars().count() + 3 + v.display_value().chars().count())
                     .unwrap_or(0);
                 popup.hscroll = clamp_hscroll(popup.hscroll, 4, row_len, popup.scroll_w.get());
                 self.overlay = Some(Overlay::EnvPopup(popup));
             }
-            KeyCode::Char('n') => self.open_prompt_add_env(popup.env_id),
+            // Masking is a property of this popup, not of the app: reopening
+            // it starts masked again.
+            KeyCode::Char('m') => {
+                popup.reveal = !popup.reveal;
+                self.overlay = Some(Overlay::EnvPopup(popup));
+            }
+            KeyCode::Char('n') => match popup.env_id {
+                Some(env_id) => self.open_prompt_add_env(env_id),
+                None => self.overlay = Some(Overlay::EnvPopup(popup)),
+            },
             // Ctrl+R reverts the whole environment to its last saved values
             // (#19). Matched before the plain `r` reload arm below, which would
             // otherwise swallow the Ctrl variant.
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.begin_revert_env(popup.env_id);
+                if let Some(env_id) = popup.env_id {
+                    self.begin_revert_env(env_id);
+                }
                 // Keep the popup open when the revert was a no-op (no confirm
                 // overlay was raised).
                 if self.overlay.is_none() {
@@ -4787,19 +4859,20 @@ impl TuiApp {
                 self.overlay = Some(Overlay::EnvPopup(popup));
                 self.reload_selected_env_var();
             }
-            KeyCode::F(2) => {
-                if self.global_envs.iter().any(|e| e.id == popup.env_id) {
-                    self.open_prompt_rename_env(popup.env_id);
-                } else {
-                    self.overlay = Some(Overlay::EnvPopup(popup));
-                }
-            }
+            KeyCode::F(2) => match popup
+                .env_id
+                .filter(|id| self.global_envs.iter().any(|e| e.id == *id))
+            {
+                Some(env_id) => self.open_prompt_rename_env(env_id),
+                None => self.overlay = Some(Overlay::EnvPopup(popup)),
+            },
             KeyCode::Enter => {
-                if let Some(var) = self
-                    .global_envs
-                    .iter()
-                    .find(|e| e.id == popup.env_id)
-                    .and_then(|e| e.vars.get(popup.idx))
+                if let Some(env_id) = popup.env_id
+                    && let Some(var) = self
+                        .global_envs
+                        .iter()
+                        .find(|e| e.id == env_id)
+                        .and_then(|e| e.vars.get(popup.idx))
                 {
                     // Pre-fill the real value so it can be replaced, but mask its
                     // display for secrets so the value is never shown. Offer a
@@ -4812,7 +4885,7 @@ impl TuiApp {
                     // it defaults to checked (still secret) — the safe choice.
                     let secret_checkbox = var.is_secret_source().then_some(true);
                     self.overlay = Some(Overlay::Prompt {
-                        kind: PromptKind::EnvValue(popup.env_id, popup.idx),
+                        kind: PromptKind::EnvValue(env_id, popup.idx),
                         editor: Editor::new(&val, false),
                         title,
                         mask,
@@ -4825,32 +4898,6 @@ impl TuiApp {
                 }
             }
             _ => self.overlay = Some(Overlay::EnvPopup(popup)),
-        }
-    }
-
-    /// Key handling for [`Overlay::EnvLinkPicker`] — linking/unlinking a
-    /// Global Environment to a collection ('p' in the Requests list).
-    fn on_key_env_link_picker(&mut self, mut picker: EnvLinkPicker, key: KeyEvent) {
-        let total = self.global_envs.len() + 1; // +1 for "(none)"
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {}
-            KeyCode::Up | KeyCode::Char('k') => {
-                picker.sel = picker.sel.saturating_sub(1);
-                self.overlay = Some(Overlay::EnvLinkPicker(picker));
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                picker.sel = (picker.sel + 1).min(total.saturating_sub(1));
-                self.overlay = Some(Overlay::EnvLinkPicker(picker));
-            }
-            KeyCode::Enter => {
-                let env_id = if picker.sel == 0 {
-                    None
-                } else {
-                    self.global_envs.get(picker.sel - 1).map(|e| e.id)
-                };
-                self.set_linked_env(picker.ci, env_id);
-            }
-            _ => self.overlay = Some(Overlay::EnvLinkPicker(picker)),
         }
     }
 
@@ -6642,6 +6689,7 @@ impl TuiApp {
             key
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         let s = Strings::for_language(&self.language);
         // The discard prompt is likewise a modal over the wizard: while it is
         // open every key belongs to it, so a keystroke aimed at the prompt
@@ -6747,6 +6795,16 @@ impl TuiApp {
             self.overlay = Some(Overlay::NewRequest(form));
             return;
         }
+        // Alt+P lays the Body out again. The main view's bare `p` can't be
+        // reused here: the Body is a text field, and a printable key that
+        // stopped typing would be a worse bug than a less obvious shortcut.
+        // Alt is the wizard's established "do something to the form" modifier
+        // (Alt+1…0 already move between its sections).
+        if alt && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')) {
+            self.status = Some(form.prettify_body());
+            self.overlay = Some(Overlay::NewRequest(form));
+            return;
+        }
         let prev_focus = form.focus;
         // Remember the last table cell (Headers/Cookies/Queries/Options row or
         // Form-field cell) the user was on, so leaving the multiline Body
@@ -6756,7 +6814,6 @@ impl TuiApp {
             form.last_table_cell = Some(form.focus);
         }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
         let submit = key.code == KeyCode::F(2) || (ctrl && key.code == KeyCode::Enter);
         // Arrowing onto an already-populated Key cell keeps the
         // dropdown hidden (see the focus-change handling below) so

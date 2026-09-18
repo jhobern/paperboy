@@ -68,6 +68,82 @@ use std::collections::HashMap;
 /// reason `Importer` holds its clock (see `postman_import.rs`). A signature is
 /// only checkable against a known-good vector if the nonce and timestamp that
 /// went into it can be pinned.
+/// What the request a `[Gen]` block belongs to is about to send, for the
+/// functions that read it (`method`, `url`, `path`, `query`, `header`, `body`,
+/// `request_name`).
+///
+/// Held as written -- `{{ name }}` and all -- and substituted at the moment a
+/// function asks for it, against the variables known *at that point in the
+/// block*. That is the only ordering that can be explained in one sentence: a
+/// row reading `body()` sees the rows above it filled in and a row below it
+/// still as its `{{name}}`, because the row below has not been worked out yet.
+/// Substituting eagerly would instead freeze the body before the block ran,
+/// and substituting at the end would make a value depend on a row that depends
+/// on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestFacts {
+    pub method: String,
+    pub url: String,
+    /// Name/value pairs in the order the request carries them; a name may
+    /// repeat, and `header()` answers with the first match, as a server reading
+    /// the request would.
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+    /// The request's title, which is what a Postman `pm.info.requestName`
+    /// becomes.
+    pub name: String,
+}
+
+impl RequestFacts {
+    /// What a request looks like to its own `[Gen]` block.
+    ///
+    /// The body is [`crate::hurl::entry::HurlEntry::body_wire`] -- what
+    /// actually goes on the wire -- so a signature computed over `body()`
+    /// signs the bytes the server will hash, not the user's JSON comments.
+    /// Disabled header rows are left out for the same reason: they are not
+    /// sent.
+    pub fn of(entry: &crate::hurl::HurlEntry) -> Self {
+        Self {
+            method: entry.method.clone(),
+            url: entry.url.clone(),
+            headers: entry
+                .headers
+                .iter()
+                .filter(|h| h.enabled)
+                .map(|h| (h.key.clone(), h.value.clone()))
+                .collect(),
+            body: entry.body_wire().unwrap_or_default().into_owned(),
+            name: entry.title.clone(),
+        }
+    }
+
+    /// The URL's path: everything after the host and before the `?`. Empty if
+    /// the URL is still a bare `{{base}}` -- a template we cannot parse is not
+    /// an error here, it is simply a URL that has no path *yet*.
+    pub fn path(&self, url: &str) -> String {
+        let after_scheme = match url.find("://") {
+            Some(i) => &url[i + 3..],
+            None => url,
+        };
+        let end = after_scheme.find(['?', '#']).unwrap_or(after_scheme.len());
+        match after_scheme[..end].find('/') {
+            Some(i) => after_scheme[..end][i..].to_string(),
+            None => String::new(),
+        }
+    }
+
+    /// The URL's query string, without the `?`. Empty when there is none.
+    pub fn query(&self, url: &str) -> String {
+        match url.find('?') {
+            Some(i) => {
+                let rest = &url[i + 1..];
+                rest[..rest.find('#').unwrap_or(rest.len())].to_string()
+            }
+            None => String::new(),
+        }
+    }
+}
+
 pub trait GenSource {
     /// Now, as a Unix timestamp in seconds, and the nanosecond part.
     fn now(&self) -> (i64, u32);
@@ -75,6 +151,16 @@ pub trait GenSource {
     fn fill_random(&self, buf: &mut [u8]);
     /// The next value of the named counter, starting at 1.
     fn counter(&self, name: &str) -> u64;
+    /// The request this block belongs to, when there is one.
+    ///
+    /// Defaulted to `None` so every existing source -- and every test fixture
+    /// that only had to answer for time, randomness and counters -- keeps
+    /// working: a block evaluated with no request behind it (the editor's live
+    /// check, a unit test) reports `NoRequest` for these functions rather than
+    /// inventing an empty one, which would quietly sign the wrong thing.
+    fn request(&self) -> Option<&RequestFacts> {
+        None
+    }
 }
 
 /// Why a generator couldn't be evaluated. Every variant names the row, because
@@ -92,6 +178,14 @@ pub enum GenError {
     Syntax { name: String, detail: String },
     /// No such function.
     UnknownFunction { name: String, function: String },
+    /// A function that reads the request was used where there is no request to
+    /// read: the wizard's live check, or a `[Gen]` block evaluated on its own.
+    ///
+    /// Its own variant rather than an empty answer, because the functions it
+    /// guards are the ones used to *sign* a request -- an `hmac_sha256` over a
+    /// silently empty body is a signature that looks fine and authorises
+    /// nothing.
+    NoRequest { name: String, function: String },
     /// A function called with the wrong number of arguments.
     Arity {
         name: String,
@@ -145,6 +239,7 @@ impl GenError {
             GenError::Empty { name }
             | GenError::Syntax { name, .. }
             | GenError::UnknownFunction { name, .. }
+            | GenError::NoRequest { name, .. }
             | GenError::Arity { name, .. }
             | GenError::BadArgument { name, .. }
             | GenError::UndefinedReference { name, .. }
@@ -194,6 +289,37 @@ enum Expr {
 /// expression (`base64(hmac_sha256(k, concat(a, b)))` is four deep).
 const MAX_DEPTH: usize = 256;
 
+/// Why a `{{name}}` inside a generator expression is refused, worded as the fix.
+///
+/// Everywhere else in PaperBoy -- a URL, a header, a body, an assert -- a
+/// variable is written `{{name}}`, so reaching for the braces here is the
+/// natural mistake rather than a careless one. But an expression is not a
+/// template: a name is already a name, and `"{{SECRET}}"` is a perfectly good
+/// string literal, so accepting it would sign the eight characters `{{SECRET}}`
+/// and return a signature that is the right length, entirely plausible to look
+/// at, and rejected with the same `401` as a wrong secret. That is the exact
+/// failure this whole block exists to prevent, so the braces are a parse error
+/// at the moment they are typed instead.
+///
+/// Substituting them instead was the other option, and is rejected because it
+/// would give one thing two spellings and quietly bypass the ordering rules
+/// that `eval` applies to a reference -- a `{{row_below}}` would find an
+/// environment variable of the same name rather than reporting the cycle.
+fn braces_fault(text: &str) -> String {
+    match braced_name(text) {
+        Some(name) if !name.is_empty() => {
+            format!("write `{name}`, not `{{{{{name}}}}}`: an expression names a variable directly")
+        }
+        _ => "a variable is named directly here, not written in `{{ }}`".to_string(),
+    }
+}
+
+/// The name inside the first `{{ }}` of `text`, if it has a complete one.
+fn braced_name(text: &str) -> Option<&str> {
+    let rest = &text[text.find("{{")? + 2..];
+    Some(rest[..rest.find("}}")?].trim())
+}
+
 struct Parser<'a> {
     rest: &'a str,
 }
@@ -234,6 +360,7 @@ impl<'a> Parser<'a> {
             Some('"') => self.string(),
             Some(c) if c == '-' || c.is_ascii_digit() => self.number(),
             Some(c) if is_name_char(c) => self.ident_or_call(depth),
+            Some('{') => Err(braces_fault(self.rest)),
             Some(c) => Err(format!("unexpected `{c}`")),
         }
     }
@@ -242,22 +369,42 @@ impl<'a> Parser<'a> {
         let mut out = String::new();
         let mut chars = self.rest.char_indices();
         chars.next(); // the opening quote
+        // Whether an unescaped `{{` has been seen: a placeholder inside a
+        // string is refused (see `braces_fault`), but `\{` is how a string that
+        // really does want a brace says so, and an escaped one must not trip
+        // the check.
+        let mut braced = false;
+        let mut prev_open_brace = false;
         while let Some((i, c)) = chars.next() {
             match c {
                 '"' => {
                     self.rest = &self.rest[i + 1..];
+                    if braced {
+                        return Err(braces_fault(&out));
+                    }
                     return Ok(Expr::Text(out));
                 }
-                '\\' => match chars.next() {
-                    Some((_, 'n')) => out.push('\n'),
-                    Some((_, 't')) => out.push('\t'),
-                    Some((_, 'r')) => out.push('\r'),
-                    Some((_, '"')) => out.push('"'),
-                    Some((_, '\\')) => out.push('\\'),
-                    Some((_, other)) => return Err(format!("unknown escape `\\{other}`")),
-                    None => return Err("string ends in a backslash".to_string()),
-                },
-                _ => out.push(c),
+                '\\' => {
+                    prev_open_brace = false;
+                    match chars.next() {
+                        Some((_, 'n')) => out.push('\n'),
+                        Some((_, 't')) => out.push('\t'),
+                        Some((_, 'r')) => out.push('\r'),
+                        Some((_, '"')) => out.push('"'),
+                        Some((_, '\\')) => out.push('\\'),
+                        // The way out of the rule below, for the rare string
+                        // that is meant to contain a placeholder rather than
+                        // stand in for one.
+                        Some((_, '{')) => out.push('{'),
+                        Some((_, other)) => return Err(format!("unknown escape `\\{other}`")),
+                        None => return Err("string ends in a backslash".to_string()),
+                    }
+                }
+                _ => {
+                    braced |= c == '{' && prev_open_brace;
+                    prev_open_brace = c == '{';
+                    out.push(c);
+                }
             }
         }
         Err("unterminated string".to_string())
@@ -344,11 +491,20 @@ fn is_name_char(c: char) -> bool {
 /// the process, which a global is and a per-collection field is not. It resets
 /// on restart, which is the documented "starting at 1".
 #[derive(Default)]
-pub struct SystemSource;
+pub struct SystemSource {
+    request: Option<RequestFacts>,
+}
 
 impl SystemSource {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// The same source, able to answer for the request being sent.
+    pub fn for_request(facts: RequestFacts) -> Self {
+        Self {
+            request: Some(facts),
+        }
     }
 }
 
@@ -371,6 +527,10 @@ impl GenSource for SystemSource {
         // signature that looks fine and is reproducible by anyone, so a failure
         // here is fatal rather than papered over with a fallback.
         getrandom::fill(buf).expect("the operating system's random source");
+    }
+
+    fn request(&self) -> Option<&RequestFacts> {
+        self.request.as_ref()
     }
 
     fn counter(&self, name: &str) -> u64 {
@@ -397,11 +557,11 @@ pub struct DryRunSource;
 
 impl GenSource for DryRunSource {
     fn now(&self) -> (i64, u32) {
-        SystemSource.now()
+        SystemSource::new().now()
     }
 
     fn fill_random(&self, buf: &mut [u8]) {
-        SystemSource.fill_random(buf)
+        SystemSource::new().fill_random(buf)
     }
 
     fn counter(&self, name: &str) -> u64 {
@@ -644,7 +804,7 @@ fn eval(
             // whereas resolving it by whichever happens to exist would make the
             // meaning of a row depend on the loaded environment.
             if is_function(name.as_str()) {
-                return call(name, &[], row, src);
+                return call(name, &[], row, vars, src);
             }
             // An earlier row that was tried and failed is a *consequence*,
             // not a second mistake: say which row is missing so the reader
@@ -685,7 +845,7 @@ fn eval(
             for a in args {
                 values.push(eval(a, row, vars, declared, done, failed, src)?);
             }
-            call(function, &values, row, src)
+            call(function, &values, row, vars, src)
         }
     }
 }
@@ -695,6 +855,7 @@ fn call(
     function: &str,
     args: &[String],
     row: &str,
+    vars: &HashMap<String, String>,
     src: &dyn GenSource,
 ) -> Result<String, GenError> {
     let arity = |expected: &str, ok: bool| -> Result<(), GenError> {
@@ -841,6 +1002,19 @@ fn call(
             arity("1", args.len() == 1)?;
             Ok(serde_json::Value::String(args[0].clone()).to_string())
         }
+        // Reaching into a JSON document the block already has in hand -- a
+        // response an earlier request captured whole, or this request's own
+        // `body()`. A `[Captures]` row is the right tool when the value comes
+        // straight from a response; this is for the cases a capture cannot
+        // reach, which is anything that has to be *computed* from the value:
+        // signing part of a payload, or building the next request's body out of
+        // pieces of the last one's.
+        "jsonpath" => {
+            arity("2", args.len() == 2)?;
+            let doc: serde_json::Value =
+                serde_json::from_str(&args[0]).map_err(|e| bad(format!("not valid JSON ({e})")))?;
+            json_path(&doc, &args[1]).map_err(bad)
+        }
 
         // ── Hashes and signatures ───────────────────────────────────────
         // The digest is bytes; the request needs text. Which text is not a
@@ -851,13 +1025,13 @@ fn call(
         // `toString()` produce, which is what a ported script expects), `_b64`
         // is standard padded Base64 (what Twilio, AWS and friends want).
         "md5" | "sha1" | "sha256" | "sha512" | "md5_b64" | "sha1_b64" | "sha256_b64"
-        | "sha512_b64" => {
+        | "sha512_b64" | "md5_b64url" | "sha1_b64url" | "sha256_b64url" | "sha512_b64url" => {
             arity("1", args.len() == 1)?;
             let (alg, as_b64) = split_encoding(function);
             Ok(encode_digest(&hash_bytes(alg, args[0].as_bytes()), as_b64))
         }
         "hmac_sha1" | "hmac_sha256" | "hmac_sha512" | "hmac_sha1_b64" | "hmac_sha256_b64"
-        | "hmac_sha512_b64" => {
+        | "hmac_sha512_b64" | "hmac_sha1_b64url" | "hmac_sha256_b64url" | "hmac_sha512_b64url" => {
             arity("2", args.len() == 2)?;
             let (alg, as_b64) = split_encoding(function);
             let alg = alg.strip_prefix("hmac_").expect("matched an hmac_ name");
@@ -881,6 +1055,103 @@ fn call(
         "trim" => {
             arity("1", args.len() == 1)?;
             Ok(args[0].trim().to_string())
+        }
+        // Taking *part* of a string is what a ported script needs most often:
+        // a test-case number off the end of a request name, a token out of a
+        // header, an id out of a path. `n` counts from 0, and from the end
+        // when negative, so "the last piece" -- JavaScript's `.pop()`, the
+        // shape these scripts are written in -- is `-1` rather than a length
+        // the block has no way to work out.
+        "split" => {
+            arity("3", args.len() == 3)?;
+            let pieces: Vec<&str> = if args[1].is_empty() {
+                // Splitting on nothing yields one empty piece per character in
+                // Rust, which is a silent trap: an empty separator here is
+                // almost always a `{{sep}}` that resolved to nothing.
+                return Err(bad("the separator cannot be empty".to_string()));
+            } else {
+                args[0].split(args[1].as_str()).collect()
+            };
+            let n = args[2]
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| bad("the piece number must be a whole number".to_string()))?;
+            let idx = if n < 0 { pieces.len() as i64 + n } else { n };
+            // Out of range is a fault, not an empty answer: this text goes on
+            // to be signed, sent or asserted against, and a silently empty
+            // piece is the kind of wrong that looks like the server's fault.
+            usize::try_from(idx)
+                .ok()
+                .and_then(|i| pieces.get(i))
+                .map(|p| p.to_string())
+                .ok_or_else(|| {
+                    bad(format!(
+                        "there is no piece {n}; the text splits into {}",
+                        pieces.len()
+                    ))
+                })
+        }
+        // The escape hatch for everything `split` cannot reach. The first
+        // capture group if the pattern has one -- which is how a pattern says
+        // "this part" -- and otherwise the whole match.
+        "regex" => {
+            arity("2", args.len() == 2)?;
+            let re = regex::Regex::new(&args[1])
+                .map_err(|e| bad(format!("the pattern is not valid: {e}")))?;
+            let caps = re
+                .captures(&args[0])
+                .ok_or_else(|| bad("the pattern matched nothing".to_string()))?;
+            Ok(caps
+                .get(1)
+                .or_else(|| caps.get(0))
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default())
+        }
+
+        // ── The request this block belongs to ───────────────────────────
+        //
+        // Every one of these reads `RequestFacts`, whose text is stored as
+        // written and substituted here against the variables worked out so
+        // far, so a row reading the body sees the rows above it filled in.
+        // Without a request behind the block -- the editor's live check --
+        // they fail rather than answer with nothing, because the whole point
+        // of reading the request is to sign or record what is actually sent.
+        "method" | "url" | "path" | "query" | "body" | "request_name" => {
+            arity("0", args.is_empty())?;
+            let facts = src.request().ok_or_else(|| GenError::NoRequest {
+                name: row.to_string(),
+                function: function.to_string(),
+            })?;
+            let fill = |t: &str| crate::environment::substitute(t, vars);
+            Ok(match function {
+                "method" => facts.method.to_ascii_uppercase(),
+                "url" => fill(&facts.url),
+                "path" => facts.path(&fill(&facts.url)),
+                "query" => facts.query(&fill(&facts.url)),
+                "body" => fill(&facts.body),
+                // The title as typed: it is a label, not a URL, and a
+                // migration that reads it back is comparing it with the
+                // Postman request name it came from.
+                _ => facts.name.clone(),
+            })
+        }
+        "header" => {
+            arity("1", args.len() == 1)?;
+            let facts = src.request().ok_or_else(|| GenError::NoRequest {
+                name: row.to_string(),
+                function: function.to_string(),
+            })?;
+            // Case-insensitively, and the first of a repeated name wins --
+            // both are how a server reads the request being described.
+            // Missing is empty rather than an error: a signature over "the
+            // Content-Type if there is one" is a real thing to write, and an
+            // absent header is not a mistake in the block.
+            Ok(facts
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(args[0].trim()))
+                .map(|(_, v)| crate::environment::substitute(v, vars))
+                .unwrap_or_default())
         }
 
         _ => Err(GenError::UnknownFunction {
@@ -926,26 +1197,54 @@ pub struct GenFunction {
 /// Every generator function, for the editors' suggestions and for
 /// documentation. Kept beside [`call`] so a function added there is offered
 /// here, which a test enforces in both directions.
+///
+/// **In alphabetical order**, and a test keeps it that way. This is the order
+/// both front-ends' dropdowns show, and browsing the whole list is what that
+/// dropdown is for: grouped by kind it read well as source, but it left a
+/// reader hunting for `sha256` with nothing to scan against. Where a related
+/// set matters -- the four `random_*`, the `hmac_*` pairs -- the shared prefix
+/// keeps it together anyway.
 pub const FUNCTIONS: &[GenFunction] = &[
     GenFunction {
-        name: "timestamp",
-        signature: "timestamp([offset_seconds])",
-        min_args: 0,
+        name: "base64",
+        signature: "base64(text)",
+        min_args: 1,
         max_args: Some(1),
         examples: &[],
     },
     GenFunction {
-        name: "timestamp_ms",
-        signature: "timestamp_ms()",
+        name: "base64_decode",
+        signature: "base64_decode(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "base64url",
+        signature: "base64url(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "body",
+        signature: "body()",
         min_args: 0,
         max_args: Some(0),
         examples: &[],
     },
     GenFunction {
-        name: "iso8601",
-        signature: "iso8601()",
+        name: "concat",
+        signature: "concat(a, b, …)",
         min_args: 0,
-        max_args: Some(0),
+        max_args: None,
+        examples: &[],
+    },
+    GenFunction {
+        name: "counter",
+        signature: "counter(name)",
+        min_args: 1,
+        max_args: Some(1),
         examples: &[],
     },
     GenFunction {
@@ -965,64 +1264,8 @@ pub const FUNCTIONS: &[GenFunction] = &[
         ],
     },
     GenFunction {
-        name: "uuid",
-        signature: "uuid()",
-        min_args: 0,
-        max_args: Some(0),
-        examples: &[],
-    },
-    GenFunction {
-        name: "counter",
-        signature: "counter(name)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "random_int",
-        signature: "random_int(low, high)",
-        min_args: 2,
-        max_args: Some(2),
-        examples: &[],
-    },
-    GenFunction {
-        name: "random_hex",
-        signature: "random_hex(length)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "random_alnum",
-        signature: "random_alnum(length)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "random_base64",
-        signature: "random_base64(bytes)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "base64",
-        signature: "base64(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "base64url",
-        signature: "base64url(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "base64_decode",
-        signature: "base64_decode(text)",
+        name: "header",
+        signature: "header(name)",
         min_args: 1,
         max_args: Some(1),
         examples: &[],
@@ -1030,83 +1273,6 @@ pub const FUNCTIONS: &[GenFunction] = &[
     GenFunction {
         name: "hex",
         signature: "hex(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "urlencode",
-        signature: "urlencode(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "urldecode",
-        signature: "urldecode(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "json_string",
-        signature: "json_string(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "md5",
-        signature: "md5(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "md5_b64",
-        signature: "md5_b64(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "sha1",
-        signature: "sha1(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "sha1_b64",
-        signature: "sha1_b64(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "sha256",
-        signature: "sha256(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "sha256_b64",
-        signature: "sha256_b64(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "sha512",
-        signature: "sha512(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "sha512_b64",
-        signature: "sha512_b64(text)",
         min_args: 1,
         max_args: Some(1),
         examples: &[],
@@ -1126,6 +1292,13 @@ pub const FUNCTIONS: &[GenFunction] = &[
         examples: &[],
     },
     GenFunction {
+        name: "hmac_sha1_b64url",
+        signature: "hmac_sha1_b64url(key, message)",
+        min_args: 2,
+        max_args: Some(2),
+        examples: &[],
+    },
+    GenFunction {
         name: "hmac_sha256",
         signature: "hmac_sha256(key, message)",
         min_args: 2,
@@ -1135,6 +1308,13 @@ pub const FUNCTIONS: &[GenFunction] = &[
     GenFunction {
         name: "hmac_sha256_b64",
         signature: "hmac_sha256_b64(key, message)",
+        min_args: 2,
+        max_args: Some(2),
+        examples: &[],
+    },
+    GenFunction {
+        name: "hmac_sha256_b64url",
+        signature: "hmac_sha256_b64url(key, message)",
         min_args: 2,
         max_args: Some(2),
         examples: &[],
@@ -1154,17 +1334,31 @@ pub const FUNCTIONS: &[GenFunction] = &[
         examples: &[],
     },
     GenFunction {
-        name: "concat",
-        signature: "concat(a, b, …)",
-        min_args: 0,
-        max_args: None,
+        name: "hmac_sha512_b64url",
+        signature: "hmac_sha512_b64url(key, message)",
+        min_args: 2,
+        max_args: Some(2),
         examples: &[],
     },
     GenFunction {
-        name: "upper",
-        signature: "upper(text)",
+        name: "iso8601",
+        signature: "iso8601()",
+        min_args: 0,
+        max_args: Some(0),
+        examples: &[],
+    },
+    GenFunction {
+        name: "json_string",
+        signature: "json_string(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "jsonpath",
+        signature: "jsonpath(text, path)",
+        min_args: 2,
+        max_args: Some(2),
         examples: &[],
     },
     GenFunction {
@@ -1175,10 +1369,213 @@ pub const FUNCTIONS: &[GenFunction] = &[
         examples: &[],
     },
     GenFunction {
+        name: "md5",
+        signature: "md5(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "md5_b64",
+        signature: "md5_b64(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "md5_b64url",
+        signature: "md5_b64url(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "method",
+        signature: "method()",
+        min_args: 0,
+        max_args: Some(0),
+        examples: &[],
+    },
+    GenFunction {
+        name: "path",
+        signature: "path()",
+        min_args: 0,
+        max_args: Some(0),
+        examples: &[],
+    },
+    GenFunction {
+        name: "query",
+        signature: "query()",
+        min_args: 0,
+        max_args: Some(0),
+        examples: &[],
+    },
+    GenFunction {
+        name: "random_alnum",
+        signature: "random_alnum(length)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "random_base64",
+        signature: "random_base64(bytes)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "random_hex",
+        signature: "random_hex(length)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "random_int",
+        signature: "random_int(low, high)",
+        min_args: 2,
+        max_args: Some(2),
+        examples: &[],
+    },
+    GenFunction {
+        name: "regex",
+        signature: "regex(text, pattern)",
+        min_args: 2,
+        max_args: Some(2),
+        examples: &[],
+    },
+    GenFunction {
+        name: "request_name",
+        signature: "request_name()",
+        min_args: 0,
+        max_args: Some(0),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha1",
+        signature: "sha1(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha1_b64",
+        signature: "sha1_b64(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha1_b64url",
+        signature: "sha1_b64url(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha256",
+        signature: "sha256(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha256_b64",
+        signature: "sha256_b64(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha256_b64url",
+        signature: "sha256_b64url(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha512",
+        signature: "sha512(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha512_b64",
+        signature: "sha512_b64(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha512_b64url",
+        signature: "sha512_b64url(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "split",
+        signature: "split(text, separator, n)",
+        min_args: 3,
+        max_args: Some(3),
+        examples: &[],
+    },
+    GenFunction {
+        name: "timestamp",
+        signature: "timestamp([offset_seconds])",
+        min_args: 0,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "timestamp_ms",
+        signature: "timestamp_ms()",
+        min_args: 0,
+        max_args: Some(0),
+        examples: &[],
+    },
+    GenFunction {
         name: "trim",
         signature: "trim(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "upper",
+        signature: "upper(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "url",
+        signature: "url()",
+        min_args: 0,
+        max_args: Some(0),
+        examples: &[],
+    },
+    GenFunction {
+        name: "urldecode",
+        signature: "urldecode(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "urlencode",
+        signature: "urlencode(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "uuid",
+        signature: "uuid()",
+        min_args: 0,
+        max_args: Some(0),
         examples: &[],
     },
 ];
@@ -1193,8 +1590,8 @@ pub fn is_function(name: &str) -> bool {
     FUNCTIONS.iter().any(|f| f.name == name)
 }
 
-/// The functions whose name begins with `prefix`, in table order, for a
-/// completion list. An empty prefix offers everything.
+/// The functions whose name begins with `prefix`, in table (alphabetical)
+/// order, for a completion list. An empty prefix offers everything.
 pub fn functions_starting_with(prefix: &str) -> impl Iterator<Item = &'static GenFunction> {
     let prefix = prefix.to_ascii_lowercase();
     FUNCTIONS
@@ -1362,18 +1759,36 @@ fn utc(src: &dyn GenSource) -> chrono::DateTime<chrono::Utc> {
 
 /// Split a hash or MAC function name into the algorithm and whether its result
 /// is wanted as Base64 rather than hex.
-fn split_encoding(function: &str) -> (&str, bool) {
-    match function.strip_suffix("_b64") {
-        Some(alg) => (alg, true),
-        None => (function, false),
+/// How a digest is written out, taken from the tail of the function's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigestEncoding {
+    /// Bare: lowercase hex, what `sha256sum` and CryptoJS's `toString()` give.
+    Hex,
+    /// `_b64`: standard padded Base64, what Twilio, AWS and friends want.
+    B64,
+    /// `_b64url`: URL-safe Base64 without padding -- the encoding a JWT is
+    /// made of, and the reason this variant exists: `header.payload.signature`
+    /// is three of these joined by dots, and the standard alphabet's `+`, `/`
+    /// and `=` are all wrong in that position.
+    B64Url,
+}
+
+/// `_b64url` is tried before `_b64` because the latter is its prefix.
+fn split_encoding(function: &str) -> (&str, DigestEncoding) {
+    if let Some(alg) = function.strip_suffix("_b64url") {
+        (alg, DigestEncoding::B64Url)
+    } else if let Some(alg) = function.strip_suffix("_b64") {
+        (alg, DigestEncoding::B64)
+    } else {
+        (function, DigestEncoding::Hex)
     }
 }
 
-fn encode_digest(bytes: &[u8], as_b64: bool) -> String {
-    if as_b64 {
-        b64(bytes, false)
-    } else {
-        to_hex(bytes)
+fn encode_digest(bytes: &[u8], how: DigestEncoding) -> String {
+    match how {
+        DigestEncoding::Hex => to_hex(bytes),
+        DigestEncoding::B64 => b64(bytes, false),
+        DigestEncoding::B64Url => b64(bytes, true),
     }
 }
 
@@ -1420,6 +1835,77 @@ fn b64(bytes: &[u8], url_safe: bool) -> String {
     } else {
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
+}
+
+/// Read a value out of a JSON document with a plain `$.a.b[0]` path.
+///
+/// The walk itself is [`crate::report::run::json_path_get`] -- the same one a
+/// report column uses -- rather than a second implementation: the same path
+/// written in two places in PaperBoy has to mean the same thing, and two
+/// hand-rolled walkers that agree on the easy paths and differ on the hard ones
+/// is the worst outcome available. What is added here is the *why*: a walk that
+/// finds nothing comes back as `None`, and a row that failed needs to say
+/// whether the document was not JSON, the path was not a path, or the value
+/// simply is not there.
+///
+/// The notation it does not implement is refused by name, pointing at the
+/// `[Captures]` row that has Hurl's full JSONPath. Refusing matters more than
+/// it looks: a `$..id` that quietly picked the wrong `id` yields a value that
+/// looks perfectly reasonable in the request it ends up in, which is the exact
+/// kind of wrong a generator block exists to stop.
+fn json_path(doc: &serde_json::Value, path: &str) -> Result<String, String> {
+    let path = path.trim();
+    let unsupported = |what: &str| {
+        Err(format!(
+            "{what} is not supported here — use a `[Captures]` row, which has \
+             Hurl's full JSONPath"
+        ))
+    };
+    if !path.starts_with('$') {
+        return Err(format!("a path starts with `$`, not {path:?}"));
+    }
+    if path.contains("..") {
+        return unsupported("recursive descent (`..`)");
+    }
+    if path.contains('*') {
+        return unsupported("a wildcard");
+    }
+    // Inside brackets only: a `:` or `,` can appear perfectly legitimately in a
+    // quoted key, and `[?(...)]` filters *are* supported.
+    for part in path.split('[').skip(1) {
+        let inside = part.split(']').next().unwrap_or_default().trim();
+        if inside.starts_with('?') {
+            continue;
+        }
+        if inside.starts_with('\'') || inside.starts_with('"') {
+            continue;
+        }
+        if inside.contains(':') {
+            return unsupported("a slice");
+        }
+        if inside.contains(',') {
+            return unsupported("a union");
+        }
+    }
+
+    // Missing is an error, not an empty answer: this text goes on to be signed,
+    // sent or asserted against, and quietly nothing is the kind of wrong that
+    // looks like the server's fault.
+    let found = crate::report::run::json_path_get(doc, path)
+        .ok_or_else(|| format!("there is nothing at {path}"))?;
+
+    Ok(match found {
+        // A string is its text, not its JSON spelling: a row reading `$.token`
+        // wants the token, not `"the-token"` with the quotes still on.
+        serde_json::Value::String(s) => s,
+        // `null` is refused rather than rendered: "null" is four plausible
+        // characters to sign or send, and never what was meant.
+        serde_json::Value::Null => return Err(format!("the value at {path} is null")),
+        // An object or array comes back as compact JSON -- the only sensible
+        // text for it, and what a script hashing part of a payload wants.
+        // Canonicalisation is the author's, as everywhere else in a block.
+        other => other.to_string(),
+    })
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -1505,6 +1991,18 @@ fn percent_decode(s: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    /// The table is the order both dropdowns show, and it is alphabetical --
+    /// so a function added to the end of the list, where a new entry naturally
+    /// goes, is caught here rather than by a reader wondering why `zzz` sits
+    /// after `trim`.
+    #[test]
+    fn the_function_table_is_in_alphabetical_order() {
+        let names: Vec<&str> = FUNCTIONS.iter().map(|f| f.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "FUNCTIONS is out of alphabetical order");
+    }
+
     /// The two halves of the word at the caret mean different things: what is
     /// typed filters the list, what follows is what a call would wrap.
     #[test]
@@ -1546,6 +2044,7 @@ mod tests {
     struct FakeSource {
         secs: i64,
         counters: std::sync::Mutex<HashMap<String, u64>>,
+        request: Option<RequestFacts>,
     }
 
     impl FakeSource {
@@ -1553,7 +2052,13 @@ mod tests {
             FakeSource {
                 secs,
                 counters: std::sync::Mutex::new(HashMap::new()),
+                request: None,
             }
+        }
+
+        fn sending(mut self, request: RequestFacts) -> Self {
+            self.request = Some(request);
+            self
         }
     }
 
@@ -1566,6 +2071,10 @@ mod tests {
                 *b = (i % 251) as u8;
             }
         }
+        fn request(&self) -> Option<&RequestFacts> {
+            self.request.as_ref()
+        }
+
         fn counter(&self, name: &str) -> u64 {
             let mut c = self.counters.lock().unwrap();
             let n = c.entry(name.to_string()).or_insert(0);
@@ -1576,6 +2085,39 @@ mod tests {
 
     fn run(rows: &[(&str, &str)]) -> (HashMap<String, String>, Vec<GenError>) {
         run_with(rows, HashMap::new())
+    }
+
+    /// The same walk, but with a request behind the block, which is what the
+    /// runner always has and the editor's live check never does.
+    fn run_sending(
+        request: RequestFacts,
+        rows: &[(&str, &str)],
+    ) -> (HashMap<String, String>, Vec<GenError>) {
+        let rows: Vec<(String, String)> = rows
+            .iter()
+            .map(|(n, e)| (n.to_string(), e.to_string()))
+            .collect();
+        let mut vars = HashMap::new();
+        let errors = expand(
+            &rows,
+            &mut vars,
+            &FakeSource::at(1_700_000_000).sending(request),
+        );
+        (vars, errors)
+    }
+
+    fn facts() -> RequestFacts {
+        RequestFacts {
+            method: "post".to_string(),
+            url: "https://api.example.net/v2/orders?page=2&size=10#top".to_string(),
+            headers: vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("X-Trace".to_string(), "first".to_string()),
+                ("X-Trace".to_string(), "second".to_string()),
+            ],
+            body: r#"{"id":7}"#.to_string(),
+            name: "Create order".to_string(),
+        }
     }
 
     fn run_with(
@@ -1669,6 +2211,398 @@ mod tests {
         );
     }
 
+    /// The URL-safe alphabet is not cosmetic: `+`, `/` and `=` are all wrong
+    /// in a JWT segment or a query parameter, which is the only reason these
+    /// variants exist.
+    #[test]
+    fn the_url_safe_digests_use_the_alphabet_a_jwt_needs() {
+        let (v, e) = run(&[
+            ("padded", r#"sha256_b64("abc")"#),
+            ("safe", r#"sha256_b64url("abc")"#),
+            ("mac", r#"hmac_sha256_b64url("key", "message")"#),
+        ]);
+        assert!(e.is_empty(), "{e:?}");
+        // The same digest as the padded vector above, with `+` -> `-`,
+        // `/` -> `_` and the padding dropped.
+        assert_eq!(v["padded"], "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
+        assert_eq!(v["safe"], "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0");
+        assert_eq!(
+            v["mac"],
+            encode_digest(
+                &hmac_bytes("sha256", b"key", b"message"),
+                DigestEncoding::B64Url
+            )
+        );
+        for name in ["safe", "mac"] {
+            assert!(
+                !v[name].contains(['+', '/', '=']),
+                "{name} produced {:?}, which cannot go in a URL or a JWT",
+                v[name]
+            );
+        }
+    }
+
+    /// The pieces a script would reach for: the last segment of a path, a
+    /// field out of a header, the token after a space.
+    #[test]
+    fn split_counts_from_either_end_and_refuses_to_guess() {
+        let (v, e) = run(&[
+            ("first", r#"split("a/b/c", "/", 0)"#),
+            ("last", r#"split("a/b/c", "/", -1)"#),
+            ("but_one", r#"split("a/b/c", "/", -2)"#),
+            ("token", r#"split("Bearer abc123", " ", 1)"#),
+        ]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["first"], "a");
+        assert_eq!(v["last"], "c");
+        assert_eq!(v["but_one"], "b");
+        assert_eq!(v["token"], "abc123");
+
+        // Out of range, an empty separator and a non-numeric index are all
+        // faults rather than an empty answer: this text goes on to be signed
+        // or sent, and quietly nothing is the hardest kind of wrong to find.
+        for expr in [
+            r#"split("a/b", "/", 5)"#,
+            r#"split("a/b", "/", -5)"#,
+            r#"split("a/b", "", 0)"#,
+            r#"split("a/b", "/", "last")"#,
+        ] {
+            let (v, e) = run(&[("v", expr)]);
+            assert!(
+                matches!(e.as_slice(), [GenError::BadArgument { .. }]),
+                "{expr} gave {e:?}"
+            );
+            assert!(!v.contains_key("v"), "{expr} still set a value");
+        }
+    }
+
+    /// A JSON document written as a `[Gen]` string literal, quotes and all --
+    /// the shape a row gets it in when it comes from `body()` or a capture.
+    fn as_literal(json: &str) -> String {
+        format!("\"{}\"", json.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    /// The shapes a ported script reaches for: a field, a nested field, an
+    /// element, a key that cannot be written with a dot, and a whole
+    /// sub-document to hash.
+    #[test]
+    fn jsonpath_reaches_into_a_document_the_block_already_has() {
+        let doc = r#"{"a":{"b":"x"},"items":[{"id":7},{"id":8}],"odd key":"k",
+                      "n":42,"ok":true,"sub":{"z":1}}"#;
+        let (v, e) = run(&[
+            ("doc", &as_literal(doc)),
+            ("field", r#"jsonpath(doc, "$.a.b")"#),
+            ("element", r#"jsonpath(doc, "$.items[1].id")"#),
+            ("bracketed", r#"jsonpath(doc, "$['odd key']")"#),
+            ("number", r#"jsonpath(doc, "$.n")"#),
+            ("boolean", r#"jsonpath(doc, "$.ok")"#),
+            ("whole", r#"jsonpath(doc, "$.sub")"#),
+            ("root", r#"jsonpath(doc, "$")"#),
+        ]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["field"], "x");
+        assert_eq!(v["element"], "8");
+        assert_eq!(v["bracketed"], "k");
+        // A number and a boolean come back as the text they are written as --
+        // not quoted, not rounded.
+        assert_eq!(v["number"], "42");
+        assert_eq!(v["boolean"], "true");
+        // A sub-document is compact JSON: the only sensible text for it, and
+        // what a script hashing part of a payload wants.
+        assert_eq!(v["whole"], r#"{"z":1}"#);
+        assert!(v["root"].starts_with('{'));
+    }
+
+    /// The one filter shape the report columns needed, which a `[Gen]` row gets
+    /// for free by sharing their walker: an API that returns its fields as a
+    /// *list of key/value objects* has no addressable path to a named field
+    /// without it.
+    #[test]
+    fn jsonpath_can_pick_an_element_out_of_a_list_by_one_of_its_fields() {
+        let doc = r#"{"CardInfo":[{"key":"full_name","value":"Ada"},
+                       {"key":"dob","value":"1815-12-10"}]}"#;
+        let (v, e) = run(&[
+            ("doc", &as_literal(doc)),
+            (
+                "name",
+                r#"jsonpath(doc, "$.CardInfo[?(@.key=='full_name')].value")"#,
+            ),
+        ]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["name"], "Ada");
+    }
+
+    /// Everything that is not there is a fault, never an empty answer: the
+    /// value goes on to be signed or sent, and quietly nothing is the hardest
+    /// kind of wrong to find. `null` included -- "null" is four plausible
+    /// characters that are never what was meant.
+    #[test]
+    fn jsonpath_refuses_rather_than_answering_with_nothing() {
+        let doc = r#"{"a":{"b":"x"},"items":[1],"nothing":null}"#;
+        let (v, e) = run(&[
+            ("doc", &as_literal(doc)),
+            ("missing", r#"jsonpath(doc, "$.a.nope")"#),
+            ("past_end", r#"jsonpath(doc, "$.items[3]")"#),
+            ("into_scalar", r#"jsonpath(doc, "$.a.b.c")"#),
+            ("null_value", r#"jsonpath(doc, "$.nothing")"#),
+            ("no_dollar", r#"jsonpath(doc, "a.b")"#),
+            ("not_json", r#"jsonpath("<html>", "$.a")"#),
+            ("bad_index", r#"jsonpath(doc, "$.items[x]")"#),
+        ]);
+        for name in [
+            "missing",
+            "past_end",
+            "into_scalar",
+            "null_value",
+            "no_dollar",
+            "not_json",
+            "bad_index",
+        ] {
+            assert!(!v.contains_key(name), "{name} was given a value: {v:?}");
+        }
+        assert_eq!(e.len(), 7, "{e:?}");
+        assert!(
+            e.iter()
+                .all(|err| matches!(err, GenError::BadArgument { .. })),
+            "{e:?}"
+        );
+    }
+
+    /// The paths the shared walker does not implement say so, and say where to
+    /// go instead. Hurl's own JSONPath is a full implementation and its module
+    /// is private, so anything unsupported here has to *fail* rather than be
+    /// half-answered: the same path written in a `[Gen]` row and a `[Captures]`
+    /// row quietly meaning different things is the worst outcome available.
+    #[test]
+    fn jsonpath_refuses_the_notation_it_does_not_share_with_hurl() {
+        let doc = r#"{"items":[{"id":1},{"id":2}]}"#;
+        for path in [
+            "$..id",
+            "$.items[*].id",
+            "$.items[0:1]",
+            "$.items[0,1]",
+            "$.*",
+        ] {
+            let (v, e) = run(&[
+                ("doc", &as_literal(doc)),
+                ("v", &format!(r#"jsonpath(doc, "{path}")"#)),
+            ]);
+            assert!(!v.contains_key("v"), "{path} was answered");
+            let detail = match e.as_slice() {
+                [GenError::BadArgument { detail, .. }] => detail.clone(),
+                other => panic!("{path} gave {other:?}"),
+            };
+            assert!(
+                detail.contains("[Captures]"),
+                "{path} should point at the row that can do it, said {detail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn regex_answers_with_the_capture_group_when_the_pattern_names_one() {
+        let (v, e) = run(&[
+            ("whole", r#"regex("order-4711-x", "[0-9]+")"#),
+            ("part", r#"regex("order-4711-x", "order-([0-9]+)")"#),
+        ]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["whole"], "4711");
+        assert_eq!(v["part"], "4711");
+
+        for expr in [
+            r#"regex("nothing here", "[0-9]+")"#,
+            r#"regex("text", "([")"#,
+        ] {
+            let (_, e) = run(&[("v", expr)]);
+            assert!(
+                matches!(e.as_slice(), [GenError::BadArgument { .. }]),
+                "{expr} gave {e:?}"
+            );
+        }
+    }
+
+    /// A row may be a plain string: the common case for "this test case
+    /// expects this" is data, not a computation, and making the user wrap it
+    /// in `concat()` to satisfy the grammar would be a toll booth.
+    #[test]
+    fn a_row_may_be_a_plain_literal() {
+        let (v, e) = run(&[("expected", r#""APPROVED""#), ("n", "3")]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["expected"], "APPROVED");
+        assert_eq!(v["n"], "3");
+    }
+
+    /// The mistake every user of the rest of PaperBoy will make, because a URL,
+    /// a header, a body and an assert all take `{{name}}`. Accepting it inside
+    /// an expression would sign the braces themselves -- a wrong signature that
+    /// looks right -- so it is a parse error, worded as the fix.
+    #[test]
+    fn a_placeholder_in_an_expression_is_refused_not_signed() {
+        for expr in [
+            "{{VAR}}",
+            r#""{{VAR}}""#,
+            r#"hmac_sha256("{{SECRET}}", "m")"#,
+            r#"concat("x-", "{{VAR}}")"#,
+        ] {
+            let detail = parse(expr).expect_err(&format!("{expr} should not parse"));
+            assert!(
+                detail.contains("VAR") || detail.contains("SECRET"),
+                "{expr} said {detail:?}, which does not name the variable"
+            );
+            assert!(
+                detail.contains("not `{{"),
+                "{expr} said {detail:?}, which does not say what to write instead"
+            );
+        }
+        // Half a placeholder has no name to offer, so the message states the
+        // rule rather than guessing at one.
+        assert!(
+            parse(r#""{{oops""#)
+                .expect_err("unclosed braces")
+                .contains("named directly"),
+        );
+    }
+
+    /// The way out, for a string that really is meant to carry braces -- a body
+    /// template being built for something else to fill in.
+    #[test]
+    fn an_escaped_brace_is_a_brace() {
+        let (v, e) = run(&[("a", r#""\{{VAR}}""#)]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["a"], "{{VAR}}");
+    }
+
+    #[test]
+    fn a_block_reads_the_request_it_belongs_to() {
+        let (v, e) = run_sending(
+            facts(),
+            &[
+                ("m", "method()"),
+                ("u", "url()"),
+                ("p", "path()"),
+                ("q", "query()"),
+                ("b", "body()"),
+                ("n", "request_name()"),
+                ("ct", r#"header("content-type")"#),
+                ("trace", r#"header("X-Trace")"#),
+                ("absent", r#"header("X-Nope")"#),
+            ],
+        );
+        assert!(e.is_empty(), "{e:?}");
+        // Upper-cased: what goes in a signing string is the method as sent,
+        // not as typed.
+        assert_eq!(v["m"], "POST");
+        assert_eq!(
+            v["u"],
+            "https://api.example.net/v2/orders?page=2&size=10#top"
+        );
+        assert_eq!(v["p"], "/v2/orders");
+        assert_eq!(v["q"], "page=2&size=10");
+        assert_eq!(v["b"], r#"{"id":7}"#);
+        assert_eq!(v["n"], "Create order");
+        // Case-insensitive, first of a repeated name wins, and a header that
+        // isn't there is empty rather than a fault.
+        assert_eq!(v["ct"], "application/json");
+        assert_eq!(v["trace"], "first");
+        assert_eq!(v["absent"], "");
+    }
+
+    /// A URL that is still `{{base}}/x` has no host to strip, and half a URL
+    /// is not a mistake in the block -- it is a URL whose front end arrives
+    /// from the environment.
+    #[test]
+    fn a_templated_url_still_yields_the_part_that_is_written_down() {
+        let mut r = facts();
+        r.url = "{{base}}/v2/orders?page=2".to_string();
+        let (v, e) = run_sending(r, &[("p", "path()"), ("q", "query()")]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["p"], "/v2/orders");
+        assert_eq!(v["q"], "page=2");
+
+        let mut bare = facts();
+        bare.url = "{{base}}".to_string();
+        let (v, e) = run_sending(bare, &[("p", "path()"), ("q", "query()")]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["p"], "");
+        assert_eq!(v["q"], "");
+    }
+
+    /// The ordering rule, stated as a test: a row reading the request sees the
+    /// rows above it substituted and the rows below it still as `{{name}}`.
+    /// Anything else makes a value depend on a row that depends on it.
+    #[test]
+    fn a_row_reading_the_request_sees_the_rows_above_it_filled_in() {
+        let mut r = facts();
+        r.body = r#"{"first":"{{a}}","second":"{{z}}"}"#.to_string();
+        let (v, e) = run_sending(
+            r,
+            &[
+                ("a", r#"hex("41")"#),
+                ("snapshot", "body()"),
+                ("z", "hex(\"5A\")"),
+            ],
+        );
+        assert!(e.is_empty(), "{e:?}");
+        // `hex` encodes the text "41", i.e. "3431" -- the point is which
+        // rows had run by the time `body()` was asked, not the value itself.
+        assert_eq!(v["snapshot"], r#"{"first":"3431","second":"{{z}}"}"#);
+    }
+
+    /// Without a request -- the editor's live check on a block being typed --
+    /// these say so rather than answering with nothing, because an HMAC over a
+    /// silently empty body is a signature that authorises nothing.
+    #[test]
+    fn a_request_function_with_no_request_behind_it_says_so() {
+        for expr in [
+            "method()",
+            "url()",
+            "path()",
+            "query()",
+            "body()",
+            "request_name()",
+            r#"header("Accept")"#,
+        ] {
+            let (v, e) = run(&[("v", expr)]);
+            assert!(
+                matches!(e.as_slice(), [GenError::NoRequest { .. }]),
+                "{expr} gave {e:?}"
+            );
+            assert!(!v.contains_key("v"), "{expr} still set a value");
+        }
+    }
+
+    /// What the block reads is what Hurl will send: the wire body, without the
+    /// JSON comments the editor keeps, and without header rows the user has
+    /// switched off.
+    #[test]
+    fn the_request_a_block_reads_is_the_one_that_will_be_sent() {
+        let entry = crate::hurl::HurlEntry {
+            title: "Create order".to_string(),
+            method: "POST".to_string(),
+            url: "https://api.example.net/v2/orders".to_string(),
+            headers: vec![
+                crate::hurl::KvRow::new("Accept", "application/json"),
+                crate::hurl::KvRow::toggled("X-Debug", "1", false),
+            ],
+            body_src: Some("{\n  // the id the server assigns\n  \"id\": 7\n}".to_string()),
+            ..Default::default()
+        };
+        let f = RequestFacts::of(&entry);
+        assert_eq!(f.name, "Create order");
+        assert_eq!(f.method, "POST");
+        assert_eq!(
+            f.headers,
+            vec![("Accept".to_string(), "application/json".to_string())],
+            "a switched-off header is not sent, so it is not part of what is signed"
+        );
+        assert!(
+            !f.body.contains("//"),
+            "the block signed the editor's comments, not the bytes on the wire: {:?}",
+            f.body
+        );
+        assert!(f.body.contains("\"id\""), "{:?}", f.body);
+    }
+
     /// The shape real signing takes: a nonce and a timestamp computed here,
     /// then signed, with the signature reading the rows above it.
     #[test]
@@ -1694,7 +2628,7 @@ mod tests {
                 b"s3cr3t",
                 format!("{}:{}", v["nonce"], v["stamp"]).as_bytes(),
             ),
-            true,
+            DigestEncoding::B64,
         );
         assert_eq!(
             v["sig"], expected,
@@ -2100,18 +3034,18 @@ mod tests {
                 f.min_args
             );
             if f.min_args > 0 {
-                let e = call(f.name, &arg(f.min_args - 1), "row", &src)
+                let e = call(f.name, &arg(f.min_args - 1), "row", &HashMap::new(), &src)
                     .expect_err(&format!("{} accepted too few arguments", f.name));
                 assert!(is_arity(&e), "{}: {e:?}", f.name);
             }
             if let Some(max) = f.max_args {
-                let e = call(f.name, &arg(max + 1), "row", &src)
+                let e = call(f.name, &arg(max + 1), "row", &HashMap::new(), &src)
                     .expect_err(&format!("{} accepted too many arguments", f.name));
                 assert!(is_arity(&e), "{}: {e:?}", f.name);
             }
             // The right number may still be the wrong *value* — `date("1")` is
             // a format string that formats nothing — so only arity is asserted.
-            if let Err(e) = call(f.name, &arg(f.min_args), "row", &src) {
+            if let Err(e) = call(f.name, &arg(f.min_args), "row", &HashMap::new(), &src) {
                 assert!(!is_arity(&e), "{} rejected its own arity: {e:?}", f.name);
             }
         }

@@ -2,6 +2,8 @@
 //! - [`entry`]: the `HurlEntry` request model + Hurl-text serializer.
 //! - [`json_comments`]: strip `//` and `/* */` comments from a JSON body, so a
 //!   body can be authored with notes but written out as strict JSON.
+//! - [`json_format`]: re-indent a JSON body without parsing it, so comments,
+//!   templates, numbers and key order survive being prettified.
 //! - [`parser`]: parse Hurl text into `HurlEntry` values.
 //! - [`run`]: execute + evaluate via the `hurl` runner (`[Captures]`/`[Asserts]`).
 //! - [`stage`]: copy out-of-scope `[Form]`/`[Multipart]` files next to the
@@ -9,6 +11,7 @@
 
 mod entry;
 pub mod json_comments;
+pub mod json_format;
 mod parser;
 pub mod run;
 mod stage;
@@ -23,8 +26,9 @@ pub use entry::{
 // the block exactly as the parser does rather than by their own guess at it.
 pub(crate) use entry::{parse_gen_marker, parse_gen_row};
 pub(crate) use parser::parse_file_form_value;
-pub use parser::{parse_hurl, parse_hurl_error};
+pub use parser::{parse_hurl, parse_hurl_error, parse_hurl_error_from};
 pub use run::{
-    AssertOutcome, EntryOutcome, EntrySetup, RunOutput, run_hurl, run_hurl_streaming_with,
+    AssertOutcome, EntryOutcome, EntrySetup, RetryLimit, RunOutput, run_hurl,
+    run_hurl_streaming_with,
 };
 pub use stage::{expand_base64_form_fields, stage_out_of_scope_form_files};

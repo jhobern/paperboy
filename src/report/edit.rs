@@ -419,7 +419,9 @@ pub(crate) fn insert_pos_after(rows: &[NodeRow], sel: usize) -> InsertPos {
 
 fn loop_body(node: &FlowNode) -> Option<&Vec<FlowNode>> {
     match node {
-        FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => Some(body),
+        FlowNode::ForEach { body, .. }
+        | FlowNode::ForEnvs { body, .. }
+        | FlowNode::Graph { body, .. } => Some(body),
         _ => None,
     }
 }
@@ -674,6 +676,7 @@ pub(crate) fn request_node(name: &str, report: bool) -> FlowNode {
         FlowNode::Report(ReportStmt::Request {
             name: name.to_string(),
             alias: None,
+            depends: Vec::new(),
             using: Vec::new(),
             response_fmt: None,
             show: Vec::new(),
@@ -683,6 +686,8 @@ pub(crate) fn request_node(name: &str, report: bool) -> FlowNode {
     } else {
         FlowNode::Request {
             name: name.to_string(),
+            alias: None,
+            depends: Vec::new(),
             using: Vec::new(),
         }
     }
@@ -1017,7 +1022,9 @@ pub(crate) fn reported_requests(body: &[FlowNode]) -> Vec<String> {
                 // A bare `REQUEST x` sends but emits nothing, so it has no
                 // fields to offer; only `REPORT REQUEST x` does.
                 FlowNode::Report(ReportStmt::Request { name, .. }) => out.push(name.clone()),
-                FlowNode::ForEnvs { body, .. } | FlowNode::ForEach { body, .. } => walk(body, out),
+                FlowNode::ForEnvs { body, .. }
+                | FlowNode::ForEach { body, .. }
+                | FlowNode::Graph { body, .. } => walk(body, out),
                 _ => {}
             }
         }
@@ -1045,13 +1052,28 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
     }
     match m {
         Modifier::Report => {
-            if let FlowNode::Request { name, using } = node {
+            if let FlowNode::Request {
+                name,
+                alias,
+                depends,
+                using,
+            } = node
+            {
                 let name = std::mem::take(name);
+                // The step name survives the upgrade too: it is this
+                // statement's identity, not a property of being reported, and
+                // dropping it would silently rename the step.
+                let alias = alias.take();
+                // The declared edges belong to the step, which is the same step
+                // before and after: reporting it changes what comes out, never
+                // when it runs.
+                let depends = std::mem::take(depends);
                 // See `CarriedMod::attach_to`: the clause belongs to the send.
                 let using = std::mem::take(using);
                 *node = FlowNode::Report(ReportStmt::Request {
                     name,
-                    alias: None,
+                    alias,
+                    depends,
                     using,
                     response_fmt: None,
                     show: Vec::new(),
@@ -2036,15 +2058,28 @@ impl CarriedMod {
         }
         match self {
             CarriedMod::Report => {
-                if let FlowNode::Request { name, using } = node {
+                if let FlowNode::Request {
+                    name,
+                    alias,
+                    depends,
+                    using,
+                } = node
+                {
                     let name = std::mem::take(name);
+                    // The step name is this statement's identity and survives
+                    // the upgrade with it.
+                    let alias = alias.take();
+                    // Declared edges say when the step runs, which the upgrade
+                    // does not touch.
+                    let depends = std::mem::take(depends);
                     // `USING` describes the *send*, which survives the upgrade
                     // to a reported one — dropping it here would silently
                     // discard a required-parameter check.
                     let using = std::mem::take(using);
                     *node = FlowNode::Report(ReportStmt::Request {
                         name,
-                        alias: None,
+                        alias,
+                        depends,
                         using,
                         response_fmt: None,
                         show: Vec::new(),
@@ -2165,14 +2200,29 @@ pub(crate) fn transfer_modifier(
 
 /// The body of [`detach_modifier`], on an already-resolved node. Returns `true`
 /// when nothing coherent is left and the caller should remove the row.
-fn detach_from_node(node: &mut FlowNode, which: DetachWhich) -> bool {
+pub(crate) fn detach_from_node(node: &mut FlowNode, which: DetachWhich) -> bool {
     match which {
         DetachWhich::Report => match node {
             // A reported request keeps sending: downgrade to a plain REQUEST.
-            FlowNode::Report(ReportStmt::Request { name, using, .. }) => {
+            FlowNode::Report(ReportStmt::Request {
+                name,
+                alias,
+                depends,
+                using,
+                ..
+            }) => {
                 let name = std::mem::take(name);
+                // The step name is identity, not a reporting option, so it
+                // survives the downgrade with the send it names.
+                let alias = alias.take();
+                let depends = std::mem::take(depends);
                 let using = std::mem::take(using);
-                *node = FlowNode::Request { name, using };
+                *node = FlowNode::Request {
+                    name,
+                    alias,
+                    depends,
+                    using,
+                };
                 false
             }
             // A reported variable/computed column has nothing left without

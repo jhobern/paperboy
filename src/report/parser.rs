@@ -2,7 +2,6 @@
 //! grammar. The full grammar is documented in the block comment below.
 
 use nom::{
-    IResult,
     branch::alt,
     bytes::complete::{take_while, take_while1},
     character::complete::{char, multispace0, multispace1, not_line_ending, satisfy},
@@ -54,7 +53,7 @@ param-decl   := 'PARAM' [ param-kind ] IDENT [ '=' value ] [ 'LABEL' name ]
 param-kind   := 'TEXT' | 'NUMBER' | 'ENV' | 'FOLDER' | 'FILE'
               | 'CHOICE' '(' [ name (',' name)* ] ')'
 
-request      := 'REQUEST' name
+request      := 'REQUEST' name [ 'AS' name ] [ using ]
 report       := 'REPORT' report-target
 report-target:= 'REQUEST' name [ 'AS' name ] [ response-fmt ] [ show ] [ hide ] [ with-block ]
               | IDENT 'AS' name                          # renamed variable column
@@ -71,6 +70,8 @@ field-def    := name ':' hurl-query                    # full Hurl query + filte
 
 for-each     := [ parallel ] 'FOR' pattern 'IN' producer statement* 'END'
 for-envs     := [ parallel ] 'FOR' IDENT 'IN' 'ENVS' env-clause statement* 'END'
+graph        := [ parallel ] 'GRAPH' [ IDENT ] graph-stmt* 'END'
+graph-stmt   := request | report               # enforced by validation, not here
 parallel     := 'PARALLEL' [ '(' UINT ')' ]            # concurrent iterations
 end          := 'END'                                  # closes the nearest FOR
 
@@ -115,10 +116,53 @@ name         := string | bareword
 // `IDENT = value` assignment, and a `WITH` field query — which stop at the
 // newline via `not_line_ending`.
 
+/// The parser's error type. nom's own carries only an `ErrorKind`, which turns
+/// every hard rejection into the same "parse error" — useless for the cases
+/// where we know exactly what is wrong and can say so (`USING` written twice,
+/// `SHOW` on a `COMPARISON`, a `GRAPH` closed on its opening line). `msg` is
+/// that explanation, and is set only on `nom::Err::Failure`: a recoverable
+/// error is just one branch of an `alt` not matching, which is never worth
+/// reporting.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PErr<'a> {
+    input: &'a str,
+    msg: Option<&'static str>,
+}
+
+impl<'a> nom::error::ParseError<&'a str> for PErr<'a> {
+    fn from_error_kind(input: &'a str, _: nom::error::ErrorKind) -> Self {
+        PErr { input, msg: None }
+    }
+
+    // Keep the innermost error: it is the one that knows what went wrong, and
+    // the only one that can be carrying a message.
+    fn append(_: &'a str, _: nom::error::ErrorKind, other: Self) -> Self {
+        other
+    }
+}
+
+/// `nom::IResult` with our error type, keeping the two-parameter shape every
+/// signature in this file is written against.
+type IResult<'a, O> = nom::IResult<&'a str, O, PErr<'a>>;
+
 /// A recoverable error at `i` (position is only used to point re-parse/leftover
 /// checks at the offending text).
-fn perr(i: &str) -> nom::Err<nom::error::Error<&str>> {
-    nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::Verify))
+fn perr(i: &str) -> nom::Err<PErr<'_>> {
+    nom::Err::Error(PErr {
+        input: i,
+        msg: None,
+    })
+}
+
+/// An unrecoverable error at `i`, carrying the reason. `Failure` stops the
+/// surrounding `alt` dead, which is the point: the input plainly *was* this
+/// construct, so falling through to try the next one would report the mistake
+/// somewhere else entirely.
+fn pfail<'a>(i: &'a str, msg: &'static str) -> nom::Err<PErr<'a>> {
+    nom::Err::Failure(PErr {
+        input: i,
+        msg: Some(msg),
+    })
 }
 
 /// `[A-Za-z_][A-Za-z0-9_]*` — the identifier predicate, used for header keys,
@@ -135,7 +179,7 @@ pub(crate) fn is_ident(s: &str) -> bool {
 
 /// A bareword token: everything up to whitespace or one of `()[],="` (so it may
 /// contain `/`, `.`, `*`, `...`, etc). Skips leading whitespace first.
-fn word(i: &str) -> IResult<&str, &str> {
+fn word(i: &str) -> IResult<'_, &str> {
     preceded(
         multispace0,
         take_while1(|c: char| !c.is_whitespace() && !"()[],=\"".contains(c)),
@@ -144,7 +188,7 @@ fn word(i: &str) -> IResult<&str, &str> {
 
 /// Match a specific keyword as a *whole* bareword (case-insensitive), so `FOR`
 /// doesn't shadow `FORMAT`.
-fn kw<'a>(k: &'static str) -> impl FnMut(&'a str) -> IResult<&'a str, ()> {
+fn kw<'a>(k: &'static str) -> impl FnMut(&'a str) -> IResult<'a, ()> {
     move |i| {
         let (rest, w) = word(i)?;
         if w.eq_ignore_ascii_case(k) {
@@ -156,12 +200,12 @@ fn kw<'a>(k: &'static str) -> impl FnMut(&'a str) -> IResult<&'a str, ()> {
 }
 
 /// A single punctuation char, skipping leading whitespace.
-fn sym<'a>(c: char) -> impl FnMut(&'a str) -> IResult<&'a str, char> {
+fn sym<'a>(c: char) -> impl FnMut(&'a str) -> IResult<'a, char> {
     move |i| preceded(multispace0, char(c))(i)
 }
 
 /// An identifier (`is_ident`), skipping leading whitespace, returned owned.
-fn ident(i: &str) -> IResult<&str, String> {
+fn ident(i: &str) -> IResult<'_, String> {
     let (i, _) = multispace0(i)?;
     let (rest, s) = recognize(pair(
         satisfy(|c| c.is_ascii_alphabetic() || c == '_'),
@@ -172,7 +216,7 @@ fn ident(i: &str) -> IResult<&str, String> {
 
 /// A double-quoted string with `\"`/`\\` escapes (any other `\x` keeps the
 /// backslash). Skips leading whitespace.
-fn string_lit(input: &str) -> IResult<&str, String> {
+fn string_lit(input: &str) -> IResult<'_, String> {
     let (input, _) = multispace0(input)?;
     let (body, _) = char('"')(input)?;
     let mut out = String::new();
@@ -196,15 +240,15 @@ fn string_lit(input: &str) -> IResult<&str, String> {
 }
 
 /// A list element / name: a quoted string or a bareword.
-fn str_or_word(i: &str) -> IResult<&str, String> {
+fn str_or_word(i: &str) -> IResult<'_, String> {
     alt((string_lit, map(word, str::to_string)))(i)
 }
 
 /// A parenthesised, comma-separated list of one-or-more `inner` — the shape
 /// shared by `(a, b)` tuples, `SHOW(...)`, `ZIP(...)`, `REPORT (...)`, roles, …
-fn paren_list1<'a, O, F>(inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, Vec<O>>
+fn paren_list1<'a, O, F>(inner: F) -> impl FnMut(&'a str) -> IResult<'a, Vec<O>>
 where
-    F: FnMut(&'a str) -> IResult<&'a str, O>,
+    F: FnMut(&'a str) -> IResult<'a, O>,
 {
     delimited(sym('('), separated_list1(sym(','), inner), sym(')'))
 }
@@ -216,7 +260,7 @@ where
 /// A whole-line `#` comment kept as a node, so that commenting a block out in
 /// the source doesn't destroy it the next time the editors re-serialize the
 /// flow. The text is stored exactly as written after the `#`.
-fn comment_node(i: &str) -> IResult<&str, FlowNode> {
+fn comment_node(i: &str) -> IResult<'_, FlowNode> {
     map(preceded(char('#'), not_line_ending), |text: &str| {
         FlowNode::Comment(text.to_string())
     })(i)
@@ -224,7 +268,7 @@ fn comment_node(i: &str) -> IResult<&str, FlowNode> {
 
 /// A statement or a comment. Bodies parse with this rather than `node` so a
 /// comment keeps its position among the statements around it.
-fn node_or_comment(i: &str) -> IResult<&str, FlowNode> {
+fn node_or_comment(i: &str) -> IResult<'_, FlowNode> {
     alt((comment_node, node))(i)
 }
 
@@ -232,7 +276,7 @@ fn node_or_comment(i: &str) -> IResult<&str, FlowNode> {
 /// where a comment has nowhere to live (by `opens_block`, which is a lookahead
 /// and keeps nothing); statement bodies use `multispace0` + `node_or_comment`,
 /// and `WITH` blocks `multispace0` + `with_item_or_comment`.
-fn trivia(i: &str) -> IResult<&str, ()> {
+fn trivia(i: &str) -> IResult<'_, ()> {
     value(
         (),
         many0(alt((
@@ -246,13 +290,13 @@ fn trivia(i: &str) -> IResult<&str, ()> {
 // Header
 // ---------------------------------------------------------------------------
 
-fn parse_headers(i: &str) -> IResult<&str, Header> {
+fn parse_headers(i: &str) -> IResult<'_, Header> {
     map(many0(header_line), |lines| Header { lines })(i)
 }
 
 /// One leading `# …` line, classified into a `key: value` directive (when the
 /// key is an identifier) or a free comment.
-fn header_line(i: &str) -> IResult<&str, HeaderLine> {
+fn header_line(i: &str) -> IResult<'_, HeaderLine> {
     let (i, _) = multispace0(i)?;
     let (i, _) = char('#')(i)?;
     let (i, verbatim) = not_line_ending(i)?;
@@ -274,12 +318,14 @@ fn header_line(i: &str) -> IResult<&str, HeaderLine> {
 // Statements
 // ---------------------------------------------------------------------------
 
-fn node(i: &str) -> IResult<&str, FlowNode> {
-    alt((for_stmt, list_decl, param_decl, request, report, assign))(i)
+fn node(i: &str) -> IResult<'_, FlowNode> {
+    alt((
+        for_stmt, graph_stmt, list_decl, param_decl, cleanup, request, report, assign,
+    ))(i)
 }
 
 /// `IDENT = <rest of line>` — value is untokenized (may contain `=`, `&`, …).
-fn assign(i: &str) -> IResult<&str, FlowNode> {
+fn assign(i: &str) -> IResult<'_, FlowNode> {
     map(
         separated_pair(ident, sym('='), not_line_ending),
         |(key, value)| FlowNode::Assign {
@@ -289,7 +335,7 @@ fn assign(i: &str) -> IResult<&str, FlowNode> {
     )(i)
 }
 
-fn list_decl(i: &str) -> IResult<&str, FlowNode> {
+fn list_decl(i: &str) -> IResult<'_, FlowNode> {
     map(
         preceded(kw("LIST"), separated_pair(ident, sym('='), producer)),
         |(name, producer)| FlowNode::ListDecl { name, producer },
@@ -303,7 +349,7 @@ fn list_decl(i: &str) -> IResult<&str, FlowNode> {
 /// `PARAM TEXT NAME = "x"` is a text parameter named `NAME`. So a leading kind
 /// word is only consumed when an identifier follows it — otherwise the word is
 /// the parameter's own name.
-fn param_decl(i: &str) -> IResult<&str, FlowNode> {
+fn param_decl(i: &str) -> IResult<'_, FlowNode> {
     let (i, _) = kw("PARAM")(i)?;
     // `peek(ident)` after the kind is what disambiguates: without a name
     // following, the word we just read was the name itself.
@@ -324,7 +370,7 @@ fn param_decl(i: &str) -> IResult<&str, FlowNode> {
 }
 
 /// `TEXT | NUMBER | ENV | FOLDER | FILE | CHOICE(a, b, …)`.
-fn param_kind(i: &str) -> IResult<&str, ParamKind> {
+fn param_kind(i: &str) -> IResult<'_, ParamKind> {
     alt((
         map(
             preceded(kw("CHOICE"), paren_list1(str_or_word)),
@@ -344,15 +390,177 @@ fn param_kind(i: &str) -> IResult<&str, ParamKind> {
     ))(i)
 }
 
-fn request(i: &str) -> IResult<&str, FlowNode> {
+fn request(i: &str) -> IResult<'_, FlowNode> {
     let (i, _) = kw("REQUEST")(i)?;
     let (i, name) = str_or_word(i)?;
-    let (i, using) = map(opt(using_clause), Option::unwrap_or_default)(i)?;
-    Ok((i, FlowNode::Request { name, using }))
+    let (i, c) = step_clauses(i, false)?;
+    Ok((
+        i,
+        FlowNode::Request {
+            name,
+            alias: c.alias,
+            depends: c.depends,
+            using: c.using,
+        },
+    ))
+}
+
+/// The clauses a step may carry, however they were written.
+#[derive(Default)]
+struct StepClauses {
+    alias: Option<String>,
+    depends: Vec<String>,
+    using: Vec<UsingItem>,
+    response_fmt: Option<ResponseFmt>,
+    show: Vec<ShowField>,
+    hide: Vec<String>,
+}
+
+/// Which clause a parse just consumed, so the loop can refuse a second one.
+#[derive(Clone, Copy, PartialEq)]
+enum ClauseKind {
+    As,
+    Depends,
+    Using,
+    Response,
+    Show,
+    Hide,
+}
+
+impl ClauseKind {
+    /// The message a repeat earns. Naming the clause is the whole point: "parse
+    /// error" on a line carrying five clauses is no help at all.
+    fn twice(self) -> &'static str {
+        match self {
+            ClauseKind::As => "AS is written twice on this step",
+            ClauseKind::Depends => "DEPENDS is written twice on this step",
+            ClauseKind::Using => "USING is written twice on this step",
+            ClauseKind::Response => "RESPONSE is written twice on this step",
+            ClauseKind::Show => "SHOW is written twice on this step",
+            ClauseKind::Hide => "HIDE is written twice on this step",
+        }
+    }
+}
+
+/// A step's clauses, in any order, optionally with a trailing parenthesised
+/// group that may span lines.
+///
+/// Order is free on input because there is no order that is right for every
+/// reader: `AS` names the step, `USING` describes the send, `DEPENDS` places it
+/// in the graph, and which of those you want to see first depends on what you
+/// are reading for. The serializer emits one canonical order, so a file
+/// normalises the moment it is saved and a diff never turns on clause order.
+///
+/// `reported` gates the three clauses that only mean something on a
+/// `REPORT REQUEST`: a plain `REQUEST` emits no columns, so `RESPONSE`, `SHOW`
+/// and `HIDE` have nothing to act on and are better refused than ignored.
+fn step_clauses(i: &str, reported: bool) -> IResult<'_, StepClauses> {
+    let mut out = StepClauses::default();
+    let mut seen: Vec<ClauseKind> = Vec::new();
+    let mut i = parse_clause_run(i, reported, &mut out, &mut seen)?;
+
+    // The group opens on the statement's own line. Requiring that is what makes
+    // a bare `(` unambiguous: the next statement may well start with one —
+    // `REPORT (a, b)` — and without the same-line rule a group would reach down
+    // and swallow it.
+    if let Ok((rest, _)) = same_line_char('(')(i) {
+        i = parse_clause_run(rest, reported, &mut out, &mut seen)?;
+        let (rest, _) = sym(')')(i).map_err(|_| {
+            pfail(
+                i,
+                "expected a step clause or a closing ')' in this clause group",
+            )
+        })?;
+        i = rest;
+        // `step-clause* [ clause-group ]`: one group, at the end. A second one
+        // would be two lists of the same thing with nothing to distinguish
+        // them, and every clause is already single-use anyway.
+        if let Ok((_, _)) = same_line_char('(')(i) {
+            return Err(pfail(i, "a step may carry only one clause group"));
+        }
+    }
+    Ok((i, out))
+}
+
+/// Consume clauses until one doesn't match, folding each into `out`.
+fn parse_clause_run<'a>(
+    mut i: &'a str,
+    reported: bool,
+    out: &mut StepClauses,
+    seen: &mut Vec<ClauseKind>,
+) -> Result<&'a str, nom::Err<PErr<'a>>> {
+    loop {
+        let before = i;
+        let kind = if let Ok((rest, alias)) = preceded(kw("AS"), str_or_word)(i) {
+            out.alias = Some(alias);
+            i = rest;
+            ClauseKind::As
+        } else if let Ok((rest, names)) = depends_clause(i) {
+            out.depends = names;
+            i = rest;
+            ClauseKind::Depends
+        } else if let Ok((rest, items)) = using_clause(i) {
+            out.using = items;
+            i = rest;
+            ClauseKind::Using
+        } else if reported && let Ok((rest, fmt)) = preceded(kw("RESPONSE"), resp_fmt)(i) {
+            out.response_fmt = Some(fmt);
+            i = rest;
+            ClauseKind::Response
+        } else if reported && let Ok((rest, fields)) = show_clause(i) {
+            out.show = fields;
+            i = rest;
+            ClauseKind::Show
+        } else if reported && let Ok((rest, fields)) = hide_clause(i) {
+            out.hide = fields;
+            i = rest;
+            ClauseKind::Hide
+        } else {
+            return Ok(i);
+        };
+        if seen.contains(&kind) {
+            return Err(pfail(before, kind.twice()));
+        }
+        seen.push(kind);
+    }
+}
+
+/// `DEPENDS a, b, c` — a bare comma-separated list of step names.
+///
+/// No parentheses and no second keyword: the clause names the steps this one
+/// runs after, and a list is all that takes.
+fn depends_clause(i: &str) -> IResult<'_, Vec<String>> {
+    preceded(kw("DEPENDS"), separated_list1(sym(','), ident))(i)
+}
+
+/// A single character that must appear on the *current* line: skips spaces and
+/// tabs but not newlines. See [`same_line_ident`] for why that matters.
+fn same_line_char<'a>(c: char) -> impl FnMut(&'a str) -> IResult<'a, char> {
+    move |i| preceded(take_while(|x: char| x == ' ' || x == '\t'), char(c))(i)
+}
+
+/// `CLEANUP <name> [AS <step>] [DEPENDS …] [USING(…)]`.
+///
+/// Takes the same clauses a plain `REQUEST` does, group and all: a cleanup is
+/// an ordinary step that happens to be deferred, and giving it its own
+/// narrower clause syntax would only mean remembering two rules.
+fn cleanup(i: &str) -> IResult<'_, FlowNode> {
+    let (i, _) = kw("CLEANUP")(i)?;
+    let (i, name) = str_or_word(i)?;
+    let (i, c) = step_clauses(i, false)?;
+    Ok((
+        i,
+        FlowNode::Cleanup {
+            name,
+            alias: c.alias,
+            depends: c.depends,
+            using: c.using,
+        },
+    ))
 }
 
 /// `[PARALLEL[(n)]] FOR <pattern> IN (ENVS <clause> | <producer>) … END`.
-fn for_stmt(i: &str) -> IResult<&str, FlowNode> {
+fn for_stmt(i: &str) -> IResult<'_, FlowNode> {
     let (i, parallel) = opt(parallel_prefix)(i)?;
     let (i, _) = kw("FOR")(i)?;
     let (i, pat) = pattern(i)?;
@@ -390,8 +598,49 @@ fn for_stmt(i: &str) -> IResult<&str, FlowNode> {
     }
 }
 
+/// `[PARALLEL[(n)]] GRAPH [<name>] … END`.
+fn graph_stmt(i: &str) -> IResult<'_, FlowNode> {
+    let (i, parallel) = opt(parallel_prefix)(i)?;
+    let (i, _) = kw("GRAPH")(i)?;
+    let (i, name) = opt(same_line_ident)(i)?;
+    // `GRAPH END` on one line would otherwise name the region `END` and then
+    // run off the end of the file looking for a terminator.
+    if name
+        .as_deref()
+        .is_some_and(|n| n.eq_ignore_ascii_case("END"))
+    {
+        return Err(perr(i));
+    }
+    let (i, body) = block_body(i)?;
+    Ok((
+        i,
+        FlowNode::Graph {
+            name,
+            body,
+            parallel,
+        },
+    ))
+}
+
+/// An identifier on the *current* line — spaces and tabs are skipped, a newline
+/// is not.
+///
+/// The region name is optional and the body starts on the next line, so a
+/// newline-crossing parser would read `GRAPH\n    REQUEST oauth2` as a region
+/// named `REQUEST`. Everywhere else in the grammar an optional argument is
+/// introduced by its own keyword, so this is the one place the distinction
+/// between "whitespace" and "end of line" carries meaning.
+fn same_line_ident(i: &str) -> IResult<'_, String> {
+    let (i, _) = take_while(|c| c == ' ' || c == '\t')(i)?;
+    let (rest, s) = recognize(pair(
+        satisfy(|c: char| c.is_ascii_alphabetic() || c == '_'),
+        take_while(|c: char| c.is_ascii_alphanumeric() || c == '_'),
+    ))(i)?;
+    Ok((rest, s.to_string()))
+}
+
 /// `PARALLEL` / `PARALLEL(n)` (n ≥ 1).
-fn parallel_prefix(i: &str) -> IResult<&str, ParallelSpec> {
+fn parallel_prefix(i: &str) -> IResult<'_, ParallelSpec> {
     let (i, _) = kw("PARALLEL")(i)?;
     let (i, degree) = opt(delimited(
         sym('('),
@@ -405,7 +654,7 @@ fn parallel_prefix(i: &str) -> IResult<&str, ParallelSpec> {
 }
 
 /// The statements up to (and consuming) the matching `END`.
-fn block_body(i: &str) -> IResult<&str, Vec<FlowNode>> {
+fn block_body(i: &str) -> IResult<'_, Vec<FlowNode>> {
     let (i, nodes) = many0(preceded(multispace0, node_or_comment))(i)?;
     let (i, _) = preceded(trivia, kw("END"))(i)?;
     Ok((i, nodes))
@@ -415,7 +664,7 @@ fn block_body(i: &str) -> IResult<&str, Vec<FlowNode>> {
 // REPORT
 // ---------------------------------------------------------------------------
 
-fn report(i: &str) -> IResult<&str, FlowNode> {
+fn report(i: &str) -> IResult<'_, FlowNode> {
     map(
         preceded(
             kw("REPORT"),
@@ -425,43 +674,35 @@ fn report(i: &str) -> IResult<&str, FlowNode> {
     )(i)
 }
 
-fn report_request(i: &str) -> IResult<&str, ReportStmt> {
+fn report_request(i: &str) -> IResult<'_, ReportStmt> {
     let (i, _) = kw("REQUEST")(i)?;
     let (i, name) = str_or_word(i)?;
-    // `USING(…)` is accepted on either side of `AS`. It is written both ways in
-    // the wild — the clause belongs to the *send* and the alias to the
-    // *column*, so neither order is obviously the wrong one to reach for — and
-    // rejecting one of them turns a reading of the line into a syntax error.
-    // The serialiser still emits one order, so a file normalises on save.
-    let (i, using_first) = map(opt(using_clause), Option::unwrap_or_default)(i)?;
-    let (i, alias) = opt(preceded(kw("AS"), str_or_word))(i)?;
-    let (i, using_last) = map(opt(using_clause), Option::unwrap_or_default)(i)?;
-    let using: Vec<UsingItem> = using_first.into_iter().chain(using_last).collect();
-    let (i, response_fmt) = opt(preceded(kw("RESPONSE"), resp_fmt))(i)?;
-    let (i, show) = map(opt(show_clause), Option::unwrap_or_default)(i)?;
-    let (i, hide) = map(opt(hide_clause), Option::unwrap_or_default)(i)?;
+    let (i, c) = step_clauses(i, true)?;
+    // `WITH` is not a step clause: it opens a block rather than taking an
+    // argument, so it can only be last and cannot sit inside the group.
     let (i, with) = map(opt(with_block), Option::unwrap_or_default)(i)?;
     Ok((
         i,
         ReportStmt::Request {
             name,
-            alias,
-            using,
-            response_fmt,
-            show,
-            hide,
+            alias: c.alias,
+            depends: c.depends,
+            using: c.using,
+            response_fmt: c.response_fmt,
+            show: c.show,
+            hide: c.hide,
             with,
         },
     ))
 }
 
 /// `REPORT (v1, v2, …)`.
-fn report_vars(i: &str) -> IResult<&str, ReportStmt> {
+fn report_vars(i: &str) -> IResult<'_, ReportStmt> {
     map(paren_list1(ident), ReportStmt::Vars)(i)
 }
 
 /// `REPORT "<template>" AS <name> [STATISTICS(…)] [IMAGE[(…)]]`.
-fn report_computed(i: &str) -> IResult<&str, ReportStmt> {
+fn report_computed(i: &str) -> IResult<'_, ReportStmt> {
     let (i, template) = string_lit(i)?;
     let (i, name) = preceded(kw("AS"), str_or_word)(i)?;
     let (i, clauses) = column_clauses(i)?;
@@ -483,7 +724,7 @@ fn report_computed(i: &str) -> IResult<&str, ReportStmt> {
 /// `report_computed`'s quoted string) is what marks this as a *variable*
 /// reference rather than a literal template. `STATISTICS(…)` without an explicit
 /// `AS` uses the variable name as the column header.
-fn report_single(i: &str) -> IResult<&str, ReportStmt> {
+fn report_single(i: &str) -> IResult<'_, ReportStmt> {
     let (i, var) = ident(i)?;
     let (i, alias) = opt(preceded(kw("AS"), str_or_word))(i)?;
     let (
@@ -530,7 +771,7 @@ fn report_single(i: &str) -> IResult<&str, ReportStmt> {
 
 /// The optional trailing column clauses -- `STATISTICS(…)`, `IMAGE[(…)]` and
 /// `TRUTH "…"` -- in any order, since none is more natural than another.
-fn column_clauses(i: &str) -> IResult<&str, ColumnClauses> {
+fn column_clauses(i: &str) -> IResult<'_, ColumnClauses> {
     let mut out = ColumnClauses::default();
     let mut rest = i;
     loop {
@@ -567,7 +808,7 @@ fn column_clauses(i: &str) -> IResult<&str, ColumnClauses> {
 /// `DETAIL` -- the placement flag that moves a column out of the table and into
 /// its row's drill-down. A bare keyword: it says *where* the column goes, and
 /// there is only one other place for it to be.
-fn detail_clause(i: &str) -> IResult<&str, ()> {
+fn detail_clause(i: &str) -> IResult<'_, ()> {
     let (i, _) = kw("DETAIL")(i)?;
     Ok((i, ()))
 }
@@ -575,13 +816,13 @@ fn detail_clause(i: &str) -> IResult<&str, ()> {
 /// `TRUTH "<template>"` -- the column's expected value, interpolated per row.
 /// The argument is a mandatory string literal (see
 /// [`crate::report::model::split_truth`] for why it may not be bare).
-fn truth_clause(i: &str) -> IResult<&str, String> {
+fn truth_clause(i: &str) -> IResult<'_, String> {
     preceded(kw("TRUTH"), string_lit)(i)
 }
 
 /// `IMAGE` / `IMAGE(HEIGHT n | WIDTH n | FIT, …)` -- the render hint that makes
 /// a column's value be drawn as a picture by writers that can show one.
-fn image_clause(i: &str) -> IResult<&str, ImageSpec> {
+fn image_clause(i: &str) -> IResult<'_, ImageSpec> {
     let (i, _) = kw("IMAGE")(i)?;
     let (i, opts) = opt(paren_list1(image_opt))(i)?;
     let mut spec = ImageSpec::default();
@@ -602,7 +843,7 @@ enum ImageOpt {
     Fit,
 }
 
-fn image_opt(i: &str) -> IResult<&str, ImageOpt> {
+fn image_opt(i: &str) -> IResult<'_, ImageOpt> {
     let px = preceded(multispace0, nom::character::complete::u32);
     alt((
         value(ImageOpt::Fit, kw("FIT")),
@@ -624,12 +865,12 @@ fn image_opt(i: &str) -> IResult<&str, ImageOpt> {
 }
 
 /// `STATISTICS(stat, …)` — the summary-statistics clause on a `REPORT … AS …`.
-fn statistics_clause(i: &str) -> IResult<&str, Vec<StatKind>> {
+fn statistics_clause(i: &str) -> IResult<'_, Vec<StatKind>> {
     preceded(kw("STATISTICS"), paren_list1(stat_kind))(i)
 }
 
 /// One statistic keyword inside a `STATISTICS(…)` clause.
-fn stat_kind(i: &str) -> IResult<&str, StatKind> {
+fn stat_kind(i: &str) -> IResult<'_, StatKind> {
     let (rest, w) = str_or_word(i)?;
     match StatKind::parse(&w) {
         Some(k) => Ok((rest, k)),
@@ -637,7 +878,7 @@ fn stat_kind(i: &str) -> IResult<&str, StatKind> {
     }
 }
 
-fn resp_fmt(i: &str) -> IResult<&str, ResponseFmt> {
+fn resp_fmt(i: &str) -> IResult<'_, ResponseFmt> {
     alt((
         value(ResponseFmt::Raw, kw("RAW")),
         value(ResponseFmt::Pretty, kw("PRETTY")),
@@ -647,12 +888,12 @@ fn resp_fmt(i: &str) -> IResult<&str, ResponseFmt> {
 /// `SHOW(a, b STATISTICS(MEAN), …)` — at least one field (empty is a parse
 /// error). Each field may carry its own `STATISTICS(…)`, which summarises the
 /// column that field produces.
-fn show_clause(i: &str) -> IResult<&str, Vec<ShowField>> {
+fn show_clause(i: &str) -> IResult<'_, Vec<ShowField>> {
     preceded(kw("SHOW"), paren_list1(show_field))(i)
 }
 
 /// One `SHOW(…)` field: a name and an optional `STATISTICS(…)` clause.
-fn show_field(i: &str) -> IResult<&str, ShowField> {
+fn show_field(i: &str) -> IResult<'_, ShowField> {
     let (i, field) = ident(i)?;
     let (i, stats) = opt(statistics_clause)(i)?;
     Ok((
@@ -670,7 +911,7 @@ fn show_field(i: &str) -> IResult<&str, ShowField> {
 /// Parenthesised and comma-separated like `SHOW(…)`/`HIDE(…)` rather than
 /// introducing a second block form: the common case is one identifier
 /// (`USING(FILE)`) and it should cost one glance, not three lines.
-fn using_clause(i: &str) -> IResult<&str, Vec<UsingItem>> {
+fn using_clause(i: &str) -> IResult<'_, Vec<UsingItem>> {
     preceded(kw("USING"), paren_list1(using_item))(i)
 }
 
@@ -678,7 +919,7 @@ fn using_clause(i: &str) -> IResult<&str, Vec<UsingItem>> {
 ///
 /// The two forms are told apart by the `=`, which leaves room for the override
 /// syntax to grow without ever making `USING(FILE)` ambiguous.
-fn using_item(i: &str) -> IResult<&str, UsingItem> {
+fn using_item(i: &str) -> IResult<'_, UsingItem> {
     let (rest, path) = word(i)?;
     match opt(preceded(sym('='), string_lit))(rest)? {
         (rest, Some(value)) => {
@@ -694,7 +935,7 @@ fn using_item(i: &str) -> IResult<&str, UsingItem> {
 }
 
 /// `HIDE(a, b, …)` — at least one field (empty is a parse error).
-fn hide_clause(i: &str) -> IResult<&str, Vec<String>> {
+fn hide_clause(i: &str) -> IResult<'_, Vec<String>> {
     preceded(kw("HIDE"), paren_list1(ident))(i)
 }
 
@@ -704,7 +945,7 @@ fn hide_clause(i: &str) -> IResult<&str, Vec<String>> {
 /// `trivia`, so a comment inside the block keeps its place among the fields
 /// instead of being skipped as whitespace — commenting a field out and then
 /// editing the request elsewhere must not delete the commented line.
-fn with_block(i: &str) -> IResult<&str, Vec<WithItem>> {
+fn with_block(i: &str) -> IResult<'_, Vec<WithItem>> {
     let (i, _) = kw("WITH")(i)?;
     let (i, items) = many0(preceded(multispace0, with_item_or_comment))(i)?;
     let (i, _) = preceded(multispace0, kw("END"))(i)?;
@@ -714,17 +955,17 @@ fn with_block(i: &str) -> IResult<&str, Vec<WithItem>> {
 /// A `WITH` item or a whole-line comment between items. Comments are tried
 /// first: a `#` can't start any real item, and a field would otherwise swallow
 /// the line as a name.
-fn with_item_or_comment(i: &str) -> IResult<&str, WithItem> {
+fn with_item_or_comment(i: &str) -> IResult<'_, WithItem> {
     alt((with_comment, with_item))(i)
 }
 
-fn with_comment(i: &str) -> IResult<&str, WithItem> {
+fn with_comment(i: &str) -> IResult<'_, WithItem> {
     map(preceded(char('#'), not_line_ending), |text: &str| {
         WithItem::Comment(text.to_string())
     })(i)
 }
 
-fn with_item(i: &str) -> IResult<&str, WithItem> {
+fn with_item(i: &str) -> IResult<'_, WithItem> {
     alt((
         map(preceded(kw("RESPONSE"), resp_fmt), WithItem::ResponseFmt),
         with_field,
@@ -734,14 +975,14 @@ fn with_item(i: &str) -> IResult<&str, WithItem> {
 /// A `WITH` field name: a quoted string (for multi-word / spaced names like
 /// `"Response Time"`) or a bareword identifier. Unlike a general `word`, the
 /// bareword form stops at the `:` separator.
-fn with_field_name(i: &str) -> IResult<&str, String> {
+fn with_field_name(i: &str) -> IResult<'_, String> {
     alt((string_lit, ident))(i)
 }
 
 /// `name: <rest of line> [STATISTICS(…)] [IMAGE[(…)]]` — a full Hurl query (may
 /// contain `:` and quotes) or an intrinsic name, with optional trailing
 /// statistics and image clauses. `name` may be quoted to allow spaces.
-fn with_field(i: &str) -> IResult<&str, WithItem> {
+fn with_field(i: &str) -> IResult<'_, WithItem> {
     let (i, name) = with_field_name(i)?;
     let (i, _) = sym(':')(i)?;
     let (i, rest) = not_line_ending(i)?;
@@ -772,11 +1013,11 @@ fn with_field(i: &str) -> IResult<&str, WithItem> {
 // Patterns
 // ---------------------------------------------------------------------------
 
-fn pattern(i: &str) -> IResult<&str, Pattern> {
+fn pattern(i: &str) -> IResult<'_, Pattern> {
     alt((paren_pattern, single_pattern))(i)
 }
 
-fn single_pattern(i: &str) -> IResult<&str, Pattern> {
+fn single_pattern(i: &str) -> IResult<'_, Pattern> {
     let (rest, w) = word(i)?;
     match binder(w) {
         Some(b) => Ok((
@@ -791,7 +1032,7 @@ fn single_pattern(i: &str) -> IResult<&str, Pattern> {
 }
 
 /// `( binder (',' binder)* [ ',' '...' ] )`.
-fn paren_pattern(i: &str) -> IResult<&str, Pattern> {
+fn paren_pattern(i: &str) -> IResult<'_, Pattern> {
     let (rest, _) = sym('(')(i)?;
     let (rest, words) = separated_list1(sym(','), word)(rest)?;
     let (rest, _) = sym(')')(rest)?;
@@ -834,7 +1075,7 @@ fn binder(w: &str) -> Option<Binder> {
 // Producers
 // ---------------------------------------------------------------------------
 
-fn producer(i: &str) -> IResult<&str, Producer> {
+fn producer(i: &str) -> IResult<'_, Producer> {
     alt((
         list_literal,
         files_src,
@@ -856,7 +1097,7 @@ fn producer(i: &str) -> IResult<&str, Producer> {
     ))(i)
 }
 
-fn files_src(i: &str) -> IResult<&str, Producer> {
+fn files_src(i: &str) -> IResult<'_, Producer> {
     map(
         preceded(
             kw("FILES"),
@@ -866,7 +1107,7 @@ fn files_src(i: &str) -> IResult<&str, Producer> {
     )(i)
 }
 
-fn folders_src(i: &str) -> IResult<&str, Producer> {
+fn folders_src(i: &str) -> IResult<'_, Producer> {
     map(
         preceded(
             kw("FOLDERS"),
@@ -889,7 +1130,7 @@ fn folders_src(i: &str) -> IResult<&str, Producer> {
 
 /// One `role="glob"` binding, with an optional trailing `?` marking the role
 /// optional (it may match no file, binding empty, rather than failing the run).
-fn role_binding(i: &str) -> IResult<&str, RoleBinding> {
+fn role_binding(i: &str) -> IResult<'_, RoleBinding> {
     map(
         pair(separated_pair(ident, sym('='), string_lit), opt(sym('?'))),
         |((name, glob), mark)| RoleBinding {
@@ -900,32 +1141,32 @@ fn role_binding(i: &str) -> IResult<&str, RoleBinding> {
     )(i)
 }
 
-fn tuples_src(i: &str) -> IResult<&str, Producer> {
+fn tuples_src(i: &str) -> IResult<'_, Producer> {
     map(
         preceded(pair(kw("TUPLES"), kw("FROM")), string_lit),
         |path| Producer::Tuples { path },
     )(i)
 }
 
-fn zip_src(i: &str) -> IResult<&str, Producer> {
+fn zip_src(i: &str) -> IResult<'_, Producer> {
     map(preceded(kw("ZIP"), paren_list1(producer)), Producer::Zip)(i)
 }
 
-fn concat_src(i: &str) -> IResult<&str, Producer> {
+fn concat_src(i: &str) -> IResult<'_, Producer> {
     map(
         preceded(kw("CONCAT"), paren_list1(producer)),
         Producer::Concat,
     )(i)
 }
 
-fn list_literal(i: &str) -> IResult<&str, Producer> {
+fn list_literal(i: &str) -> IResult<'_, Producer> {
     map(
         delimited(sym('['), separated_list0(sym(','), element), sym(']')),
         Producer::List,
     )(i)
 }
 
-fn element(i: &str) -> IResult<&str, Element> {
+fn element(i: &str) -> IResult<'_, Element> {
     alt((
         map(paren_list1(str_or_word), Element::Tuple),
         map(str_or_word, Element::Scalar),
@@ -936,15 +1177,15 @@ fn element(i: &str) -> IResult<&str, Element> {
 // ENVS clause
 // ---------------------------------------------------------------------------
 
-fn env_clause(i: &str) -> IResult<&str, EnvClause> {
+fn env_clause(i: &str) -> IResult<'_, EnvClause> {
     alt((roles_clause, plain_clause))(i)
 }
 
-fn plain_clause(i: &str) -> IResult<&str, EnvClause> {
+fn plain_clause(i: &str) -> IResult<'_, EnvClause> {
     map(separated_list1(sym(','), string_lit), EnvClause::Plain)(i)
 }
 
-fn roles_clause(i: &str) -> IResult<&str, EnvClause> {
+fn roles_clause(i: &str) -> IResult<'_, EnvClause> {
     let (i, roles) = separated_list1(sym(','), role)(i)?;
     let mut baseline = Vec::new();
     let mut comparisons = Vec::new();
@@ -973,7 +1214,7 @@ fn roles_clause(i: &str) -> IResult<&str, EnvClause> {
 /// live env name or a `FILE("…")` snapshot.  `SHOW` after `COMPARISON` is a
 /// hard parse error (returned as `nom::Err::Failure`) so it can't be silently
 /// swallowed by the surrounding `alt`.
-fn role(i: &str) -> IResult<&str, (bool, Vec<RoleRef>, Vec<ShowField>)> {
+fn role(i: &str) -> IResult<'_, (bool, Vec<RoleRef>, Vec<ShowField>)> {
     let (i, is_baseline) = alt((value(true, kw("BASELINE")), value(false, kw("COMPARISON"))))(i)?;
     let (i, refs) = paren_list1(role_ref)(i)?;
     // SHOW(…) is only legal on a BASELINE role.  If we see SHOW after a
@@ -984,10 +1225,10 @@ fn role(i: &str) -> IResult<&str, (bool, Vec<RoleRef>, Vec<ShowField>)> {
         (i, maybe.unwrap_or_default())
     } else {
         if peek(show_clause)(i).is_ok() {
-            return Err(nom::Err::Failure(nom::error::Error::new(
+            return Err(pfail(
                 i,
-                nom::error::ErrorKind::Verify,
-            )));
+                "SHOW(…) belongs on a BASELINE role, not a COMPARISON",
+            ));
         }
         (i, Vec::new())
     };
@@ -999,12 +1240,12 @@ fn role(i: &str) -> IResult<&str, (bool, Vec<RoleRef>, Vec<ShowField>)> {
 /// `FILE(` — it is a quoted string), and only ever here in argument position,
 /// so it never collides with the `FILE` loop-variable name in `FOR FILE IN
 /// FILES`.
-fn role_ref(i: &str) -> IResult<&str, RoleRef> {
+fn role_ref(i: &str) -> IResult<'_, RoleRef> {
     alt((map(file_ref, RoleRef::File), map(string_lit, RoleRef::Env)))(i)
 }
 
 /// `FILE("path")` — the snapshot path inside a role argument.
-fn file_ref(i: &str) -> IResult<&str, String> {
+fn file_ref(i: &str) -> IResult<'_, String> {
     let (i, _) = kw("FILE")(i)?;
     delimited(sym('('), string_lit, sym(')'))(i)
 }
@@ -1013,11 +1254,45 @@ fn file_ref(i: &str) -> IResult<&str, String> {
 // Entry point
 // ---------------------------------------------------------------------------
 
-fn report_flow(i: &str) -> IResult<&str, ReportFlow> {
+fn report_flow(i: &str) -> IResult<'_, ReportFlow> {
     let (i, header) = parse_headers(i)?;
     let (i, nodes) = many0(preceded(multispace0, node_or_comment))(i)?;
     let (i, _) = trivia(i)?;
-    Ok((i, ReportFlow { header, nodes }))
+    Ok((
+        i,
+        ReportFlow {
+            header,
+            nodes,
+            requests: None,
+            requests_line: 0,
+        },
+    ))
+}
+
+/// Split a flow's source at its `REQUESTS` line: the statements before it, and
+/// the verbatim Hurl after it.
+///
+/// Recognised only as a line of its own with no indentation, because everything
+/// after it is Hurl and Hurl has lines that begin with words too. The *first*
+/// such line wins — a later one is part of the embedded text, not a second
+/// section, which is what "must be last in the file" means operationally.
+fn split_requests_section(input: &str) -> (&str, Option<String>, usize) {
+    let mut at = 0usize;
+    for (n, line) in input.split_inclusive('\n').enumerate() {
+        if !line.starts_with(char::is_whitespace)
+            && line.trim_end().eq_ignore_ascii_case("REQUESTS")
+        {
+            // `n` is 0-based and names the keyword line, so the text begins on
+            // file line `n + 2`.
+            return (
+                &input[..at],
+                Some(input[at + line.len()..].to_string()),
+                n + 2,
+            );
+        }
+        at += line.len();
+    }
+    (input, None, 0)
 }
 
 /// A parse failure, carrying the 1-based line where it occurred so the TUI
@@ -1052,8 +1327,17 @@ fn err_at(input: &str, at: &str, message: impl Into<String>) -> ParseError {
 
 /// Parse PaperTrail source into a [`ReportFlow`].
 pub fn parse_flow(input: &str) -> Result<ReportFlow, ParseError> {
+    // Taken off the front before the grammar runs, so the flow parser never
+    // sees Hurl and the Hurl parser never sees PaperTrail. `head` is a prefix
+    // of `input`, so error line numbers are still the file's own.
+    let (head, requests, requests_line) = split_requests_section(input);
+    let input = head;
     match report_flow(input) {
-        Ok((rest, flow)) if rest.trim().is_empty() => Ok(flow),
+        Ok((rest, mut flow)) if rest.trim().is_empty() => {
+            flow.requests = requests;
+            flow.requests_line = requests_line;
+            Ok(flow)
+        }
         Ok((rest, _)) => {
             let near = rest.lines().next().unwrap_or("").trim();
             Err(err_at(
@@ -1063,7 +1347,7 @@ pub fn parse_flow(input: &str) -> Result<ReportFlow, ParseError> {
             ))
         }
         Err(nom::Err::Error(e)) | Err(nom::Err::Failure(e)) => {
-            Err(err_at(input, e.input, "parse error"))
+            Err(err_at(input, e.input, e.msg.unwrap_or("parse error")))
         }
         Err(nom::Err::Incomplete(_)) => Err(err_at(input, input, "unexpected end of input")),
     }
@@ -1078,15 +1362,18 @@ pub fn parse_flow(input: &str) -> Result<ReportFlow, ParseError> {
 /// keywords by hand, so it can't drift out of sync with the language. Leading
 /// indentation is ignored (the token parsers skip it).
 pub fn opens_block(line: &str) -> bool {
-    // `[PARALLEL[(n)]] FOR …`
+    // `[PARALLEL[(n)]] FOR …` and `[PARALLEL[(n)]] GRAPH …`
     let for_head = preceded(opt(parallel_prefix), kw("FOR"));
-    map(for_head, |_| ())(line).is_ok() || with_block_head(line).is_ok()
+    let graph_head = preceded(opt(parallel_prefix), kw("GRAPH"));
+    map(for_head, |_| ())(line).is_ok()
+        || map(graph_head, |_| ())(line).is_ok()
+        || with_block_head(line).is_ok()
 }
 
 /// The opener line of a `REPORT REQUEST … WITH … END` block: the statement head
 /// up to and including a trailing `WITH` that ends the line (its `END` lands on
 /// a later line, so only the head is present here).
-fn with_block_head(i: &str) -> IResult<&str, ()> {
+fn with_block_head(i: &str) -> IResult<'_, ()> {
     let (i, _) = kw("REPORT")(i)?;
     let (i, _) = kw("REQUEST")(i)?;
     let (i, _) = str_or_word(i)?;
@@ -1807,7 +2094,9 @@ mod tests {
         assert_eq!(
             flow.nodes[0],
             FlowNode::Request {
+                alias: None,
                 name: "My Request".into(),
+                depends: Vec::new(),
                 using: Vec::new(),
             }
         );
@@ -1819,7 +2108,9 @@ mod tests {
         assert_eq!(
             flow.nodes[0],
             FlowNode::Request {
+                alias: None,
                 name: "auth/Oauth".into(),
+                depends: Vec::new(),
                 using: Vec::new(),
             }
         );
@@ -1843,6 +2134,148 @@ mod tests {
     fn error_reports_a_line_number() {
         let err = parse_flow("REQUEST ok\nFOR\n").unwrap_err();
         assert_eq!(err.line, 2);
+    }
+
+    #[test]
+    fn a_region_round_trips_with_its_name_and_parallel_marker() {
+        for src in [
+            "# collection: c\n\nGRAPH\n    REQUEST a\n    REQUEST b\nEND\n",
+            "# collection: c\n\nGRAPH release_smoke\n    REQUEST a\nEND\n",
+            "# collection: c\n\nPARALLEL(5) GRAPH\n    REQUEST a\nEND\n",
+            "# collection: c\n\nPARALLEL GRAPH smoke\n    REQUEST a\nEND\n",
+        ] {
+            let flow = parse_flow(src).expect("parses");
+            assert_eq!(flow.to_text(), src, "round-trip of {src:?}");
+        }
+    }
+
+    #[test]
+    fn an_unnamed_region_does_not_swallow_its_first_statement() {
+        // The region name is optional and the body starts on the next line, so
+        // a newline-crossing name parser would read this as `GRAPH REQUEST`.
+        let flow =
+            parse_flow("# collection: c\n\nGRAPH\n    REQUEST oauth2\nEND\n").expect("parses");
+        let FlowNode::Graph { name, body, .. } = &flow.nodes[0] else {
+            panic!("expected a region, got {:?}", flow.nodes[0]);
+        };
+        assert_eq!(name, &None);
+        assert_eq!(body.len(), 1);
+    }
+
+    #[test]
+    fn clauses_may_be_written_in_any_order_and_normalise_on_save() {
+        // There is no order that is right for every reader, so input order is
+        // free and the serializer picks one — a diff must never turn on which
+        // order someone happened to type.
+        let flow = parse_flow(
+            "# collection: c\n\nGRAPH\n    REQUEST a\n    REQUEST b USING(url = \"u\") DEPENDS a AS step\nEND\n",
+        )
+        .expect("parses");
+        assert!(
+            flow.to_text()
+                .contains("REQUEST b AS step DEPENDS a USING(url = \"u\")"),
+            "{}",
+            flow.to_text()
+        );
+    }
+
+    #[test]
+    fn a_clause_group_may_span_lines() {
+        let src = "# collection: c\n\nGRAPH\n    REQUEST a\n    REQUEST b (\n        AS step\n        DEPENDS a\n    )\nEND\n";
+        let flow = parse_flow(src).expect("parses");
+        let FlowNode::Graph { body, .. } = &flow.nodes[0] else {
+            panic!("expected a region, got {:?}", flow.nodes[0]);
+        };
+        let FlowNode::Request { alias, depends, .. } = &body[1] else {
+            panic!("expected a request, got {:?}", body[1]);
+        };
+        assert_eq!(alias.as_deref(), Some("step"));
+        assert_eq!(depends, &vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn a_clause_written_twice_says_which_one() {
+        // "parse error" on a line carrying five clauses is no help at all.
+        let err = parse_flow("# collection: c\n\nREQUEST a AS x AS y\n").expect_err("rejected");
+        assert!(err.message.contains("AS is written twice"), "{err}");
+    }
+
+    #[test]
+    fn a_clause_group_does_not_reach_down_and_swallow_the_next_statement() {
+        // `REPORT (a, b)` starts with a bare `(` too. Requiring the group to
+        // open on the statement's own line is what keeps the two apart.
+        let flow = parse_flow("# collection: c\n\nREQUEST a\nREPORT (x, y)\n").expect("parses");
+        assert_eq!(flow.nodes.len(), 2, "{:?}", flow.nodes);
+        assert!(
+            matches!(&flow.nodes[1], FlowNode::Report(ReportStmt::Vars(v)) if v.len() == 2),
+            "{:?}",
+            flow.nodes[1]
+        );
+    }
+
+    #[test]
+    fn a_requests_section_is_kept_verbatim_and_round_trips() {
+        let src = "# collection: c\n\nREQUEST ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n[Asserts]\nstatus == 200\n";
+        let flow = parse_flow(src).expect("parses");
+        assert_eq!(flow.nodes.len(), 1, "the Hurl must not reach the grammar");
+        assert_eq!(
+            flow.requests.as_deref(),
+            Some("\n# ping\nGET https://x/ping\n[Asserts]\nstatus == 200\n"),
+            "everything after the keyword line is the section, byte for byte"
+        );
+        assert_eq!(flow.to_text(), src);
+        assert_eq!(
+            flow.embedded_entries()
+                .iter()
+                .map(|e| e.title.clone())
+                .collect::<Vec<_>>(),
+            vec!["ping".to_string()]
+        );
+    }
+
+    #[test]
+    fn only_the_first_requests_line_opens_the_section() {
+        // A later one is Hurl text — a request may perfectly well be called
+        // `REQUESTS`, and the section is defined as running to end of file.
+        let src = "# collection: c\n\nREQUESTS\n\n# a\nGET https://x/a\n\nREQUESTS\n";
+        let flow = parse_flow(src).expect("parses");
+        assert!(
+            flow.requests.as_deref().unwrap().contains("REQUESTS"),
+            "the second keyword belongs to the embedded text"
+        );
+        assert_eq!(flow.to_text(), src);
+    }
+
+    #[test]
+    fn an_indented_requests_line_is_not_a_section() {
+        // The section is defined at column zero. Anything indented is inside a
+        // block, where it has to be a statement — and there is no such
+        // statement, so this is a parse error rather than a silent truncation
+        // of the flow.
+        let src = "# collection: c\n\nFOR x IN LIST y\n    REQUESTS\nEND\n";
+        assert!(parse_flow(src).is_err());
+    }
+
+    #[test]
+    fn a_cleanup_round_trips_with_all_its_clauses() {
+        let src = "# collection: c\n\nCLEANUP auth/purge AS purge DEPENDS login USING(query.sid = \"{{sid}}\")\n";
+        let flow = parse_flow(src).expect("parses");
+        assert!(
+            matches!(&flow.nodes[0], FlowNode::Cleanup { alias, depends, .. }
+                if alias.as_deref() == Some("purge") && depends == &vec!["login".to_string()]),
+            "{:?}",
+            flow.nodes[0]
+        );
+        assert_eq!(flow.to_text(), src);
+    }
+
+    #[test]
+    fn a_region_is_a_block_opener_for_indentation() {
+        // The editors indent from this, so a region that isn't recognised as an
+        // opener would silently produce a flat, unreadable body.
+        assert!(opens_block("GRAPH"));
+        assert!(opens_block("GRAPH release_smoke"));
+        assert!(opens_block("PARALLEL(5) GRAPH"));
     }
 
     #[test]
@@ -2239,6 +2672,76 @@ REPORT Thumb AS Small IMAGE(FIT)
                 "every order serializes the same way"
             );
         }
+    }
+
+    /// A region is a scheduling device, not a scope: a column declared inside
+    /// one is a column of the same report. The collectors walked loop bodies
+    /// but not `GRAPH` bodies, so a `TRUTH` written in a region was scored
+    /// against nothing and `STATISTICS`/`IMAGE`/`DETAIL` were dropped — silent
+    /// in every case, since a column with no metadata still renders.
+    #[test]
+    fn column_metadata_written_inside_a_region_still_reaches_the_report() {
+        let src = "# collection: c\n\nGRAPH\n    REPORT V AS Verdict STATISTICS(COUNT) IMAGE(HEIGHT 60) DETAIL TRUTH \"{{ e }}\"\nEND\n";
+        let flow = parse_flow(src).expect("parse");
+        assert_eq!(
+            flow.column_truths().get("Verdict").map(String::as_str),
+            Some("{{ e }}"),
+            "a TRUTH inside a region is checked"
+        );
+        assert!(
+            flow.column_stats().contains_key("Verdict"),
+            "STATISTICS inside a region still summarise"
+        );
+        assert!(
+            flow.column_images().contains_key("Verdict"),
+            "IMAGE inside a region still renders"
+        );
+        assert!(
+            flow.column_details().contains("Verdict"),
+            "DETAIL inside a region still opens"
+        );
+    }
+
+    /// The four kinds of column metadata are gathered by one walk, but the
+    /// walk is not symmetric across them, and flattening it would be a silent
+    /// behaviour change. A `SHOW` field carries statistics and nothing else —
+    /// there is no `SHOW(f IMAGE)` — and a `BASELINE(…) SHOW(…)` contributes a
+    /// suffix-matched `baseline.*.f` key that only statistics have.
+    #[test]
+    fn column_metadata_is_gathered_from_the_places_each_clause_may_be_written() {
+        let src = concat!(
+            "# collection: c\n\n",
+            "REPORT REQUEST api AS a SHOW(dur STATISTICS(MEAN)) WITH\n",
+            "    code: jsonpath \"$.c\" IMAGE DETAIL TRUTH \"{{ e }}\" STATISTICS(COUNT)\n",
+            "END\n",
+            "FOR T IN ENVS BASELINE(\"p\") SHOW(lat STATISTICS(MEAN)), COMPARISON(\"s\")\n",
+            "    REPORT \"x\" AS C\n",
+            "END\n",
+        );
+        let flow = parse_flow(src).expect("parse");
+
+        // A `SHOW` field reaches the stats and only the stats.
+        assert!(flow.column_stats().contains_key("a.dur"), "SHOW summarises");
+        assert!(!flow.column_images().contains_key("a.dur"));
+        assert!(!flow.column_truths().contains_key("a.dur"));
+        assert!(!flow.column_details().contains("a.dur"));
+
+        // A `WITH` field reaches all four.
+        assert!(flow.column_stats().contains_key("a.code"));
+        assert!(flow.column_images().contains_key("a.code"));
+        assert_eq!(
+            flow.column_truths().get("a.code").map(String::as_str),
+            Some("{{ e }}")
+        );
+        assert!(flow.column_details().contains("a.code"));
+
+        // And the baseline key, which is statistics-only and matched by suffix
+        // at render time because its aliases aren't known until the run.
+        assert!(
+            flow.column_stats().contains_key("baseline.*.lat"),
+            "{:?}",
+            flow.column_stats()
+        );
     }
 
     /// The template is arbitrary text, so words that happen to be clause

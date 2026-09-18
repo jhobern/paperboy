@@ -395,12 +395,12 @@ pub struct Collection {
     pub name: String,
     pub entries: Vec<HurlEntry>,
     pub selected_entry: usize,
-    /// The Global Environment (if any) linked/"pinned" to this collection —
-    /// an id into [`crate::tui::app::TuiApp::global_envs`], not an owned
-    /// [`Environment`]. Any number of collections may link the same one. Its
-    /// vars take precedence over the active Global Environment's on a
-    /// name collision (see [`crate::request::subst_map`]).
-    pub linked_env_id: Option<u64>,
+    /// The Global Environment (if any) active on this tab — an id into
+    /// [`crate::session::Session::global_envs`], not an owned [`Environment`].
+    /// Any number of tabs may activate the same one. This is the *only* source
+    /// of substituted variables for the tab (see
+    /// [`crate::session::effective_env`]).
+    pub env_id: Option<u64>,
     /// Source `.hurl` file this collection was loaded from (used by "Save
     /// Collection"). `None` for the built-in Request tab until saved.
     pub path: Option<PathBuf>,
@@ -621,7 +621,7 @@ impl Collection {
             name,
             entries,
             selected_entry: 0,
-            linked_env_id: None,
+            env_id: None,
             path: None,
             git_origin: None,
             request_json_buf: String::new(),

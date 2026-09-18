@@ -290,7 +290,7 @@ fn mouse_second_click_on_global_env_row_opens_popup_without_redraw() {
 
     app.on_mouse(mouse_down(env.x, env.y));
     match &app.overlay {
-        Some(Overlay::EnvPopup(popup)) => assert_eq!(popup.env_id, dev_id),
+        Some(Overlay::EnvPopup(popup)) => assert_eq!(popup.env_id, Some(dev_id)),
         _ => panic!("second click opens the selected environment popup"),
     }
 }
@@ -331,7 +331,7 @@ fn mouse_second_click_on_workspace_env_row_loads_and_opens_popup_without_redraw(
     assert_eq!(app.global_envs.len(), 1);
     assert_eq!(app.global_envs[0].path.as_deref(), Some(env_path.as_path()));
     match &app.overlay {
-        Some(Overlay::EnvPopup(popup)) => assert_eq!(popup.env_id, app.global_envs[0].id),
+        Some(Overlay::EnvPopup(popup)) => assert_eq!(popup.env_id, Some(app.global_envs[0].id)),
         _ => panic!("second click loads and opens the environment examiner"),
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -382,7 +382,7 @@ fn keyboard_event_between_row_clicks_breaks_mouse_activation_pair() {
 
     app.on_mouse(mouse_down(env.x, env.y));
     match &app.overlay {
-        Some(Overlay::EnvPopup(popup)) => assert_eq!(popup.env_id, env_id),
+        Some(Overlay::EnvPopup(popup)) => assert_eq!(popup.env_id, Some(env_id)),
         _ => panic!("third click starts a new pair and opens the popup"),
     }
 }
@@ -726,73 +726,262 @@ fn open_only_env_popup(app: &mut TuiApp) {
     app.overlay = Some(Overlay::EnvPopup(EnvPopupState::new(only_env_id(app))));
 }
 
+// ── The `v` variables popup: environment rows *and* the live capture pool ──
+
+/// The popup used to list the environment's rows and nothing else, while
+/// substitution reads `request::collection_vars` — the environment **overridden
+/// by** the capture pool. A captured `TOKEN` therefore left the environment's
+/// row sitting on screen showing a value that was not the one being sent. Both
+/// halves of that have to be on screen for the view to be honest.
 #[test]
-fn effective_env_prefers_the_linked_environment_on_a_key_collision() {
+fn the_variables_popup_lists_the_captures_as_well_as_the_environment() {
     let mut app = TuiApp::default();
-    let (active, _) =
-        crate::environment::parse_vars_pending("global".into(), "TOKEN=from-global\nONLY_GLOBAL=g");
-    let active_id = add_global_env(&mut app, active);
-    app.active_env_id = Some(active_id);
+    let (env, _) = crate::environment::parse_vars_pending("dev".into(), "HOST=example.com");
+    let env_id = add_global_env(&mut app, env);
+    let ci = app.active_tab;
+    app.collections[ci].env_id = Some(env_id);
+    app.collections[ci]
+        .captures
+        .insert("session".to_string(), "abc123".to_string());
 
-    let (linked, _) =
-        crate::environment::parse_vars_pending("linked".into(), "TOKEN=from-linked\nONLY_LINKED=l");
-    let linked_id = add_global_env(&mut app, linked);
-    app.collections[0].linked_env_id = Some(linked_id);
+    press(&mut app, KeyCode::Char('v'));
+    let screen = render_screen(&mut app);
+    assert!(screen.contains("HOST"), "the environment's row: {screen}");
+    assert!(screen.contains("session"), "the capture's row: {screen}");
+    assert!(
+        screen.contains(Strings::for_language(&app.language).vars_heading),
+        "the popup is about variables, not just an environment: {screen}"
+    );
+}
 
-    let merged = app
-        .effective_env(0)
-        .expect("both a linked and active env are set");
-    let token = merged.vars.iter().find(|v| v.key == "TOKEN").unwrap();
+/// Captures are masked for the same reason the Response pane's Captures tab
+/// masks them: a capture carries no "secret" marking to go by and is very often
+/// a bearer token.
+#[test]
+fn the_variables_popup_masks_captures_until_m_is_pressed() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci]
+        .captures
+        .insert("session".to_string(), "abc123".to_string());
+
+    press(&mut app, KeyCode::Char('v'));
+    let screen = render_screen(&mut app);
+    assert!(
+        !screen.contains("abc123"),
+        "the value must not be on screen unasked: {screen}"
+    );
+    assert!(
+        screen.contains(crate::environment::SECRET_MASK),
+        "it should be masked: {screen}"
+    );
+
+    press(&mut app, KeyCode::Char('m'));
+    let screen = render_screen(&mut app);
+    assert!(screen.contains("abc123"), "m reveals it: {screen}");
+}
+
+/// The environment row a capture shadows is the one the popup was actively
+/// misleading about, so it is marked.
+#[test]
+fn an_environment_row_a_capture_shadows_is_marked() {
+    let mut app = TuiApp::default();
+    let (env, _) = crate::environment::parse_vars_pending(
+        "dev".into(),
+        "TOKEN=from-env
+HOST=h",
+    );
+    let env_id = add_global_env(&mut app, env);
+    let ci = app.active_tab;
+    app.collections[ci].env_id = Some(env_id);
+
+    press(&mut app, KeyCode::Char('v'));
+    let screen = render_screen(&mut app);
+    assert!(
+        !screen.contains(Strings::for_language(&app.language).vars_overridden),
+        "nothing is shadowing anything yet: {screen}"
+    );
+
+    app.collections[ci]
+        .captures
+        .insert("TOKEN".to_string(), "from-capture".to_string());
+    let screen = render_screen(&mut app);
+    assert!(
+        screen.contains(Strings::for_language(&app.language).vars_overridden),
+        "the row whose value is no longer the one sent must say so: {screen}"
+    );
+}
+
+/// A `# [Gen]` value reaches the pool the way a capture does, but must never be
+/// displayed: it may be an HMAC of a secret, and the figure on hand is the
+/// previous send's while the next send computes a fresh one. Naming it as an
+/// override would point at it just as surely as printing it.
+#[test]
+fn a_computed_value_is_not_listed_among_the_captures() {
+    let mut app = TuiApp::default();
+    let (env, _) = crate::environment::parse_vars_pending("dev".into(), "nonce=placeholder");
+    let env_id = add_global_env(&mut app, env);
+    let ci = app.active_tab;
+    app.collections[ci].env_id = Some(env_id);
+    app.collections[ci].entries.push(crate::hurl::HurlEntry {
+        title: "gen".to_string(),
+        generators: vec![("nonce".to_string(), "uuid".to_string())],
+        ..Default::default()
+    });
+    app.collections[ci]
+        .captures
+        .insert("nonce".to_string(), "deadbeef".to_string());
+
+    press(&mut app, KeyCode::Char('v'));
+    press(&mut app, KeyCode::Char('m')); // reveal — even then it stays out
+    let screen = render_screen(&mut app);
+    assert!(
+        !screen.contains("deadbeef"),
+        "a computed value must never be shown: {screen}"
+    );
+    assert!(
+        !screen.contains(Strings::for_language(&app.language).vars_overridden),
+        "nor may the environment row be marked, which would point straight at it: {screen}"
+    );
+}
+
+/// `v` used to refuse to open on a tab with no environment — the one case where
+/// the captures are the *only* variables there are, so refusing left them with
+/// no view at all.
+#[test]
+fn v_opens_the_variables_popup_with_no_environment_loaded() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    assert!(app.collections[ci].env_id.is_none());
+    app.collections[ci]
+        .captures
+        .insert("session".to_string(), "abc123".to_string());
+
+    press(&mut app, KeyCode::Char('v'));
+    assert!(
+        matches!(app.overlay, Some(Overlay::EnvPopup(ref p)) if p.env_id.is_none()),
+        "the popup opens without an environment"
+    );
+    let screen = render_screen(&mut app);
+    assert!(
+        screen.contains("session"),
+        "and lists the captures: {screen}"
+    );
+}
+
+/// Nothing at all to show is different from an environment with no variables,
+/// and both are different from a popup that refuses to open.
+#[test]
+fn the_variables_popup_says_so_when_there_is_nothing_to_show() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('v'));
+    let screen = render_screen(&mut app);
+    assert!(
+        screen.contains(Strings::for_language(&app.language).vars_none),
+        "an empty popup still has to say what it means: {screen}"
+    );
+}
+
+/// Selection stops at the end of the environment's rows: a capture has nothing
+/// to edit, reload or revert, so there is nothing to land on. Down-arrowing off
+/// the end must not walk the highlight into the capture group.
+#[test]
+fn the_selection_stops_at_the_end_of_the_environment_rows() {
+    let mut app = TuiApp::default();
+    let (env, _) = crate::environment::parse_vars_pending("dev".into(), "A=1\nB=2");
+    let env_id = add_global_env(&mut app, env);
+    let ci = app.active_tab;
+    app.collections[ci].env_id = Some(env_id);
+    app.collections[ci]
+        .captures
+        .insert("session".to_string(), "abc123".to_string());
+
+    press(&mut app, KeyCode::Char('v'));
+    for _ in 0..6 {
+        press(&mut app, KeyCode::Down);
+    }
+    match app.overlay {
+        Some(Overlay::EnvPopup(ref p)) => assert_eq!(p.idx, 1, "the last environment row"),
+        _ => panic!("expected the variables popup to still be open"),
+    }
+}
+
+#[test]
+fn each_tab_substitutes_from_its_own_environment() {
+    let mut app = TuiApp::default();
+    let (prod, _) =
+        crate::environment::parse_vars_pending("prod".into(), "TOKEN=from-prod\nONLY_PROD=p");
+    let prod_id = add_global_env(&mut app, prod);
+    let (staging, _) = crate::environment::parse_vars_pending(
+        "staging".into(),
+        "TOKEN=from-staging\nONLY_STAGING=s",
+    );
+    let staging_id = add_global_env(&mut app, staging);
+
+    app.add_collection("second");
+    assert_eq!(app.collections.len(), 2, "two tabs to tell apart");
+    app.collections[0].env_id = Some(prod_id);
+    app.collections[1].env_id = Some(staging_id);
+
+    let first = app.effective_env(0).expect("tab 0 has an environment");
+    let second = app.effective_env(1).expect("tab 1 has an environment");
     assert_eq!(
-        token.value, "from-linked",
-        "the linked environment must win on a key collision"
+        first.vars.iter().find(|v| v.key == "TOKEN").unwrap().value,
+        "from-prod"
+    );
+    assert_eq!(
+        second.vars.iter().find(|v| v.key == "TOKEN").unwrap().value,
+        "from-staging"
+    );
+    // The whole point: one tab's environment does not leak into the other.
+    assert!(
+        !first.vars.iter().any(|v| v.key == "ONLY_STAGING"),
+        "tab 0 must not see tab 1's variables"
     );
     assert!(
-        merged.vars.iter().any(|v| v.key == "ONLY_GLOBAL"),
-        "non-colliding global vars are kept"
-    );
-    assert!(
-        merged.vars.iter().any(|v| v.key == "ONLY_LINKED"),
-        "non-colliding linked vars are kept"
+        !second.vars.iter().any(|v| v.key == "ONLY_PROD"),
+        "tab 1 must not see tab 0's variables"
     );
 }
 
 #[test]
-fn shadowed_env_keys_reports_only_keys_defined_in_both_environments() {
+fn a_tab_with_no_environment_substitutes_from_nothing() {
     let mut app = TuiApp::default();
-    let (active, _) =
-        crate::environment::parse_vars_pending("global".into(), "TOKEN=from-global\nONLY_GLOBAL=g");
-    let active_id = add_global_env(&mut app, active);
-    app.active_env_id = Some(active_id);
+    let (prod, _) = crate::environment::parse_vars_pending("prod".into(), "TOKEN=from-prod");
+    let prod_id = add_global_env(&mut app, prod);
+    app.add_collection("second");
+    app.collections[0].env_id = Some(prod_id);
 
-    let (linked, _) =
-        crate::environment::parse_vars_pending("linked".into(), "TOKEN=from-linked\nONLY_LINKED=l");
-    let linked_id = add_global_env(&mut app, linked);
-    app.collections[0].linked_env_id = Some(linked_id);
-
-    let shadowed = app.shadowed_env_keys(0);
     assert!(
-        shadowed.contains("TOKEN"),
-        "a key defined in both must be reported as shadowed"
-    );
-    assert!(
-        !shadowed.contains("ONLY_GLOBAL"),
-        "a key only in the active global env is not shadowed"
-    );
-    assert!(
-        !shadowed.contains("ONLY_LINKED"),
-        "a key only in the linked env is not shadowed"
+        app.effective_env(1).is_none(),
+        "a loaded environment no tab activated substitutes nowhere"
     );
 }
 
 #[test]
-fn shadowed_env_keys_is_empty_without_both_a_linked_and_an_active_environment() {
+fn activating_an_environment_only_touches_the_active_tab() {
     let mut app = TuiApp::default();
-    let (active, _) = crate::environment::parse_vars_pending("global".into(), "TOKEN=from-global");
-    let active_id = add_global_env(&mut app, active);
-    app.active_env_id = Some(active_id);
-    // No linked env on collection 0: nothing can be shadowed.
-    assert!(app.shadowed_env_keys(0).is_empty());
+    let (prod, _) = crate::environment::parse_vars_pending("prod".into(), "TOKEN=t");
+    add_global_env(&mut app, prod);
+    app.add_collection("second");
+    app.active_tab = 1;
+
+    app.toggle_activate_env(0);
+
+    let id = app.global_envs[0].id;
+    assert_eq!(
+        app.collections[1].env_id,
+        Some(id),
+        "the active tab takes it"
+    );
+    assert_eq!(
+        app.collections[0].env_id, None,
+        "every other tab keeps what it had"
+    );
+
+    // And it is a toggle, so the same keystroke takes it back off.
+    app.toggle_activate_env(0);
+    assert_eq!(app.collections[1].env_id, None);
 }
 
 #[test]
@@ -1029,18 +1218,6 @@ fn f2_on_the_environments_panel_renames_the_selected_environment() {
         }
         _ => panic!("F2 did not open a rename prompt"),
     }
-}
-
-#[test]
-fn shadowed_env_keys_is_empty_when_linked_env_is_also_the_active_env() {
-    let mut app = TuiApp::default();
-    let (env, _) = crate::environment::parse_vars_pending("shared".into(), "TOKEN=v\nOTHER=w");
-    let id = add_global_env(&mut app, env);
-    // The collection is linked to the very environment that's also active —
-    // the same value is substituted either way, so nothing is shadowed.
-    app.active_env_id = Some(id);
-    app.collections[0].linked_env_id = Some(id);
-    assert!(app.shadowed_env_keys(0).is_empty());
 }
 
 #[test]
@@ -3760,7 +3937,7 @@ fn fetched_collection_from_git_records_its_git_origin() {
     assert_eq!(col_origin.ref_kind, RefKind::Branch);
     assert_eq!(col_origin.ref_name, "main");
     assert!(
-        app.collections[ci].linked_env_id.is_none(),
+        app.collections[ci].env_id.is_none(),
         "loading a collection no longer also loads/links an environment"
     );
     assert!(
@@ -4490,7 +4667,7 @@ fn app_with_resolved_secret(secret: &str) -> TuiApp {
         value: Some(secret.to_string()),
     });
     let env_id = add_global_env(&mut app, env);
-    app.collections[0].linked_env_id = Some(env_id);
+    app.collections[0].env_id = Some(env_id);
     app.focus = Pane::GlobalEnv;
     app.global_env_idx = 0;
     app
@@ -4933,7 +5110,7 @@ fn help_popup_any_other_key_closes_it_from_either_tab() {
 }
 
 #[test]
-fn help_glossary_tab_renders_every_substitution_colour_and_the_shadow_icon() {
+fn help_glossary_tab_renders_every_substitution_colour() {
     use crate::i18n::{Language, Strings};
     use ratatui::{Terminal, backend::TestBackend};
     let th = super::theme::theme(&Language::English);
@@ -4951,11 +5128,6 @@ fn help_glossary_tab_renders_every_substitution_colour_and_the_shadow_icon() {
     assert!(text.contains(s.glossary_label_loaded));
     assert!(text.contains(s.glossary_label_pending));
     assert!(text.contains(s.glossary_label_failed));
-    assert!(text.contains(s.glossary_label_shadowed));
-    assert!(
-        text.contains(super::draw::SHADOW_ICON),
-        "the shadow icon itself is shown, matching the inline marker"
-    );
     assert!(
         text.contains(s.help_tab_glossary),
         "the popup title reflects the active Glossary tab"
@@ -4967,7 +5139,7 @@ fn help_glossary_tab_also_renders_every_other_app_icon() {
     // The Glossary is meant to be a complete legend, not just the
     // substitution dots — a second group covers every other icon shown
     // elsewhere in the app (pencil, plus, tick, cross, ellipsis, git,
-    // link, folder, scroll-hint arrows).
+    // folder, scroll-hint arrows).
     use crate::i18n::{Language, Strings};
     use ratatui::{Terminal, backend::TestBackend};
     let th = super::theme::theme(&Language::English);
@@ -4988,16 +5160,11 @@ fn help_glossary_tab_also_renders_every_other_app_icon() {
     assert!(text.contains(s.glossary_label_run_failed));
     assert!(text.contains(s.glossary_label_running));
     assert!(text.contains(s.glossary_label_git));
-    assert!(text.contains(s.glossary_label_linked));
     assert!(text.contains(s.glossary_label_folder));
     assert!(text.contains(s.glossary_label_scroll_hint));
     assert!(
         text.contains(super::draw::GIT_ICON),
         "the git icon glyph itself is shown"
-    );
-    assert!(
-        text.contains(super::draw::LINK_ICON),
-        "the link icon glyph itself is shown"
     );
     assert!(
         text.contains(super::draw::FOLDER_ICON),
@@ -5008,7 +5175,7 @@ fn help_glossary_tab_also_renders_every_other_app_icon() {
 #[test]
 fn glossary_entries_with_a_double_width_emoji_icon_align_their_wrapped_description_like_any_other_row()
  {
-    // `FOLDER_ICON`/`LINK_ICON` are double-width emoji, unlike the
+    // `FOLDER_ICON` is a double-width emoji, unlike the
     // single-column bullet/pencil/etc. glyphs used elsewhere in the
     // Glossary. Measuring the header by `.chars().count()` (1 char for
     // the emoji) instead of display width used to under-pad these rows
@@ -5192,8 +5359,7 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
         s.help_env_filter,
         s.help_env_delete,
         s.help_env_reopen,
-        s.help_env_link,
-        s.help_env_view_linked,
+        s.help_env_view_vars,
         s.help_tab_manage,
         s.help_restore_request,
         s.help_tab_reorder,
@@ -5593,7 +5759,7 @@ fn git_icon_shown_on_env_heading_independently_of_the_collection_origin() {
         }),
     };
     let env_id = add_global_env(&mut app, env);
-    app.collections[ci].linked_env_id = Some(env_id);
+    app.collections[ci].env_id = Some(env_id);
     assert!(
         app.collections[ci].git_origin.is_none(),
         "collection itself was not loaded from git"
@@ -5639,7 +5805,8 @@ fn the_active_environment_is_pinned_above_the_list() {
             active_id = id;
         }
     }
-    app.active_env_id = Some(active_id);
+    let ci = app.active_tab;
+    app.collections[ci].env_id = Some(active_id);
 
     let area = ratatui::layout::Rect::new(0, 0, 40, 10);
     let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
@@ -5685,7 +5852,8 @@ fn the_pinned_line_says_when_no_environment_is_active() {
             git_origin: None,
         },
     );
-    app.active_env_id = None;
+    let ci = app.active_tab;
+    app.collections[ci].env_id = None;
 
     let area = ratatui::layout::Rect::new(0, 0, 40, 10);
     let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
@@ -5693,6 +5861,317 @@ fn the_pinned_line_says_when_no_environment_is_active() {
         .unwrap();
     let text = buffer_text(term.backend().buffer());
     assert!(text.contains(s.env_active_none), "got: {text}");
+}
+
+/// The pinned line answers for the tab you are looking at, so switching tabs
+/// must re-read it. One tab on staging and another on prod is the whole point
+/// of the per-tab model; a line that kept naming the last tab's environment
+/// would be worse than no line at all.
+#[test]
+fn the_pinned_line_follows_the_active_tab() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    let (staging, _) = crate::environment::parse_vars_pending("staging".into(), "R=s");
+    let staging_id = add_global_env(&mut app, staging);
+    let (prod, _) = crate::environment::parse_vars_pending("prod".into(), "R=p");
+    let prod_id = add_global_env(&mut app, prod);
+    app.add_collection("second");
+    app.collections[0].env_id = Some(staging_id);
+    app.collections[1].env_id = Some(prod_id);
+
+    let area = ratatui::layout::Rect::new(0, 0, 40, 10);
+    let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+    let pinned = |app: &TuiApp, term: &mut Terminal<TestBackend>| {
+        term.draw(|f| super::draw::draw_env_panel(f, area, app, &s, &th))
+            .unwrap();
+        buffer_text(term.backend().buffer())
+            .lines()
+            .find(|l| l.contains(s.env_active_label.trim()))
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    app.active_tab = 0;
+    assert!(
+        pinned(&app, &mut term).contains("staging"),
+        "tab 0's environment is the one named"
+    );
+    app.active_tab = 1;
+    let line = pinned(&app, &mut term);
+    assert!(line.contains("prod"), "tab 1 names its own: {line}");
+    assert!(!line.contains("staging"), "and not the other tab's: {line}");
+}
+
+// ── prettify a JSON body ──────────────────────────────────────────────────
+
+/// A collection holding one request with `body` as its authored body, selected.
+fn app_with_body(body: &str) -> TuiApp {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        method: "POST".into(),
+        url: "http://h/x".into(),
+        body_src: Some(body.to_string()),
+        ..Default::default()
+    }];
+    app.collections[ci].selected_entry = 0;
+    app
+}
+
+fn body_of(app: &TuiApp) -> Option<&str> {
+    app.collections[app.active_tab].entries[0]
+        .body_src
+        .as_deref()
+}
+
+#[test]
+fn p_lays_the_selected_requests_json_body_out_again() {
+    let mut app = app_with_body(r#"{"a":1,"b":[2]}"#);
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('p'));
+
+    assert_eq!(
+        body_of(&app),
+        Some("{\n  \"a\": 1,\n  \"b\": [\n    2\n  ]\n}")
+    );
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::BodyPrettified)),
+        "got {:?}",
+        app.status
+    );
+    assert!(
+        app.collections[app.active_tab].entries[0].modified,
+        "the request now differs from its saved version, and must say so"
+    );
+}
+
+/// The body is what the Main panel is showing, so the key means the same thing
+/// from there — restricting it to the list would make it a trick to discover.
+#[test]
+fn p_works_from_the_main_panel_too() {
+    let mut app = app_with_body(r#"{"a":1}"#);
+    app.focus = Pane::Main;
+    press(&mut app, KeyCode::Char('p'));
+    assert_eq!(body_of(&app), Some("{\n  \"a\": 1\n}"));
+}
+
+/// The Request JSON preview is cached per selected entry, so rewriting the
+/// body underneath it leaves the pane drawing the old text while the status
+/// bar claims a reformat — worst for exactly the bodies this key exists for,
+/// where the preview carries the raw source because it will not parse.
+#[test]
+fn p_refreshes_the_request_json_preview_it_just_invalidated() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    // A commented body: `build_request_json` cannot parse it, so it embeds the
+    // source verbatim and the reformat is visible in the preview.
+    let mut app = app_with_body("{\"a\":1, // note\n\"b\":2}");
+    app.default_request_view = RequestView::Json;
+    app.focus = Pane::List;
+    let ci = app.active_tab;
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert!(
+        app.collections[ci]
+            .request_json_buf
+            .contains("{\\\"a\\\":1,"),
+        "the preview starts out holding the unformatted source: {:?}",
+        app.collections[ci].request_json_buf
+    );
+
+    press(&mut app, KeyCode::Char('p'));
+    assert!(
+        app.collections[ci].request_json_for.is_none(),
+        "the cached preview must be marked stale by the rewrite"
+    );
+
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let buf = &app.collections[ci].request_json_buf;
+    assert!(
+        buf.contains("\\\"a\\\": 1,"),
+        "the redraw must show the reformatted body: {buf:?}"
+    );
+    assert!(
+        !buf.contains("{\\\"a\\\":1,"),
+        "and not still the old one: {buf:?}"
+    );
+}
+
+/// Silence would read as a broken key. Both "nothing to do" cases say what
+/// they did, and neither touches the body.
+#[test]
+fn p_says_so_when_there_is_nothing_to_do() {
+    let already = "{\n  \"a\": 1\n}";
+    let mut app = app_with_body(already);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Char('p'));
+    assert_eq!(body_of(&app), Some(already));
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::BodyAlreadyTidy)),
+        "got {:?}",
+        app.status
+    );
+    assert!(
+        !app.collections[app.active_tab].entries[0].modified,
+        "a reformat that changed nothing must not mark the request edited"
+    );
+
+    // A GraphQL body: its `//` is data, and mangling it would be far worse
+    // than refusing.
+    let graphql = "query { user // not a comment\n}";
+    let mut app = app_with_body(graphql);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Char('p'));
+    assert_eq!(body_of(&app), Some(graphql));
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::BodyNotJson)),
+        "got {:?}",
+        app.status
+    );
+
+    // And a request with no body at all answers rather than doing nothing.
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry::default()];
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Char('p'));
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::BodyNotJson)),
+        "got {:?}",
+        app.status
+    );
+}
+
+/// The reason this isn't a `serde_json` round-trip, driven through the key the
+/// user actually presses: every one of these would come back rewritten, and
+/// every one of them changes what the server is sent.
+#[test]
+fn p_keeps_comments_templates_numbers_and_key_order() {
+    let src = "{\"z\":1.50,// note\n\"a\":{{ COUNT }},\"z\":1e3}";
+    let mut app = app_with_body(src);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Char('p'));
+    let out = body_of(&app).expect("still has a body");
+    assert_eq!(
+        out,
+        "{\n  \"z\": 1.50, // note\n  \"a\": {{ COUNT }},\n  \"z\": 1e3\n}"
+    );
+}
+
+/// The hint is how anyone finds Alt+P — it isn't a printable key and the Body
+/// is a free-text field, so nothing else advertises it. It belongs only where
+/// it works.
+#[test]
+fn the_wizard_offers_the_format_hint_only_on_the_body() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let footer = |app: &TuiApp| -> String {
+        let form = form_ref(app);
+        let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        term.draw(|f| super::new_request::draw_new_request(f, form, &s, &th, true))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        let area = *buf.area();
+        (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    app.on_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::ALT));
+    assert_eq!(new_focus(&app), NewField::Body);
+    assert!(
+        footer(&app).contains(s.hint_prettify_body),
+        "the Body field should advertise {:?}",
+        s.hint_prettify_body
+    );
+
+    app.on_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT));
+    press(&mut app, KeyCode::Enter); // "+ Add Header" -> Header(0, Key)
+    assert!(
+        !footer(&app).contains(s.hint_prettify_body),
+        "a header cell has no body to format"
+    );
+}
+
+/// The wizard's half. `p` can't be reused there — the Body is a text field, and
+/// a printable key that stopped typing would be the worse bug — so Alt+P does
+/// it, and a bare `p` must still type a `p`.
+#[test]
+fn alt_p_lays_the_body_out_inside_the_request_editor() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    app.on_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::ALT));
+    assert_eq!(new_focus(&app), NewField::Body, "Alt+6 is the Body section");
+    type_str(&mut app, r#"{"a":1,"b":[2]}"#);
+
+    app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+
+    assert_eq!(
+        form_ref(&app).body.text(),
+        "{\n  \"a\": 1,\n  \"b\": [\n    2\n  ]\n}"
+    );
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::BodyPrettified)),
+        "got {:?}",
+        app.status
+    );
+    // Ctrl+Z is the way back: `replace_text` takes a checkpoint, so the old
+    // layout is one undo away rather than gone.
+    app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert_eq!(form_ref(&app).body.text(), r#"{"a":1,"b":[2]}"#);
+}
+
+#[test]
+fn a_bare_p_in_the_body_still_types_a_p() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    app.on_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::ALT));
+    type_str(&mut app, "pop");
+    assert_eq!(form_ref(&app).body.text(), "pop");
+}
+
+/// Prettifying a long body is exactly when being dumped back at line one costs
+/// most, so the cursor rides along to the character it was on.
+#[test]
+fn the_body_cursor_stays_on_the_character_it_was_on() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    app.on_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::ALT));
+    type_str(&mut app, r#"{"a":1,"bee":2}"#);
+    // Put the cursor just after the `b` of "bee".
+    let col = r#"{"a":1,"b"#.chars().count();
+    match app.overlay.as_mut().unwrap() {
+        Overlay::NewRequest(f) => f.body.set_cursor(0, col),
+        _ => panic!("wizard not open"),
+    }
+
+    app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+
+    let f = form_ref(&app);
+    let line = &f.body.lines[f.body.row];
+    assert_eq!(
+        line.chars().nth(f.body.col - 1),
+        Some('b'),
+        "landed at {}:{} in {line:?}",
+        f.body.row,
+        f.body.col
+    );
 }
 
 // ── "Save Collection to Git" wizard ─────────────────────────────────────
@@ -5764,7 +6243,7 @@ fn choose_paths_checkbox_toggles_and_tab_skips_the_hidden_env_path_field() {
         .push(Collection::new("api".into(), Vec::new()));
     let ci = app.collections.len() - 1;
     let env_id = add_empty_global_env(&mut app, "e");
-    app.collections[ci].linked_env_id = Some(env_id);
+    app.collections[ci].env_id = Some(env_id);
     app.collections[ci].git_origin = Some(GitOrigin {
         repo_url: "https://example.test/repo.git".into(),
         path: "api/health.hurl".into(),
@@ -6621,6 +7100,56 @@ fn r_reloads_only_a_failed_env_var_and_leaves_others_alone() {
     assert!(
         matches!(app.status, Some(crate::i18n::Status::EnvVarReloading(ref k)) if k == "TOKEN"),
         "the status bar should confirm which variable is being retried"
+    );
+}
+
+#[test]
+fn both_variable_groups_are_labelled_and_the_selection_skips_the_heading() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = app_with_resolved_secret("s3cr3t");
+    let tab = app.active_tab;
+    app.collections[tab]
+        .captures
+        .insert("token".into(), "T0KEN".into());
+
+    let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+    let popup = EnvPopupState::new(only_env_id(&app));
+    term.draw(|f| super::draw::draw_env_popup(f, &app, &popup, &s, &th))
+        .unwrap();
+    let panel = buffer_text(term.backend().buffer());
+    assert!(
+        panel.contains(s.vars_group_env),
+        "the environment's own rows are labelled too:\n{panel}"
+    );
+    assert!(
+        panel.contains(s.vars_group_captures),
+        "the captures group keeps its label:\n{panel}"
+    );
+    let rows: Vec<&str> = panel.lines().collect();
+    let heading = rows
+        .iter()
+        .position(|r| r.contains(s.vars_group_env))
+        .expect("environment heading on screen");
+    assert!(
+        !rows[heading].contains('\u{203a}'),
+        "the highlight sits on a heading instead of a variable:\n{panel}"
+    );
+    assert!(
+        rows[heading + 1].contains('\u{203a}'),
+        "the first variable under the heading is the selected row:\n{panel}"
+    );
+    // Centred, not left-aligned: the variable rows start at the left, so a
+    // heading that starts there too reads as one more of them.
+    let (before, _) = rows[heading]
+        .split_once(s.vars_group_env)
+        .expect("heading row holds the label");
+    assert!(
+        before.contains('\u{2500}'),
+        "the heading is flush left instead of centred in its rule:\n{panel}"
     );
 }
 
@@ -7976,6 +8505,59 @@ fn response_panel_shows_other_entrys_response_while_one_is_sending() {
     );
 }
 
+/// A request Hurl is retrying says which attempt it is on. Every attempt of a
+/// retried entry comes back at once, when the poll finally settles, so a
+/// `retry: 5, retry-interval: 2000` request would otherwise sit on a bare
+/// "Sending…" for ten seconds — indistinguishable from a hung server.
+#[test]
+fn the_response_panel_says_which_retry_is_being_waited_on() {
+    use crate::hurl::RunStatus;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries.push(HurlEntry::default());
+    app.collections[ci].entries[0].last_run = RunStatus::Running;
+    app.collections[ci].entries[0].retry_attempt = Some((2, crate::hurl::RetryLimit::Times(5)));
+
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains("retry 2 of 5"),
+        "the spinner should say which attempt is running:\n{out}"
+    );
+
+    // `retry: -1` is a poll that will go on asking, which is worth saying: it
+    // keeps the shape of the sentence and answers the question the reader
+    // actually has.
+    app.collections[ci].entries[0].retry_attempt = Some((3, crate::hurl::RetryLimit::Forever));
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains("retry 3 of ∞"),
+        "a forever-poll should say so rather than drop the total:\n{out}"
+    );
+
+    // A `{{placeholder}}` limit nothing could resolve has no total at all, so
+    // the hint states the attempt and stops rather than inventing one.
+    app.collections[ci].entries[0].retry_attempt = Some((4, crate::hurl::RetryLimit::Unknown));
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains("retry 4") && !out.contains(" of "),
+        "an unknown limit should not claim a total:\n{out}"
+    );
+}
+
 /// A failed status assertion (e.g. `HTTP 200` but the server returned 500)
 /// still shows the full response — status line, the failing assert marked ✗,
 /// and the response body — instead of replacing everything with the error text.
@@ -8630,6 +9212,52 @@ fn response_panel_shows_a_scrollbar_overlaid_on_the_border_outside_the_selectabl
     );
 }
 
+/// The request summary shows the request's `[Options]` rows. Nothing else in
+/// the TUI did: a request told to `retry: 5` with a two-second interval can sit
+/// on "Sending…" for ten seconds, and the reader had no way to see that this is
+/// the request doing exactly as it was told. Disabled rows are left out — they
+/// round-trip as comments and are not applied.
+#[test]
+fn the_request_summary_lists_the_options_a_request_carries() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    let mut entry = HurlEntry::from_fields("t", "GET", "http://h/poll", vec![], "");
+    entry.options = vec![
+        crate::hurl::KvRow {
+            key: "retry".to_string(),
+            value: "5".to_string(),
+            enabled: true,
+            ..Default::default()
+        },
+        crate::hurl::KvRow {
+            key: "delay".to_string(),
+            value: "1000".to_string(),
+            enabled: false,
+            ..Default::default()
+        },
+    ];
+    app.collections[ci].entries = vec![entry];
+
+    let mut term = Terminal::new(TestBackend::new(70, 20)).unwrap();
+    term.draw(|f| super::draw::draw_collection_main(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = flattened_content(term.backend().buffer());
+    assert!(
+        out.contains("[Options]") && out.contains("retry: 5"),
+        "the summary should show the request's options:\n{out}"
+    );
+    assert!(
+        out.contains("[Options] 1"),
+        "only the enabled option counts — the disabled one appears in the Hurl \
+         text below as the comment it round-trips as:\n{out}"
+    );
+}
+
 #[test]
 fn request_json_panel_wraps_long_lines_instead_of_truncating() {
     // Regression test: a very long, unbroken line in the Request JSON
@@ -9104,7 +9732,7 @@ fn main_panel_copy_uses_the_substituted_value_not_the_raw_template() {
             git_origin: None,
         },
     );
-    app.collections[ci].linked_env_id = Some(env_id);
+    app.collections[ci].env_id = Some(env_id);
     app.focus = Pane::Main;
 
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -9166,15 +9794,14 @@ fn main_panel_copy_uses_the_substituted_value_not_the_raw_template() {
     );
 }
 
-/// The shadow-warning icon (`!`) that's rendered immediately before a
-/// shadowed substitution's value is a pure UI annotation, not part of
-/// the request — including it in copied text would silently corrupt a
-/// pasted/sent request for anyone who doesn't manually remove it. It
-/// must be excluded from both the whole-panel copy and a dragged
-/// selection, while every *other*, legitimate `!` character in the body
-/// (e.g. one that's simply part of a URL) must still be copied intact.
+/// Copying the Main panel must yield the text the user sees, character
+/// for character: the substituted value in full, and every legitimate
+/// `!` in the body (e.g. one that's simply part of a URL) intact. This
+/// guarded against a UI annotation leaking into the clipboard back when
+/// shadowed substitutions were flagged inline; the copy guarantee it
+/// pins down outlives the annotation.
 #[test]
-fn main_panel_copy_excludes_the_shadow_icon_but_keeps_other_exclamation_marks() {
+fn main_panel_copy_keeps_substituted_values_and_exclamation_marks() {
     use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -9188,35 +9815,24 @@ fn main_panel_copy_excludes_the_shadow_icon_but_keeps_other_exclamation_marks() 
     };
     app.collections[ci].entries = vec![entry];
 
-    let (active, _) = crate::environment::parse_vars_pending("active".into(), "TOKEN=from-active");
-    let active_id = add_global_env(&mut app, active);
-    app.active_env_id = Some(active_id);
-    let (linked, _) = crate::environment::parse_vars_pending("linked".into(), "TOKEN=secret123");
-    let linked_id = add_global_env(&mut app, linked);
-    app.collections[ci].linked_env_id = Some(linked_id);
+    let (env, _) = crate::environment::parse_vars_pending("staging".into(), "TOKEN=secret123");
+    let env_id = add_global_env(&mut app, env);
+    app.collections[ci].env_id = Some(env_id);
     app.focus = Pane::Main;
 
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
-    assert!(
-        !app.main_shadow_icon_positions.is_empty(),
-        "TOKEN is defined in both envs, so a shadow icon must have been recorded"
-    );
 
     let text = app
         .whole_panel_text(Pane::Main)
         .expect("main panel has content");
     assert!(
         text.contains("secret123"),
-        "the shadowed (linked) value must still be copied: {text}"
-    );
-    assert!(
-        !text.contains("!secret123"),
-        "the shadow icon glued to the value must not be copied: {text}"
+        "the substituted value must be copied: {text}"
     );
     assert!(
         text.contains("path!important"),
-        "an unrelated, legitimate '!' must still be copied intact: {text}"
+        "a legitimate '!' must still be copied intact: {text}"
     );
 
     // Same guarantee for a mouse-dragged selection covering the
@@ -9251,11 +9867,7 @@ fn main_panel_copy_excludes_the_shadow_icon_but_keeps_other_exclamation_marks() 
         .expect("selection should extract text");
     assert!(
         selected.contains("secret123"),
-        "dragged selection must contain the shadowed value: {selected}"
-    );
-    assert!(
-        !selected.contains("!secret123"),
-        "dragged selection must not contain the shadow icon: {selected}"
+        "dragged selection must contain the substituted value: {selected}"
     );
     let _ = sel;
 }
@@ -10388,7 +11000,7 @@ fn environment_persists_in_source_form_without_leaking_secrets() {
     let mut restored = TuiApp::default();
     restored.apply_persisted(snapshot);
     assert_eq!(
-        restored.collections[0].linked_env_id,
+        restored.collections[0].env_id,
         Some(only_env_id(&restored)),
         "the collection relinks to the restored env"
     );
@@ -11509,7 +12121,7 @@ fn collection_list_substitutes_and_colour_codes_by_status() {
     );
     let mut app = TuiApp::default();
     let env_id = add_global_env(&mut app, env);
-    col.linked_env_id = Some(env_id);
+    col.env_id = Some(env_id);
     app.collections.push(col);
     app.active_tab = 1;
     app.focus = Pane::List; // selected_entry 0 is highlighted; rows 1 & 2 keep their colours
@@ -11685,7 +12297,7 @@ fn opening_a_plain_value_prompt_has_no_still_secret_checkbox() {
     let mut app = TuiApp::default();
     let (env, _) = crate::environment::parse_vars_pending("e".into(), "PLAIN=hello");
     let env_id = add_global_env(&mut app, env);
-    app.collections[0].linked_env_id = Some(env_id);
+    app.collections[0].env_id = Some(env_id);
     app.overlay = Some(Overlay::EnvPopup(EnvPopupState::new(env_id)));
     press(&mut app, KeyCode::Enter);
     match &app.overlay {
@@ -11807,7 +12419,7 @@ fn editing_a_literal_value_into_an_op_reference_reclassifies_and_queues_loading(
     let mut app = TuiApp::default();
     let (env, _) = crate::environment::parse_vars_pending("e".into(), "BASE_URL=127.0.0.1");
     let env_id = add_global_env(&mut app, env);
-    app.collections[0].linked_env_id = Some(env_id);
+    app.collections[0].env_id = Some(env_id);
     let before = app.pending_env.len();
 
     app.commit_prompt_with_secrecy(
@@ -11842,7 +12454,7 @@ fn editing_a_literal_value_into_an_ssm_reference_reclassifies_and_queues_loading
     let mut app = TuiApp::default();
     let (env, _) = crate::environment::parse_vars_pending("e".into(), "BASE_URL=127.0.0.1");
     let env_id = add_global_env(&mut app, env);
-    app.collections[0].linked_env_id = Some(env_id);
+    app.collections[0].env_id = Some(env_id);
     let before = app.pending_env.len();
 
     app.commit_prompt_with_secrecy(
@@ -11875,7 +12487,7 @@ fn editing_a_plain_value_to_another_plain_value_stays_literal_with_no_pending_wo
     let mut app = TuiApp::default();
     let (env, _) = crate::environment::parse_vars_pending("e".into(), "BASE_URL=127.0.0.1");
     let env_id = add_global_env(&mut app, env);
-    app.collections[0].linked_env_id = Some(env_id);
+    app.collections[0].env_id = Some(env_id);
     let before = app.pending_env.len();
 
     app.commit_prompt_with_secrecy(PromptKind::EnvValue(env_id, 0), "10.0.0.1".into(), true);
@@ -14508,6 +15120,34 @@ fn raw_mode_edits_fields_the_wizard_does_not_expose() {
     assert!(e.modified);
 }
 
+/// An edit that touches only a comment is still an edit. The save path used to
+/// decide "did anything change?" from a hand-written list of fields that had
+/// fallen behind the struct, so a comment the user added in Hurl Mode was
+/// parsed, judged identical and silently discarded.
+#[test]
+fn raw_mode_keeps_an_edit_that_only_adds_a_comment() {
+    let entry = HurlEntry::from_fields("r", "GET", "http://h/x", vec![], "");
+    let mut app = TuiApp::default();
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::Main;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT));
+    if let Some(Overlay::Prompt { editor, .. }) = &mut app.overlay {
+        let new_text = format!("{}\n# a trailing note\n", editor.text().trim_end());
+        *editor = super::editor::Editor::new(&new_text, true);
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    assert!(app.overlay.is_none(), "valid hurl commits and closes");
+    let e = &app.collections[0].entries[0];
+    assert!(
+        e.comments.iter().any(|c| c.text == "# a trailing note"),
+        "a comment-only edit must be kept, got {:?}",
+        e.comments
+    );
+    assert!(e.modified);
+}
+
 /// Shift+Arrow inside the Raw Mode editor selects text (extending from
 /// wherever the cursor was when Shift was first held) without
 /// disturbing the underlying text, and Ctrl+Y copies exactly that
@@ -16859,6 +17499,38 @@ fn list_panel_title_tracks_the_loaded_collection_while_the_tab_bar_keeps_the_tab
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The title bar names the tab's environment, joined by a dim middot. It used
+/// to be a 🔗, from when an environment was *linked* to a collection as a second
+/// layer over an app-wide active one; there is now one environment per tab and
+/// nothing to link, so an icon for the old relationship would be naming a
+/// feature that no longer exists.
+#[test]
+fn the_list_panel_title_names_the_tabs_environment_without_a_link_icon() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut app = TuiApp::default();
+    let (env, _) = crate::environment::parse_vars_pending("staging".into(), "HOST=h");
+    let env_id = add_global_env(&mut app, env);
+    let ci = app.active_tab;
+    app.collections[ci].env_id = Some(env_id);
+
+    let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+
+    assert!(
+        text.contains("staging"),
+        "the tab's environment is named in the title:\n{text}"
+    );
+    assert!(
+        text.contains("\u{00b7} staging"),
+        "joined by the middot the Environment panel's title also uses:\n{text}"
+    );
+    assert!(
+        !text.contains('\u{1F517}'),
+        "the link icon belonged to the removed linked-environment layer:\n{text}"
+    );
+}
+
 #[test]
 fn a_git_downloaded_workspace_tab_shows_both_the_git_and_folder_icons() {
     use ratatui::{Terminal, backend::TestBackend};
@@ -18433,7 +19105,7 @@ fn run_all_entries_blocks_when_any_entry_references_a_still_pending_secret() {
 
     let mut app = TuiApp::default();
     let env_id = add_global_env(&mut app, env);
-    col.linked_env_id = Some(env_id);
+    col.env_id = Some(env_id);
     app.collections.push(col);
 
     app.run_all_entries(1);
@@ -18539,7 +19211,7 @@ fn run_entry_says_nothing_when_every_variable_is_defined() {
 
     let mut app = TuiApp::default();
     let env_id = add_global_env(&mut app, env);
-    col.linked_env_id = Some(env_id);
+    col.env_id = Some(env_id);
     app.collections.push(col);
 
     app.run_entry(1);
@@ -18578,7 +19250,7 @@ fn undefined_variables_name_a_loaded_environment_that_defines_them() {
     };
 
     let mut app = TuiApp::default();
-    // Loaded, but deliberately neither activated nor linked.
+    // Loaded, but deliberately not activated on any tab.
     add_global_env(&mut app, env);
     app.collections
         .push(Collection::new("t".to_string(), vec![entry]));
@@ -18600,9 +19272,67 @@ fn undefined_variables_name_a_loaded_environment_that_defines_them() {
 
     // Once it is in use, nothing is reported at all.
     let env_id = app.global_envs[0].id;
-    app.set_active_env(Some(env_id));
+    app.collections[1].env_id = Some(env_id);
     app.run_entry(1);
     assert!(app.status.is_none(), "got {:?}", app.status);
+}
+
+/// A "Run All" pass carries the retry hint through to the entry being retried,
+/// and drops it the moment the run ends — a stale "retry 2 of 5" on a finished
+/// request would be worse than none at all.
+#[test]
+fn a_run_all_pass_marks_the_entry_it_is_retrying() {
+    let col = Collection::new(
+        "t".to_string(),
+        vec![HurlEntry::default(), HurlEntry::default()],
+    );
+    let col_id = col.id;
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let update = crate::request::BatchRunUpdate {
+        col_id,
+        results: vec![Some(true), None],
+        captures: std::collections::HashMap::new(),
+        responses: vec![None, None],
+        retrying: Some((1, 2, crate::hurl::RetryLimit::Times(5))),
+    };
+    tx.send(update.clone()).unwrap();
+    app.pending_batch_runs.push(rx);
+    app.poll_batch_run_updates();
+
+    let col = &app.collections[1];
+    assert_eq!(
+        col.entries[1].retry_attempt,
+        Some((2, crate::hurl::RetryLimit::Times(5))),
+        "the retried entry should carry the attempt it is on"
+    );
+    assert_eq!(
+        col.entries[0].retry_attempt, None,
+        "only the entry actually being retried is marked"
+    );
+
+    // The poll settles: the entry's outcome arrives, which ends the wait. (The
+    // runner sends exactly this — `retrying` is cleared by the same hook that
+    // stamps the result — so a finished request never keeps a stale hint.)
+    tx.send(crate::request::BatchRunUpdate {
+        results: vec![Some(true), Some(true)],
+        retrying: None,
+        ..update
+    })
+    .unwrap();
+    drop(tx);
+    for _ in 0..3 {
+        app.poll_batch_run_updates();
+    }
+    assert!(
+        app.collections[1]
+            .entries
+            .iter()
+            .all(|e| e.retry_attempt.is_none()),
+        "a finished run leaves no request claiming to be retrying"
+    );
 }
 
 #[test]
@@ -18647,6 +19377,7 @@ fn poll_batch_run_updates_applies_pass_fail_markers_captures_and_summary() {
         None,
     ];
     tx.send(crate::request::BatchRunUpdate {
+        retrying: None,
         col_id,
         results: vec![Some(true), Some(false), None],
         captures,
@@ -20804,8 +21535,10 @@ impl crate::report::run::EntryRunner for FakeReportRunner {
         _vars: &std::collections::HashMap<String, String>,
     ) -> crate::hurl::RunOutput {
         crate::hurl::RunOutput {
+            generated: Default::default(),
             entries: vec![crate::hurl::EntryOutcome {
                 entry_index: 0,
+                superseded: false,
                 method: base.method.clone(),
                 url: base.url.clone(),
                 status: 200,
@@ -22326,10 +23059,12 @@ fn dry_run_no_warning_when_var_in_env() {
             ..Default::default()
         }],
     ));
-    // Create and activate an environment that provides HOST.
+    // Create an environment that provides HOST and activate it on the tab
+    // holding the collection the report is bound to.
     let (env, _) = crate::environment::parse_vars_pending("myenv".into(), "HOST=example.test");
     let env_id = add_global_env(&mut app, env);
-    app.active_env_id = Some(env_id);
+    let ci = app.collections.len() - 1;
+    app.collections[ci].env_id = Some(env_id);
 
     app.new_report_tab();
     let idx = app.active_report_index().unwrap();
@@ -22565,10 +23300,11 @@ fn environment_header_selects_the_named_env_as_base_vars() {
             ..Default::default()
         }],
     ));
-    // An active env with REGION=active, plus a "prod" env with REGION=prod.
+    // The tab's env supplies REGION=active, plus a "prod" env with REGION=prod.
     let (active, _) = crate::environment::parse_vars_pending("global".into(), "REGION=active");
     let active_id = add_global_env(&mut app, active);
-    app.active_env_id = Some(active_id);
+    let ci = app.collections.len() - 1;
+    app.collections[ci].env_id = Some(active_id);
     let (prod, _) = crate::environment::parse_vars_pending("prod".into(), "REGION=prod");
     add_global_env(&mut app, prod);
 
@@ -22613,7 +23349,8 @@ fn without_environment_header_the_active_env_is_used() {
     ));
     let (active, _) = crate::environment::parse_vars_pending("global".into(), "REGION=active");
     let active_id = add_global_env(&mut app, active);
-    app.active_env_id = Some(active_id);
+    let ci = app.collections.len() - 1;
+    app.collections[ci].env_id = Some(active_id);
 
     app.new_report_tab();
     let idx = app.active_report_index().unwrap();
@@ -23028,7 +23765,11 @@ fn the_expression_cell_suggests_generator_functions() {
     let dd = form_ref(&app).key_dropdown().expect("suggestions");
     assert_eq!(
         dd.1,
-        vec!["hmac_sha256(key, message)", "hmac_sha256_b64(key, message)"]
+        vec![
+            "hmac_sha256(key, message)",
+            "hmac_sha256_b64(key, message)",
+            "hmac_sha256_b64url(key, message)"
+        ]
     );
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
@@ -23093,7 +23834,10 @@ fn a_suggestion_replaces_only_the_word_being_typed() {
     open_form_on_computed_expression(&mut app);
     type_str(&mut app, "concat(sha25");
     let dd = form_ref(&app).key_dropdown().expect("suggestions");
-    assert_eq!(dd.1, vec!["sha256(text)", "sha256_b64(text)"]);
+    assert_eq!(
+        dd.1,
+        vec!["sha256(text)", "sha256_b64(text)", "sha256_b64url(text)"]
+    );
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
     let form = form_ref(&app);
@@ -27637,7 +28381,7 @@ fn re_opening_a_loaded_environment_refreshes_it_instead_of_asking() {
         .expect("loaded");
     // Link it, to prove the reload keeps the identity the link points at.
     let ci = app.active_tab;
-    app.collections[ci].linked_env_id = Some(id);
+    app.collections[ci].env_id = Some(id);
 
     std::fs::write(&path, "TOKEN=new\n").unwrap();
     let again =
@@ -27651,7 +28395,7 @@ fn re_opening_a_loaded_environment_refreshes_it_instead_of_asking() {
     assert_eq!(app.global_envs.len(), 1, "and not duplicated");
     assert_eq!(app.global_envs[0].vars[0].raw, "new", "with the new value");
     assert_eq!(
-        app.collections[ci].linked_env_id,
+        app.collections[ci].env_id,
         Some(id),
         "the link survives the reload"
     );
@@ -27827,7 +28571,7 @@ fn typing_a_filter_does_not_trigger_the_panels_letter_actions() {
 
     assert_eq!(app.env_query, "aegon");
     assert_eq!(
-        app.active_env_id, None,
+        app.collections[app.active_tab].env_id, None,
         "`a` typed a letter, it didn't activate"
     );
     assert_eq!(app.global_envs.len(), 1, "`x` would have deleted, `q` quit");
@@ -27841,7 +28585,7 @@ fn typing_a_filter_does_not_trigger_the_panels_letter_actions() {
 
     // With the filter gone the panel's keys work again.
     press(&mut app, KeyCode::Char('a'));
-    assert_eq!(app.active_env_id, Some(id));
+    assert_eq!(app.collections[app.active_tab].env_id, Some(id));
 }
 
 /// The actions act on the row under the cursor, which is a row of the *filtered*
@@ -27865,7 +28609,7 @@ fn panel_actions_target_the_selected_row_of_the_filtered_list() {
 
     press(&mut app, KeyCode::Char('a'));
     assert_eq!(
-        app.active_env_id,
+        app.collections[app.active_tab].env_id,
         Some(target),
         "activation followed the filtered selection, not list position 0"
     );
@@ -27976,7 +28720,8 @@ fn g_jumps_the_environments_panel_to_the_active_environment() {
     let id = app
         .load_environment_text("mmm".into(), "TOKEN=m\n", Some(dir.join("mmm.vars")), None)
         .expect("loaded");
-    app.active_env_id = Some(id);
+    let ci = app.active_tab;
+    app.collections[ci].env_id = Some(id);
 
     // Somewhere else entirely, the way scrolling a long list leaves you.
     app.global_env_idx = 0;
@@ -28006,7 +28751,8 @@ fn g_clears_a_filter_that_is_hiding_the_active_environment() {
     let id = app
         .load_environment_text("mmm".into(), "TOKEN=m\n", Some(dir.join("mmm.vars")), None)
         .expect("loaded");
-    app.active_env_id = Some(id);
+    let ci = app.active_tab;
+    app.collections[ci].env_id = Some(id);
     app.env_query = "aaa".into();
     assert!(
         app.env_rows().iter().all(|r| r.env_id() != Some(id)),
@@ -28051,7 +28797,8 @@ fn the_environments_panel_announces_the_goto_key_only_when_something_is_active()
     let id = app
         .load_environment_text("dev".into(), "TOKEN=t\n", Some(dir.join("dev.vars")), None)
         .expect("loaded");
-    app.active_env_id = Some(id);
+    let ci = app.active_tab;
+    app.collections[ci].env_id = Some(id);
     assert!(
         render(&app).contains(s.foot_env_goto_active),
         "announced: {}",
@@ -28151,7 +28898,11 @@ fn a_on_a_workspace_environment_file_loads_and_activates_it() {
 
     assert_eq!(app.global_envs.len(), 1);
     let id = app.global_envs[0].id;
-    assert_eq!(app.active_env_id, Some(id), "and it is now the active one");
+    assert_eq!(
+        app.collections[app.active_tab].env_id,
+        Some(id),
+        "and it is now the active one"
+    );
     assert_eq!(
         app.selected_env_id(),
         Some(id),
@@ -28170,7 +28921,7 @@ fn a_on_a_workspace_environment_file_loads_and_activates_it() {
         1,
         "nor load a second copy of the file"
     );
-    assert_eq!(app.active_env_id, Some(id));
+    assert_eq!(app.collections[app.active_tab].env_id, Some(id));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -28196,7 +28947,10 @@ fn right_clicking_a_workspace_environment_file_activates_it() {
 
     assert_eq!(app.collections[ci].list_cursor, env_idx);
     assert_eq!(app.global_envs.len(), 1);
-    assert_eq!(app.active_env_id, Some(app.global_envs[0].id));
+    assert_eq!(
+        app.collections[app.active_tab].env_id,
+        Some(app.global_envs[0].id)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -28224,7 +28978,7 @@ fn right_clicking_a_non_environment_row_does_nothing() {
     });
 
     assert!(app.global_envs.is_empty());
-    assert_eq!(app.active_env_id, None);
+    assert_eq!(app.collections[app.active_tab].env_id, None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -31983,9 +32737,288 @@ fn render_footer(app: &mut TuiApp) -> String {
     (0..w).map(|x| buf[(x, h - 1)].symbol()).collect()
 }
 
+// ── Response ▸ Captures ───────────────────────────────────────────────────
+
+/// A response carrying `captures`, selected, with the Response pane focused.
+fn app_with_captures(captures: &[(&str, &str)]) -> TuiApp {
+    let mut app = app_with_response_body("{}");
+    let ci = app.active_tab;
+    if let Some(r) = app.collections[ci].entries[0].last_response.as_mut() {
+        r.captures = captures
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+    }
+    app.response_section = ResponseSection::Captures;
+    app
+}
+
+/// Render just the Response panel's text area as lines.
+fn response_lines(app: &mut TuiApp) -> Vec<String> {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let area = app.resp_text_area;
+    (area.y..area.bottom())
+        .map(|y| {
+            (area.x..area.right())
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The values are masked by default. A capture is almost always a bearer token
+/// — that is what `[Captures]` is largely for — and unlike an environment
+/// variable it carries no "secret" marking to go by, so the pane cannot tell a
+/// token from a page count and must assume the worse of the two.
+#[test]
+fn the_captures_section_masks_its_values_until_m_is_pressed() {
+    let mut app = app_with_captures(&[("access_token", "ey.super.secret")]);
+    let s = Strings::for_language(&app.language);
+
+    let lines = response_lines(&mut app);
+    let text = lines.join("\n");
+    assert!(
+        text.contains("access_token"),
+        "the name is listed: {text:?}"
+    );
+    assert!(
+        text.contains(crate::environment::SECRET_MASK),
+        "the value should be masked: {text:?}"
+    );
+    assert!(
+        !text.contains("ey.super.secret"),
+        "the value must not be on screen: {text:?}"
+    );
+    // The footer teaches the key, and says which way it is about to go.
+    let foot = render_footer(&mut app);
+    assert!(
+        foot.contains(s.foot_reveal),
+        "the footer should offer to reveal: {foot:?}"
+    );
+
+    press(&mut app, KeyCode::Char('m'));
+    let text = response_lines(&mut app).join("\n");
+    assert!(
+        text.contains("ey.super.secret"),
+        "m reveals the value: {text:?}"
+    );
+    let foot = render_footer(&mut app);
+    assert!(
+        foot.contains(s.foot_hide),
+        "and the footer now offers to hide it again: {foot:?}"
+    );
+}
+
+/// Masking is a defence against onlookers, not against the person who went
+/// looking for the token. Copying yields the real thing — the same bargain the
+/// compact body view strikes.
+#[test]
+fn copying_the_captures_section_yields_the_real_values() {
+    let mut app = app_with_captures(&[("access_token", "ey.super.secret")]);
+    let _ = response_lines(&mut app);
+    assert!(!app.response_reveal, "still masked on screen");
+
+    let copied = app
+        .whole_panel_text(Pane::Response)
+        .expect("the panel has text to copy");
+    assert!(
+        copied.contains("ey.super.secret"),
+        "a masked value nobody can retrieve would defeat the point of listing it: {copied:?}"
+    );
+    assert!(
+        !copied.contains(crate::environment::SECRET_MASK),
+        "the bullets are a view, not the text: {copied:?}"
+    );
+}
+
+/// The same bargain for a *partial* selection. `y` with nothing selected and a
+/// drag-select-and-copy must agree, and neither may depend on whether the user
+/// happened to leave the Body section's compact toggle on — same gesture, same
+/// screen, same text.
+#[test]
+fn dragging_across_a_masked_capture_copies_the_real_value() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with_captures(&[("access_token", "ey.super.secret")]);
+    app.focus = Pane::Response;
+    assert!(!app.response_compact, "the Body toggle is off, as it ships");
+
+    let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.resp_text_area;
+    assert!(area.width > 20 && area.height > 0, "captures must render");
+
+    let ev = |kind, col: u16| MouseEvent {
+        kind,
+        column: area.x + col,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 0));
+    app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), area.width - 1));
+    app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), area.width - 1));
+
+    // On screen the drag covered bullets...
+    let shown = app.resp_panel.selected_parts(None).join("");
+    assert!(
+        shown.contains(crate::environment::SECRET_MASK),
+        "the on-screen selection is masked: {shown:?}"
+    );
+    // ...but the clipboard gets the token.
+    let copied = app
+        .concatenated_selection_text()
+        .expect("a Response selection should copy something");
+    assert!(
+        copied.contains("ey.super.secret"),
+        "a drag-copy must yield what a whole-panel copy yields: {copied:?}"
+    );
+    assert!(
+        !copied.contains(crate::environment::SECRET_MASK),
+        "the bullets are a view, not the text: {copied:?}"
+    );
+}
+
+/// A captured value can carry newlines of its own — a PEM, or a whole response
+/// body — and then takes several rows on screen. The column map is read per
+/// row, so a capture that folded its rows into one entry would send every
+/// selection below it to the wrong value: dragging `token` used to copy a
+/// fragment of the PEM above it.
+#[test]
+fn a_multi_line_capture_does_not_misdirect_the_rows_below_it() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with_captures(&[
+        ("pem", "-----BEGIN-----\nmiddle\n-----END-----"),
+        ("token", "abc123"),
+    ]);
+    app.focus = Pane::Response;
+
+    let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.resp_text_area;
+
+    // Masked, the value takes one run of bullets per line, indented under the
+    // first so it still reads as one capture.
+    let lines = response_lines(&mut app);
+    let mask = crate::environment::SECRET_MASK;
+    assert_eq!(lines[0], format!("pem: {mask}"));
+    assert_eq!(lines[1], format!("     {mask}"));
+    assert_eq!(lines[2], format!("     {mask}"));
+    assert_eq!(lines[3], format!("token: {mask}"));
+
+    // Dragging the `token` row copies the token, not a slice of the PEM.
+    let ev = |kind, col: u16| MouseEvent {
+        kind,
+        column: area.x + col,
+        row: area.y + 3,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 0));
+    app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), area.width - 1));
+    app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), area.width - 1));
+    let copied = app
+        .concatenated_selection_text()
+        .expect("a Response selection should copy something");
+    assert!(
+        copied.contains("abc123") && !copied.contains("middle"),
+        "the row under the cursor is the one that gets copied: {copied:?}"
+    );
+
+    // Revealed, the value is copied straight off the panel, so it must not
+    // have gained the indentation the masked view draws.
+    press(&mut app, KeyCode::Char('m'));
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let copied = app
+        .whole_panel_text(Pane::Response)
+        .expect("the panel has text to copy");
+    assert!(
+        copied.contains("-----BEGIN-----\nmiddle\n-----END-----"),
+        "the PEM must survive verbatim: {copied:?}"
+    );
+}
+
+/// The reason the tab is not simply the live pool: a response keeps its
+/// captures for as long as the request keeps its last response, so a later run
+/// of some *other* request leaves this figure on screen looking current.
+#[test]
+fn a_capture_the_pool_has_moved_past_is_marked_superseded() {
+    let mut app = app_with_captures(&[("token", "first")]);
+    let s = Strings::for_language(&app.language);
+    app.response_reveal = true;
+
+    let text = response_lines(&mut app).join("\n");
+    assert!(
+        !text.contains(s.resp_capture_superseded),
+        "nothing has replaced it yet: {text:?}"
+    );
+
+    // Another request runs and captures the same name.
+    let ci = app.active_tab;
+    app.collections[ci]
+        .captures
+        .insert("token".into(), "second".into());
+
+    let text = response_lines(&mut app).join("\n");
+    assert!(
+        text.contains("first") && text.contains(s.resp_capture_superseded),
+        "the snapshot must admit it is one: {text:?}"
+    );
+}
+
+#[test]
+fn a_request_that_captured_nothing_says_so() {
+    let mut app = app_with_captures(&[]);
+    let s = Strings::for_language(&app.language);
+    let text = response_lines(&mut app).join("\n");
+    assert!(text.contains(s.resp_no_captures), "{text:?}");
+}
+
+/// `m` is the Requests list's "move to workspace" elsewhere, and means nothing
+/// on a body or a header table. Scoped to the one section it applies to, the
+/// same rule `c` (compact) already follows.
+#[test]
+fn m_is_only_the_reveal_key_on_the_captures_section() {
+    for section in [ResponseSection::Body, ResponseSection::Headers] {
+        let mut app = app_with_captures(&[("token", "t")]);
+        app.response_section = section;
+        press(&mut app, KeyCode::Char('m'));
+        assert!(
+            !app.response_reveal,
+            "{section:?} must not toggle the capture mask"
+        );
+    }
+    for pane in [Pane::List, Pane::Main, Pane::Tabs, Pane::GlobalEnv] {
+        let mut app = app_with_captures(&[("token", "t")]);
+        app.focus = pane;
+        press(&mut app, KeyCode::Char('m'));
+        assert!(!app.response_reveal, "{pane:?} must not reach the mask");
+    }
+}
+
+/// The tabs sit on the panel's top border, so a third one has to fit there.
+#[test]
+fn the_captures_tab_is_on_the_panel_border() {
+    let mut app = app_with_captures(&[("token", "t")]);
+    let s = Strings::for_language(&app.language);
+    let screen = render_screen(&mut app);
+    assert!(
+        screen.contains(s.resp_section_captures),
+        "the tab should be drawn beside Body and Headers"
+    );
+}
+
 /// `i` steps the Response section ring and Shift+I steps back. A ring rather
-/// than a boolean toggle because more sections are expected (timings, capture
-/// values) and a third one mustn't need a third key.
+/// than a boolean toggle because more sections were expected (timings, the
+/// redirect chain) and a further one mustn't need a further key — which is
+/// exactly how Captures arrived, without touching this key map.
 #[test]
 fn i_steps_the_response_section_tabs_and_shift_i_steps_back() {
     let mut app = app_with_response_headers("{}", &[("content-type", "application/json")]);
@@ -31993,14 +33026,16 @@ fn i_steps_the_response_section_tabs_and_shift_i_steps_back() {
 
     press(&mut app, KeyCode::Char('i'));
     assert_eq!(app.response_section, ResponseSection::Headers);
-    // Two members, so forward wraps back round rather than sticking.
+    press(&mut app, KeyCode::Char('i'));
+    assert_eq!(app.response_section, ResponseSection::Captures);
+    // The last member wraps back round rather than sticking.
     press(&mut app, KeyCode::Char('i'));
     assert_eq!(app.response_section, ResponseSection::Body);
 
     press(&mut app, KeyCode::Char('I'));
     assert_eq!(
         app.response_section,
-        ResponseSection::Headers,
+        ResponseSection::Captures,
         "Shift+I steps the ring backwards"
     );
 }
@@ -32188,7 +33223,17 @@ fn compact_view_is_refused_in_the_headers_section() {
         "c must not arm compact view from the Headers section"
     );
 
+    // Captures has no long string literals to shorten either.
     press(&mut app, KeyCode::Char('i'));
+    assert_eq!(app.response_section, ResponseSection::Captures);
+    press(&mut app, KeyCode::Char('c'));
+    assert!(
+        !app.response_compact,
+        "c must not arm compact view from the Captures section"
+    );
+
+    press(&mut app, KeyCode::Char('i'));
+    assert_eq!(app.response_section, ResponseSection::Body);
     press(&mut app, KeyCode::Char('c'));
     assert!(app.response_compact, "but it still works on the Body");
 }

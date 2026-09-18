@@ -19,7 +19,7 @@
 //! was true the two copies could (and did) silently disagree — a default set in
 //! one place and not the other.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -44,83 +44,43 @@ use crate::theme::{self, ThemeSpec};
 
 // ── Shared pure helpers (called by both front-ends) ─────────────────────────
 
-/// Build the effective, merged [`Environment`] used for substitution in
-/// collection `ci`: the active Global Environment's vars, overridden by the
-/// collection's own Linked Environment's vars on any name collision (Linked
-/// wins). `None` when neither is set.
+/// The [`Environment`] used for substitution in collection `ci`: the one
+/// activated on that tab, or `None` when the tab has none.
+///
+/// One tab, one environment. There was briefly a second layer — a single
+/// app-wide "active" environment that every tab merged underneath its own
+/// pinned one — and it was a steady source of "which value am I actually
+/// sending?": the environment a request really used was a synthetic merge of
+/// two rows, and no panel ever displayed it. A tab now substitutes from
+/// exactly the environment its own tab bar names.
 pub fn effective_env(
     collections: &[Collection],
     global_envs: &[Environment],
     ci: usize,
-    active_env_id: Option<u64>,
 ) -> Option<Environment> {
-    let linked = collections
+    collections
         .get(ci)
-        .and_then(|c| c.linked_env_id)
-        .and_then(|id| global_envs.iter().find(|e| e.id == id));
-    let active = active_env_id.and_then(|id| global_envs.iter().find(|e| e.id == id));
-    match (linked, active) {
-        (None, None) => None,
-        (Some(env), None) | (None, Some(env)) => Some(env.clone()),
-        (Some(linked), Some(active)) => {
-            let mut merged = active.clone();
-            for lv in &linked.vars {
-                match merged.vars.iter_mut().find(|v| v.key == lv.key) {
-                    Some(existing) => *existing = lv.clone(),
-                    None => merged.vars.push(lv.clone()),
-                }
-            }
-            merged.id = linked.id;
-            merged.name = linked.name.clone();
-            Some(merged)
-        }
-    }
+        .and_then(|c| c.env_id)
+        .and_then(|id| global_envs.iter().find(|e| e.id == id))
+        .cloned()
 }
 
-/// Keys defined in *both* the active collection's linked Environment and the
-/// active Global Environment — per [`effective_env`]'s merge rule the linked
-/// value always wins, so these keys' Global Environment value is silently
-/// shadowed. Used to flag such substitutions with a warning icon.
-pub fn shadowed_env_keys(
-    collections: &[Collection],
-    global_envs: &[Environment],
-    ci: usize,
-    active_env_id: Option<u64>,
-) -> HashSet<String> {
-    let linked = collections
-        .get(ci)
-        .and_then(|c| c.linked_env_id)
-        .and_then(|id| global_envs.iter().find(|e| e.id == id));
-    let active = active_env_id.and_then(|id| global_envs.iter().find(|e| e.id == id));
-    match (linked, active) {
-        (Some(linked), Some(active)) if linked.id != active.id => linked
-            .vars
-            .iter()
-            .filter(|lv| active.vars.iter().any(|av| av.key == lv.key))
-            .map(|lv| lv.key.clone())
-            .collect(),
-        _ => HashSet::new(),
-    }
-}
-
-/// Loaded Global Environments that define one of `keys` but are neither active
-/// nor linked to collection `ci`, so their values are not substituted.
+/// Loaded Global Environments that define one of `keys` but are not the one
+/// active on collection `ci`, so their values are not substituted.
 ///
 /// Loading a `.vars` file only adds it to the Global Environments list;
-/// [`effective_env`] reads the active one merged with the collection's linked
-/// one, so a file that is neither does nothing and its variables read as
-/// undefined.
+/// [`effective_env`] reads the tab's own environment, so a file that isn't it
+/// does nothing and its variables read as undefined.
 pub fn envs_defining_keys(
     collections: &[Collection],
     global_envs: &[Environment],
     ci: usize,
-    active_env_id: Option<u64>,
     keys: &[String],
 ) -> Vec<String> {
-    let linked_id = collections.get(ci).and_then(|c| c.linked_env_id);
+    let tab_env = collections.get(ci).and_then(|c| c.env_id);
     global_envs
         .iter()
-        .filter(|e| Some(e.id) != active_env_id && Some(e.id) != linked_id)
+        .filter(|e| Some(e.id) != tab_env)
         .filter(|e| e.vars.iter().any(|v| keys.contains(&v.key)))
         .map(|e| e.name.clone())
         .collect()
@@ -187,13 +147,10 @@ pub struct Session {
 
     /// The global list of Environments, shared across all collections (in the
     /// terminal UI, the "Global Environments" panel, `Pane::GlobalEnv`).
-    /// Individual collections may `linked_env_id` one of these; at most one may
-    /// be `active_env_id` at a time.
+    /// "Global" describes where they are *listed*, not what they apply to:
+    /// each tab activates at most one of them (`Collection::env_id`), and any
+    /// number of tabs may activate the same one.
     pub global_envs: Vec<Environment>,
-    /// The currently-activated Global Environment, if any — its vars are used
-    /// for substitution in any collection (subject to being overridden by that
-    /// collection's own `linked_env_id`, if set, on name collision).
-    pub active_env_id: Option<u64>,
 
     /// The shared response buffer written by the background request runner.
     pub response: Arc<Mutex<ApiResponse>>,
@@ -307,7 +264,6 @@ impl Default for Session {
             collections: vec![Collection::new("Request".to_string(), Vec::new())],
             active_tab: 0,
             global_envs: Vec::new(),
-            active_env_id: None,
             response: Arc::new(Mutex::new(ApiResponse::default())),
             pending_env: Vec::new(),
             pending_captures: Vec::new(),
@@ -373,52 +329,22 @@ impl Session {
 
     // ── Environments ──────────────────────────────────────────────────────
 
-    /// The merged environment used for substitution in collection `ci`.
+    /// The environment used for substitution in collection `ci`.
     pub fn effective_env(&self, ci: usize) -> Option<Environment> {
-        effective_env(&self.collections, &self.global_envs, ci, self.active_env_id)
+        effective_env(&self.collections, &self.global_envs, ci)
     }
 
-    /// Keys whose active Global Environment value is silently shadowed by the
-    /// collection's linked Environment (see the free [`shadowed_env_keys`]).
-    pub fn shadowed_env_keys(&self, ci: usize) -> HashSet<String> {
-        shadowed_env_keys(&self.collections, &self.global_envs, ci, self.active_env_id)
-    }
-
-    /// Loaded environments that would define `keys` if activated or linked (see
-    /// the free [`envs_defining_keys`]).
+    /// Loaded environments that would define `keys` if activated on this tab
+    /// (see the free [`envs_defining_keys`]).
     pub fn envs_defining_keys(&self, ci: usize, keys: &[String]) -> Vec<String> {
-        envs_defining_keys(
-            &self.collections,
-            &self.global_envs,
-            ci,
-            self.active_env_id,
-            keys,
-        )
+        envs_defining_keys(&self.collections, &self.global_envs, ci, keys)
     }
 
-    /// Toggle which Global Environment is active (activating the same one again
-    /// deactivates it), rebuilding affected previews.
-    pub fn set_active_env(&mut self, env_id: Option<u64>) {
-        self.active_env_id = if self.active_env_id == env_id {
-            None
-        } else {
-            env_id
-        };
-        for col in &mut self.collections {
-            col.invalidate_request_json();
-        }
-        self.save();
-    }
-
-    /// Link (pin) a Global Environment to collection `ci` (linking the same one
-    /// again unlinks it).
-    pub fn set_linked_env(&mut self, ci: usize, env_id: Option<u64>) {
+    /// Activate a Global Environment on collection `ci`'s tab (activating the
+    /// one already active deactivates it), rebuilding affected previews.
+    pub fn set_tab_env(&mut self, ci: usize, env_id: Option<u64>) {
         if let Some(col) = self.collections.get_mut(ci) {
-            col.linked_env_id = if col.linked_env_id == env_id {
-                None
-            } else {
-                env_id
-            };
+            col.env_id = if col.env_id == env_id { None } else { env_id };
             col.invalidate_request_json();
         }
         self.save();
@@ -500,16 +426,13 @@ impl Session {
         Some(id)
     }
 
-    /// Delete the Global Environment with `env_id`, unlinking any collections
-    /// that referenced it.
+    /// Delete the Global Environment with `env_id`, deactivating it on any tab
+    /// that had it active.
     pub fn delete_environment(&mut self, env_id: u64) {
         self.global_envs.retain(|e| e.id != env_id);
-        if self.active_env_id == Some(env_id) {
-            self.active_env_id = None;
-        }
         for col in &mut self.collections {
-            if col.linked_env_id == Some(env_id) {
-                col.linked_env_id = None;
+            if col.env_id == Some(env_id) {
+                col.env_id = None;
             }
             col.invalidate_request_json();
         }
@@ -954,9 +877,10 @@ impl Session {
         }
         let gen_errors = request::generator_problems_all(col, env.as_ref());
         // Only batch shares one variable set across the file, so only batch
-        // turns two requests computing the same name into one value for both.
-        // Reported, not refused: sharing is occasionally what was meant, and
-        // the run is about to happen either way.
+        // has to run the later of two requests computing the same name under a
+        // numbered name of its own (see `uniquify_batch_generators`). Said out
+        // loud rather than done silently, so the `nonce_2` that appears among
+        // the results is accounted for.
         let collisions = if self.run_all_batch_mode {
             request::generator_collisions(col)
         } else {
@@ -1114,10 +1038,10 @@ impl Session {
                 .collections
                 .iter()
                 .map(|c| {
-                    let linked_env_index = c
-                        .linked_env_id
+                    let env_index = c
+                        .env_id
                         .and_then(|id| self.global_envs.iter().position(|e| e.id == id));
-                    PersistedTab::from_collection(c, linked_env_index)
+                    PersistedTab::from_collection(c, env_index)
                 })
                 .collect(),
             reports: self.reports.clone(),
@@ -1155,9 +1079,7 @@ impl Session {
                 .iter()
                 .map(PersistedEnv::from_environment)
                 .collect(),
-            active_global_env: self
-                .active_env_id
-                .and_then(|id| self.global_envs.iter().position(|e| e.id == id)),
+            active_global_env: None,
             gui: self.gui,
         }
     }
@@ -1181,7 +1103,12 @@ impl Session {
             }
             global_envs.push(env);
         }
-        self.active_env_id = state
+        // A state file from before environments were per-tab names one env as
+        // active app-wide. Under the old merge every tab without its own
+        // pinned env substituted from that one, so handing it to exactly those
+        // tabs below restores what the user last saw rather than opening the
+        // session with substitution silently off.
+        let legacy_active_env = state
             .active_global_env
             .and_then(|idx| global_envs.get(idx))
             .map(|e| e.id);
@@ -1197,11 +1124,12 @@ impl Session {
             for (idx, tab) in state.tabs.into_iter().enumerate() {
                 let had_root = tab.workspace_root.is_some();
                 let name = tab.name.clone();
-                let linked_env_id = tab
-                    .linked_env_index
+                let env_id = tab
+                    .env_index
                     .and_then(|i| self.global_envs.get(i))
-                    .map(|e| e.id);
-                let (col, pending_reload) = tab.into_collection(linked_env_id);
+                    .map(|e| e.id)
+                    .or(legacy_active_env);
+                let (col, pending_reload) = tab.into_collection(env_id);
                 if had_root && col.workspace_root.is_none() {
                     match pending_reload {
                         // A git-downloaded Workspace whose folder has vanished
@@ -1330,6 +1258,112 @@ mod param_memory_tests {
             restored.remembered_params("name:Face"),
             values(&[("TICKET", "42"), ("ENV", "au")])
         );
+    }
+}
+
+#[cfg(test)]
+mod tab_env_tests {
+    use super::*;
+
+    /// Each tab's environment is part of the session: come back and the tab
+    /// you left on staging is still on staging, and the one on prod is still
+    /// on prod. Saved as an *index* into the environment list, so this also
+    /// guards the index surviving a reload that rebuilds every env id.
+    #[test]
+    fn each_tabs_environment_survives_a_restart() {
+        let mut s = Session::default();
+        let (prod, _) = crate::environment::parse_vars_pending("prod".into(), "R=prod");
+        let (staging, _) = crate::environment::parse_vars_pending("staging".into(), "R=staging");
+        s.global_envs.push(prod);
+        s.global_envs.push(staging);
+        let prod_id = s.global_envs[0].id;
+        let staging_id = s.global_envs[1].id;
+        s.add_collection("second");
+        s.collections[0].env_id = Some(prod_id);
+        s.collections[1].env_id = Some(staging_id);
+
+        let state = s.to_persisted();
+        assert_eq!(state.tabs[0].env_index, Some(0));
+        assert_eq!(state.tabs[1].env_index, Some(1));
+
+        let mut back = Session::default();
+        back.apply_persisted(state);
+        let name_of = |back: &Session, ci: usize| {
+            back.collections[ci]
+                .env_id
+                .and_then(|id| back.global_envs.iter().find(|e| e.id == id))
+                .map(|e| e.name.clone())
+        };
+        assert_eq!(name_of(&back, 0).as_deref(), Some("prod"));
+        assert_eq!(name_of(&back, 1).as_deref(), Some("staging"));
+    }
+
+    /// A tab that had no environment must come back with none — "nothing
+    /// active" is a real choice, not an absence to be filled in.
+    #[test]
+    fn a_tab_with_no_environment_comes_back_with_none() {
+        let mut s = Session::default();
+        let (prod, _) = crate::environment::parse_vars_pending("prod".into(), "R=prod");
+        s.global_envs.push(prod);
+        s.add_collection("second");
+        s.collections[0].env_id = Some(s.global_envs[0].id);
+
+        let mut back = Session::default();
+        back.apply_persisted(s.to_persisted());
+        assert!(back.collections[0].env_id.is_some());
+        assert_eq!(back.collections[1].env_id, None);
+    }
+
+    /// Migration from the two-layer model. A state file written before
+    /// environments were per-tab names one environment as active app-wide;
+    /// under the old rules every tab without its own pinned environment
+    /// substituted from it. Handing it to exactly those tabs reproduces what
+    /// the user last saw, instead of opening the session with substitution
+    /// silently switched off.
+    #[test]
+    fn a_legacy_app_wide_environment_becomes_every_unpinned_tabs_environment() {
+        let mut s = Session::default();
+        let (prod, _) = crate::environment::parse_vars_pending("prod".into(), "R=prod");
+        let (staging, _) = crate::environment::parse_vars_pending("staging".into(), "R=staging");
+        s.global_envs.push(prod);
+        s.global_envs.push(staging);
+        s.add_collection("second");
+        // Tab 1 was pinned to "staging"; tab 0 relied on the app-wide one.
+        s.collections[1].env_id = Some(s.global_envs[1].id);
+
+        let mut state = s.to_persisted();
+        state.tabs[0].env_index = None;
+        state.active_global_env = Some(0); // "prod" was the old active env
+
+        let mut back = Session::default();
+        back.apply_persisted(state);
+        let name_of = |back: &Session, ci: usize| {
+            back.collections[ci]
+                .env_id
+                .and_then(|id| back.global_envs.iter().find(|e| e.id == id))
+                .map(|e| e.name.clone())
+        };
+        assert_eq!(
+            name_of(&back, 0).as_deref(),
+            Some("prod"),
+            "the unpinned tab inherits the old app-wide environment"
+        );
+        assert_eq!(
+            name_of(&back, 1).as_deref(),
+            Some("staging"),
+            "a tab that had pinned its own keeps it — pinned used to win"
+        );
+    }
+
+    /// The migration input is read, never written: once a state file has been
+    /// through this build, nothing claims an app-wide environment any more.
+    #[test]
+    fn saving_never_writes_an_app_wide_environment_again() {
+        let mut s = Session::default();
+        let (prod, _) = crate::environment::parse_vars_pending("prod".into(), "R=prod");
+        s.global_envs.push(prod);
+        s.collections[0].env_id = Some(s.global_envs[0].id);
+        assert_eq!(s.to_persisted().active_global_env, None);
     }
 }
 

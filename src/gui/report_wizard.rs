@@ -210,6 +210,10 @@ pub struct RequestForm {
     hide_fields: Vec<(String, bool)>,
     /// Preserved verbatim across the edit (the form doesn't expose them).
     with: Vec<WithItem>,
+    /// The `DEPENDS` list, preserved verbatim. The GUI has no way to author
+    /// one — a dependency only means anything inside a `GRAPH`, which v1 runs
+    /// headless — but editing a node here must not be what deletes it.
+    depends: Vec<String>,
     /// The `USING(…)` clause as the node was opened with. Only its
     /// requirements and overrides are editable here, both below; the field is
     /// kept so anything a later clause item might carry survives the round trip.
@@ -295,12 +299,16 @@ impl RequestForm {
                 show: self.show(),
                 hide: self.hide(),
                 with: self.with.clone(),
+                depends: self.depends.clone(),
             })
         } else {
-            // `USING` describes the send, so it survives dropping REPORT.
+            // `USING` describes the send, so it survives dropping REPORT. So
+            // does `DEPENDS`: it says when the request runs, not what it shows.
             FlowNode::Request {
                 name: self.name.trim().to_string(),
+                alias: self.alias_opt(),
                 using: self.using_clause(),
+                depends: self.depends.clone(),
             }
         }
     }
@@ -758,16 +766,22 @@ fn build_request(
     path: Vec<usize>,
     node: &FlowNode,
 ) -> RequestForm {
-    let (name, report, alias, response, show, hide, with, using) = match node {
-        FlowNode::Request { name, using } => (
+    let (name, report, alias, response, show, hide, with, using, depends) = match node {
+        FlowNode::Request {
+            name,
+            alias,
+            using,
+            depends,
+        } => (
             name.clone(),
             false,
-            None,
+            alias.clone(),
             None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
             using.clone(),
+            depends.clone(),
         ),
         FlowNode::Report(ReportStmt::Request {
             name,
@@ -777,6 +791,7 @@ fn build_request(
             show,
             hide,
             with,
+            depends,
         }) => (
             name.clone(),
             true,
@@ -786,6 +801,7 @@ fn build_request(
             hide.clone(),
             with.clone(),
             using.clone(),
+            depends.clone(),
         ),
         _ => unreachable!("build_request called on a non-request node"),
     };
@@ -875,6 +891,7 @@ fn build_request(
         report,
         response,
         alias: alias.unwrap_or_default(),
+        depends,
         fields,
         show_stats: show
             .iter()
@@ -2247,6 +2264,7 @@ mod tests {
         RequestForm {
             path: vec![0],
             name: name.to_string(),
+            depends: Vec::new(),
             titles: vec!["upload".into(), "warmup".into()],
             report: true,
             response: None,
@@ -2405,7 +2423,9 @@ mod tests {
         let nodes = vec![
             FlowNode::Request {
                 name: "warmup".into(),
+                alias: None,
                 using: Vec::new(),
+                depends: Vec::new(),
             },
             FlowNode::Report(crate::report::flow::ReportStmt::Request {
                 name: "login".into(),
@@ -2415,6 +2435,7 @@ mod tests {
                 show: Vec::new(),
                 hide: Vec::new(),
                 with: Vec::new(),
+                depends: Vec::new(),
             }),
         ];
         assert_eq!(

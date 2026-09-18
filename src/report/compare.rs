@@ -24,8 +24,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use super::flow::{EnvClause, FlowNode, ReportFlow};
-use super::model::{ReportResult, ReportRow};
+use super::flow::{EnvClause, FlowNode, ReportFlow, RoleRef};
+use super::model::{ReportResult, ReportRow, RowRole};
 
 /// The reserved output column that carries the comparison outcome. Added to the
 /// default column order (at the front) only when the flow configures a
@@ -94,7 +94,7 @@ pub struct Roles {
 /// `ENVS` role clause with a baseline (a plain `ENVS` list, or no `ENVS` loop at
 /// all, produces per-env rows with no diff — unchanged behaviour).
 pub fn comparison_roles(flow: &ReportFlow) -> Option<Roles> {
-    comparison_roles_with(flow, &HashMap::new())
+    comparison_roles_with(flow, &HashMap::new(), &HashMap::new())
 }
 
 /// As [`comparison_roles`], with the run's parameter values in hand so a role
@@ -102,13 +102,18 @@ pub fn comparison_roles(flow: &ReportFlow) -> Option<Roles> {
 /// actually visited. Without this the collapse would look for a row whose
 /// target is the literal `{{TARGET}}` and find nothing — every comparison
 /// would come back unmatched.
-pub fn comparison_roles_with(flow: &ReportFlow, params: &HashMap<String, String>) -> Option<Roles> {
+pub fn comparison_roles_with(
+    flow: &ReportFlow,
+    params: &HashMap<String, String>,
+    resolved: &HashMap<String, Vec<String>>,
+) -> Option<Roles> {
     let mut baseline = HashSet::new();
     let mut comparisons = Vec::new();
     let mut baseline_show = Vec::new();
     collect_roles(
         &flow.nodes,
         params,
+        resolved,
         &mut baseline,
         &mut comparisons,
         &mut baseline_show,
@@ -127,10 +132,17 @@ pub fn comparison_roles_with(flow: &ReportFlow, params: &HashMap<String, String>
 fn collect_roles(
     nodes: &[FlowNode],
     params: &HashMap<String, String>,
+    resolved: &HashMap<String, Vec<String>>,
     baseline: &mut HashSet<String>,
     comparisons: &mut Vec<String>,
     baseline_show: &mut Vec<String>,
 ) {
+    // What the run made of the target wins outright. Substituting again here
+    // can only see the declared parameters, so a role named through a capture
+    // or a prelude assignment would come back as the literal `{{…}}` and match
+    // no row at all — and the rows are tagged with the run's answer, not this
+    // one. The fallback is for callers with no run behind them (the pre-run
+    // skeleton, validation, the TUI's static look at a flow).
     for node in nodes {
         match node {
             FlowNode::ForEnvs { clause, body, .. } => {
@@ -143,13 +155,22 @@ fn collect_roles(
                     // A role's comparison *target* is its name (a live env) or
                     // its snapshot path (a `FILE(…)`); either way the produced /
                     // injected rows carry that string as their target.
+                    // Every answer the run reached, not one: a clause inside a
+                    // loop is resolved per iteration and each value names a real
+                    // environment whose rows are waiting to be collapsed.
+                    let effective = |r: &RoleRef| -> Vec<String> {
+                        resolved.get(r.target()).cloned().unwrap_or_else(|| {
+                            vec![crate::environment::substitute(r.target(), params)]
+                        })
+                    };
                     for r in b {
-                        baseline.insert(crate::environment::substitute(r.target(), params));
+                        baseline.extend(effective(r));
                     }
                     for r in c {
-                        let name = crate::environment::substitute(r.target(), params);
-                        if !comparisons.contains(&name) {
-                            comparisons.push(name);
+                        for name in effective(r) {
+                            if !comparisons.contains(&name) {
+                                comparisons.push(name);
+                            }
                         }
                     }
                     // Only the names travel here: any `STATISTICS(…)` a field
@@ -161,10 +182,10 @@ fn collect_roles(
                         }
                     }
                 }
-                collect_roles(body, params, baseline, comparisons, baseline_show);
+                collect_roles(body, params, resolved, baseline, comparisons, baseline_show);
             }
-            FlowNode::ForEach { body, .. } => {
-                collect_roles(body, params, baseline, comparisons, baseline_show)
+            FlowNode::ForEach { body, .. } | FlowNode::Graph { body, .. } => {
+                collect_roles(body, params, resolved, baseline, comparisons, baseline_show)
             }
             _ => {}
         }
@@ -185,32 +206,54 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
     let excluded = excluded_keys(result);
     let rows = std::mem::take(&mut result.rows);
 
-    let mut baseline_by_key: HashMap<Vec<String>, ReportRow> = HashMap::new();
-    let mut candidate_by_key_target: HashMap<(Vec<String>, String), ReportRow> = HashMap::new();
-    let mut key_order: Vec<Vec<String>> = Vec::new();
-    let mut seen_key: HashSet<Vec<String>> = HashSet::new();
+    // Keyed by comparison as well as by row key. Two independent clauses both
+    // drop their own environment axis from the key — that is what lets a
+    // baseline and its candidate meet — so their rows collide, and indexing
+    // baselines by key alone kept whichever arrived first and measured the
+    // other comparison's candidates against a stranger.
+    type CmpKey = (Vec<String>, Option<String>);
+    let mut baseline_by_key: HashMap<CmpKey, ReportRow> = HashMap::new();
+    let mut candidate_by_key_target: HashMap<(CmpKey, String), ReportRow> = HashMap::new();
+    let mut key_order: Vec<CmpKey> = Vec::new();
+    let mut seen_key: HashSet<CmpKey> = HashSet::new();
     let mut passthrough: Vec<ReportRow> = Vec::new();
 
     for row in rows {
         let target = row.target.clone();
-        let is_baseline = target
-            .as_deref()
-            .is_some_and(|t| roles.baseline.contains(t));
-        let is_candidate = target
-            .as_deref()
-            .is_some_and(|t| roles.comparisons.iter().any(|c| c == t));
+        // The row's own role wins. A name can hold both roles across a run —
+        // rolling pairs make one environment the candidate here and the
+        // baseline next time round — so asking a set whether a *name* is "a
+        // baseline" has no single answer, and asking it first filed the
+        // candidate as a baseline, losing its pair's diff to "no baseline".
+        // The set is the fallback for rows with no role recorded: those loaded
+        // from a stored snapshot, and any produced before roles were tracked.
+        let (is_baseline, is_candidate) = match row.role {
+            RowRole::Baseline => (true, false),
+            RowRole::Candidate => (false, true),
+            // A plain `ENVS` list assigns no roles, so its rows compare against
+            // nothing and pass straight through — even when the environment
+            // they name is used as a role by some *other* clause in the flow.
+            RowRole::Unassigned => (false, false),
+            RowRole::Unknown => (
+                target
+                    .as_deref()
+                    .is_some_and(|t| roles.baseline.contains(t)),
+                target
+                    .as_deref()
+                    .is_some_and(|t| roles.comparisons.iter().any(|c| c == t)),
+            ),
+        };
 
-        if (is_baseline || is_candidate) && seen_key.insert(row.key.clone()) {
-            key_order.push(row.key.clone());
+        let ck = (row.key.clone(), row.comparison.clone());
+        if (is_baseline || is_candidate) && seen_key.insert(ck.clone()) {
+            key_order.push(ck.clone());
         }
 
         if is_baseline {
-            baseline_by_key.entry(row.key.clone()).or_insert(row);
+            baseline_by_key.entry(ck).or_insert(row);
         } else if is_candidate {
             let t = target.unwrap_or_default();
-            candidate_by_key_target
-                .entry((row.key.clone(), t))
-                .or_insert(row);
+            candidate_by_key_target.entry((ck, t)).or_insert(row);
         } else {
             passthrough.push(row);
         }
@@ -220,7 +263,13 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
     out.append(&mut passthrough);
 
     for key in &key_order {
-        let baseline = baseline_by_key.get(key);
+        // A row restored from a snapshot carries no comparison — it was saved
+        // long before this flow was written — so a comparison with no baseline
+        // of its own falls back to one that belongs to no comparison. That is
+        // the whole point of `BASELINE(FILE(…))`.
+        let baseline = baseline_by_key
+            .get(key)
+            .or_else(|| baseline_by_key.get(&(key.0.clone(), None)));
         let mut emitted = false;
         for comp in &roles.comparisons {
             if let Some(mut cand) = candidate_by_key_target.remove(&(key.clone(), comp.clone())) {
@@ -387,6 +436,7 @@ mod tests {
 
     fn row(key: &[&str], target: &str, cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {
+            role: RowRole::default(),
             cells: cells
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -394,6 +444,7 @@ mod tests {
             vars: HashMap::new(),
             key: key.iter().map(|k| k.to_string()).collect(),
             path: Vec::new(),
+            comparison: None,
             target: Some(target.to_string()),
         }
     }

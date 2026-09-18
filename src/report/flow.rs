@@ -13,10 +13,37 @@ use super::model::StatKind;
 
 /// A whole report flow: a comment/directive header plus the ordered statements
 /// the interpreter executes.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Eq)]
 pub struct ReportFlow {
     pub header: Header,
     pub nodes: Vec<FlowNode>,
+    /// The verbatim Hurl after a `REQUESTS` line, when the flow embeds its own
+    /// requests. `None` when it has no such section — which is the declaration:
+    /// there is no header directive to disagree with.
+    ///
+    /// Kept as text rather than parsed entries so that extraction is a
+    /// byte-range move plus a `# collection:` line, and so a flow round-trips
+    /// through the editor without its requests being reformatted by a parser
+    /// that never claimed to be a formatter.
+    pub requests: Option<String>,
+    /// The 1-based line of the file the embedded section's text starts on — the
+    /// line after the `REQUESTS` keyword. Provenance, not content: it exists so
+    /// that a Hurl parse error inside the section can be reported against the
+    /// line of the `.trail` file the reader is looking at, rather than against
+    /// the section, which is not a file anyone has open.
+    ///
+    /// Deliberately left out of [`PartialEq`] below, because it describes where
+    /// a flow was read from and not what it says. Two flows that differ only in
+    /// where their section happened to start are the same flow, and a
+    /// round-trip through [`ReportFlow::to_text`] renumbers it whenever the
+    /// serializer's canonical layout differs from the author's.
+    pub requests_line: usize,
+}
+
+impl PartialEq for ReportFlow {
+    fn eq(&self, other: &Self) -> bool {
+        self.header == other.header && self.nodes == other.nodes && self.requests == other.requests
+    }
 }
 
 /// The header block: the `# key: value` directives (and any free `#` comments)
@@ -212,10 +239,48 @@ pub enum FlowNode {
     /// Holds the text *after* the `#`, verbatim (leading space included), so a
     /// comment round-trips byte for byte.
     Comment(String),
-    /// `REQUEST <name> [USING(…)]` — send a request, emit no column.
+    /// `REQUEST <name> [AS <step>] [USING(…)]` — send a request, emit no column.
     Request {
         name: String,
+        /// The step name: `AS <step>`.
+        ///
+        /// A *step* is one execution of a request, and the step name — not the
+        /// request name — is the unit of identity. It is what a dependency
+        /// clause refers to and what qualifies a capture reference, which is
+        /// why it must be an identifier while request names stay path-like.
+        ///
+        /// `None` means "defaulted": the request's leaf name is used, which is
+        /// only legal when that leaf is already a valid identifier and the
+        /// request is invoked exactly once in the flow. Validation enforces
+        /// both, so two invocations can never silently collapse into one node.
+        alias: Option<String>,
+        /// `DEPENDS a, b` — steps this one must run after, for orderings the
+        /// data does not reveal. Inference can only see values flowing between
+        /// requests; a server-side effect (an upload whose result is fetched
+        /// later by an id that was a parameter all along) leaves no trace in
+        /// the text, and this clause is how the author supplies it. Empty = no
+        /// clause. Only meaningful inside a `GRAPH`, where order is the graph's
+        /// to decide; validation rejects it elsewhere.
+        depends: Vec<String>,
         /// See [`ReportStmt::Request::using`].
+        using: Vec<UsingItem>,
+    },
+    /// `CLEANUP <name> [AS <step>] [DEPENDS …] [USING(…)]` — teardown.
+    ///
+    /// Deferred, not sequential: a cleanup runs at the end of the block it is
+    /// written in, after everything that block does. Written where the resource
+    /// is created, run when the work with it is finished — which is the only
+    /// placement that survives the statements around it being reordered.
+    ///
+    /// It is skipped when something it depends on did not succeed, because
+    /// there is then nothing to tear down; it is *not* skipped merely because
+    /// some unrelated step failed, which is the whole reason it is a separate
+    /// construct rather than a trailing `REQUEST`. Teardown has to stay alive
+    /// through exactly the failures it exists to clean up after.
+    Cleanup {
+        name: String,
+        alias: Option<String>,
+        depends: Vec<String>,
         using: Vec<UsingItem>,
     },
     /// `REPORT …` — send/compute and emit column(s) into the current row.
@@ -236,6 +301,32 @@ pub enum FlowNode {
         var: String,
         clause: EnvClause,
         body: Vec<FlowNode>,
+        parallel: Option<ParallelSpec>,
+    },
+    /// `[PARALLEL[(n)]] GRAPH [<name>] … END` — a region in which written order
+    /// is only a tie-break, and the declared dependency graph is authoritative.
+    ///
+    /// The region is an *assertion by the author*: that every ordering
+    /// constraint which matters is written down, as an inferred data edge or an
+    /// explicit clause. That assertion cannot be derived and cannot be checked,
+    /// which is exactly why it is a construct the author opts into rather than
+    /// something inferred from a file that merely looks like a list of
+    /// independent requests. Two features are licensed by it and by nothing
+    /// else: overlapping execution, and pruning a run to a subset of steps.
+    ///
+    /// Outside a region nothing changes — statements run in written order — so
+    /// a region is one statement's worth of ordering to the code around it, and
+    /// wrapping an existing sequential block in one is a no-op.
+    Graph {
+        /// The optional region name. It carries no semantics today; the grammar
+        /// reserves it for a JUnit `testsuite` name once one file can hold
+        /// several sibling regions.
+        name: Option<String>,
+        body: Vec<FlowNode>,
+        /// `Some(..)` caps how many steps may overlap. A cap is a *permission*,
+        /// not an instruction: running one at a time is always a legal schedule
+        /// for any `PARALLEL(n)`, which is what lets the scheduler arrive after
+        /// the grammar does.
         parallel: Option<ParallelSpec>,
     },
 }
@@ -494,6 +585,14 @@ pub enum ReportStmt {
     Request {
         name: String,
         alias: Option<String>,
+        /// `DEPENDS a, b` — steps this one must run after, for orderings the
+        /// data does not reveal. Inference can only see values flowing between
+        /// requests; a server-side effect (an upload whose result is fetched
+        /// later by an id that was a parameter all along) leaves no trace in
+        /// the text, and this clause is how the author supplies it. Empty = no
+        /// clause. Only meaningful inside a `GRAPH`, where order is the graph's
+        /// to decide; validation rejects it elsewhere.
+        depends: Vec<String>,
         /// The `USING(…)` clause: required parameters and/or call-site
         /// overrides. Empty = no clause, which stays the common case.
         using: Vec<UsingItem>,
@@ -877,7 +976,29 @@ impl ReportFlow {
         for node in &self.nodes {
             write_node(&mut out, node, 0);
         }
+        if let Some(hurl) = &self.requests {
+            // Last in the file, by definition: everything after the keyword is
+            // Hurl, so nothing can follow it.
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            out.push_str("REQUESTS\n");
+            out.push_str(hurl);
+        }
         out
+    }
+
+    /// The requests this flow embeds, parsed.
+    ///
+    /// Empty when there is no `REQUESTS` section. Parse errors are not reported
+    /// here — the Hurl parser is lenient by design and a malformed section
+    /// simply yields nothing, which validation reports as "the section declares
+    /// no requests" with the real reason attached.
+    pub fn embedded_entries(&self) -> Vec<crate::hurl::HurlEntry> {
+        match &self.requests {
+            Some(text) => crate::hurl::parse_hurl(text),
+            None => Vec::new(),
+        }
     }
 
     /// Collect the per-column summary statistics requested by
@@ -886,9 +1007,7 @@ impl ReportFlow {
     /// for the same header win. Used to attach statistics to the resolved
     /// columns at render time.
     pub fn column_stats(&self) -> std::collections::HashMap<String, Vec<StatKind>> {
-        let mut out = std::collections::HashMap::new();
-        collect_column_stats(&self.nodes, &mut out);
-        out
+        self.column_meta().stats
     }
 
     /// Collect the per-column `IMAGE[(…)]` render hints requested anywhere in
@@ -896,9 +1015,7 @@ impl ReportFlow {
     /// [`column_stats`](Self::column_stats) does for statistics — the two
     /// clauses attach at the same three places and are resolved the same way.
     pub fn column_images(&self) -> std::collections::HashMap<String, ImageSpec> {
-        let mut out = std::collections::HashMap::new();
-        collect_column_images(&self.nodes, &mut out);
-        out
+        self.column_meta().images
     }
 
     /// Collect the per-column `TRUTH "<template>"` clauses declared anywhere in
@@ -912,9 +1029,7 @@ impl ReportFlow {
     /// from the loop that chose the input (a labels manifest, a folder name),
     /// never from the response it is judging.
     pub fn column_truths(&self) -> std::collections::HashMap<String, String> {
-        let mut out = std::collections::HashMap::new();
-        collect_column_truths(&self.nodes, &mut out);
-        out
+        self.column_meta().truths
     }
 
     /// The columns flagged `DETAIL` — shown in a row's drill-down rather than
@@ -926,133 +1041,86 @@ impl ReportFlow {
     /// have somewhere else to put it treat it differently, which is what lets
     /// every other format ignore the flag without losing data.
     pub fn column_details(&self) -> std::collections::HashSet<String> {
-        let mut out = std::collections::HashSet::new();
-        collect_column_details(&self.nodes, &mut out);
+        self.column_meta().details
+    }
+
+    /// All four kinds of column metadata in one walk, for the callers that
+    /// want more than one of them — which is every caller that resolves a
+    /// column, since the precedence rule reads all four together.
+    pub fn column_meta(&self) -> FlowColumnMeta {
+        let mut out = FlowColumnMeta::default();
+        collect_column_meta(&self.nodes, &mut out);
         out
     }
 }
 
-fn collect_column_images(
-    nodes: &[FlowNode],
-    out: &mut std::collections::HashMap<String, ImageSpec>,
-) {
+/// Everything the flow says about its output columns, gathered in one walk.
+///
+/// The four kinds of column metadata — statistics, image hints, ground truths
+/// and the `DETAIL` flag — attach at the same places and are keyed the same
+/// way, so they are collected together. They were four near-identical walkers
+/// once, and the cost of that was paid twice: each had to learn about every new
+/// node kind separately, and when `GRAPH` arrived three of them were taught to
+/// recurse into it and the fourth was not, making metadata written inside a
+/// region dead text with nothing to say so.
+#[derive(Default)]
+pub struct FlowColumnMeta {
+    /// `STATISTICS(…)`, keyed by output-column header. Later statements for the
+    /// same header win.
+    pub stats: std::collections::HashMap<String, Vec<StatKind>>,
+    /// `IMAGE[(…)]` render hints, keyed the same way.
+    pub images: std::collections::HashMap<String, ImageSpec>,
+    /// `TRUTH "<template>"` clauses, **unevaluated**: a truth is interpolated
+    /// per row after the run, against that row's variable snapshot.
+    pub truths: std::collections::HashMap<String, String>,
+    /// The columns flagged `DETAIL`.
+    pub details: std::collections::HashSet<String>,
+}
+
+/// The output-column header a `WITH`/`SHOW` field lands in: the statement's
+/// alias, defaulting to the request's leaf name, then the field name.
+fn field_header(name: &str, alias: &Option<String>, field: &str) -> String {
+    let a = alias
+        .clone()
+        .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
+    format!("{a}.{field}")
+}
+
+pub fn collect_column_meta(nodes: &[FlowNode], out: &mut FlowColumnMeta) {
     for node in nodes {
         match node {
-            FlowNode::Report(ReportStmt::VarAs { name, image, .. })
-            | FlowNode::Report(ReportStmt::Computed { name, image, .. }) => {
+            FlowNode::Report(ReportStmt::VarAs {
+                name,
+                image,
+                truth,
+                detail,
+                stats,
+                ..
+            })
+            | FlowNode::Report(ReportStmt::Computed {
+                name,
+                image,
+                truth,
+                detail,
+                stats,
+                ..
+            }) => {
                 if let Some(img) = image {
-                    out.insert(name.clone(), *img);
+                    out.images.insert(name.clone(), *img);
                 }
-            }
-            FlowNode::Report(ReportStmt::Request {
-                name, alias, with, ..
-            }) => {
-                let a = alias
-                    .clone()
-                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
-                for item in with {
-                    if let WithItem::Field {
-                        name: fname,
-                        image: Some(img),
-                        ..
-                    } = item
-                    {
-                        out.insert(format!("{a}.{fname}"), *img);
-                    }
-                }
-            }
-            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
-                collect_column_images(body, out);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_column_details(nodes: &[FlowNode], out: &mut std::collections::HashSet<String>) {
-    for node in nodes {
-        match node {
-            FlowNode::Report(ReportStmt::VarAs { name, detail, .. })
-            | FlowNode::Report(ReportStmt::Computed { name, detail, .. }) => {
-                if *detail {
-                    out.insert(name.clone());
-                }
-            }
-            FlowNode::Report(ReportStmt::Request {
-                name, alias, with, ..
-            }) => {
-                let a = alias
-                    .clone()
-                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
-                for item in with {
-                    if let WithItem::Field {
-                        name: fname,
-                        detail: true,
-                        ..
-                    } = item
-                    {
-                        out.insert(format!("{a}.{fname}"));
-                    }
-                }
-            }
-            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
-                collect_column_details(body, out);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_column_truths(nodes: &[FlowNode], out: &mut std::collections::HashMap<String, String>) {
-    for node in nodes {
-        match node {
-            FlowNode::Report(ReportStmt::VarAs { name, truth, .. })
-            | FlowNode::Report(ReportStmt::Computed { name, truth, .. }) => {
                 if let Some(t) = truth {
-                    out.insert(name.clone(), t.clone());
+                    out.truths.insert(name.clone(), t.clone());
+                }
+                if *detail {
+                    out.details.insert(name.clone());
+                }
+                if !stats.is_empty() {
+                    out.stats.insert(name.clone(), stats.clone());
                 }
             }
-            FlowNode::Report(ReportStmt::Request {
-                name, alias, with, ..
-            }) => {
-                let a = alias
-                    .clone()
-                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
-                for item in with {
-                    if let WithItem::Field {
-                        name: fname,
-                        truth: Some(t),
-                        ..
-                    } = item
-                    {
-                        out.insert(format!("{a}.{fname}"), t.clone());
-                    }
-                }
-            }
-            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
-                collect_column_truths(body, out);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_column_stats(
-    nodes: &[FlowNode],
-    out: &mut std::collections::HashMap<String, Vec<StatKind>>,
-) {
-    for node in nodes {
-        match node {
-            FlowNode::Report(ReportStmt::VarAs { name, stats, .. })
-            | FlowNode::Report(ReportStmt::Computed { name, stats, .. })
-                if !stats.is_empty() =>
-            {
-                out.insert(name.clone(), stats.clone());
-            }
-            // `WITH` fields carry their own optional `STATISTICS(…)`; their
-            // output column is `alias.field`, where `alias` defaults to the
-            // request's leaf name. Compute that key statically so the stats
-            // attach at render time just like a `REPORT … STATISTICS(…)`.
+            // `WITH` fields carry their own clauses; their output column is
+            // `alias.field`, computed statically here so the metadata attaches
+            // at render time just like a `REPORT … AS <header>` clause.
             FlowNode::Report(ReportStmt::Request {
                 name,
                 alias,
@@ -1060,23 +1128,40 @@ fn collect_column_stats(
                 show,
                 ..
             }) => {
-                let a = alias
-                    .clone()
-                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
-                // A `SHOW(field STATISTICS(…))` names the same `alias.field`
-                // column a `WITH` field would.
+                // Asymmetric on purpose: a `SHOW(field STATISTICS(…))` names
+                // the same `alias.field` column a `WITH` field would, but a
+                // `ShowField` carries *only* statistics — there is no
+                // `SHOW(field IMAGE)` or `SHOW(field TRUTH …)` to collect.
                 for f in show {
                     if !f.stats.is_empty() {
-                        out.insert(format!("{a}.{}", f.field), f.stats.clone());
+                        out.stats
+                            .insert(field_header(name, alias, &f.field), f.stats.clone());
                     }
                 }
                 for item in with {
-                    if let WithItem::Field {
-                        name: fname, stats, ..
+                    let WithItem::Field {
+                        name: fname,
+                        image,
+                        truth,
+                        detail,
+                        stats,
+                        ..
                     } = item
-                        && !stats.is_empty()
-                    {
-                        out.insert(format!("{a}.{fname}"), stats.clone());
+                    else {
+                        continue;
+                    };
+                    let header = field_header(name, alias, fname);
+                    if let Some(img) = image {
+                        out.images.insert(header.clone(), *img);
+                    }
+                    if let Some(t) = truth {
+                        out.truths.insert(header.clone(), t.clone());
+                    }
+                    if *detail {
+                        out.details.insert(header.clone());
+                    }
+                    if !stats.is_empty() {
+                        out.stats.insert(header.clone(), stats.clone());
                     }
                 }
             }
@@ -1086,19 +1171,23 @@ fn collect_column_stats(
             // and those aliases aren't known until the run produces them. The
             // key is therefore matched by suffix at render time (see
             // `ReportResult::resolved_columns`), recorded here under the bare
-            // field with a `baseline.` marker prefix.
+            // field with a `baseline.` marker prefix. Statistics only: the
+            // other three clauses have no baseline form.
             FlowNode::ForEnvs { body, clause, .. } => {
                 if let EnvClause::Roles { baseline_show, .. } = clause {
                     for f in baseline_show {
                         if !f.stats.is_empty() {
-                            out.insert(format!("baseline.*.{}", f.field), f.stats.clone());
+                            out.stats
+                                .insert(format!("baseline.*.{}", f.field), f.stats.clone());
                         }
                     }
                 }
-                collect_column_stats(body, out);
+                collect_column_meta(body, out);
             }
-            FlowNode::ForEach { body, .. } => {
-                collect_column_stats(body, out);
+            // A region is a scheduling device, not a scope: metadata written
+            // inside one belongs to the enclosing block's row like any other.
+            FlowNode::ForEach { body, .. } | FlowNode::Graph { body, .. } => {
+                collect_column_meta(body, out);
             }
             _ => {}
         }
@@ -1126,8 +1215,31 @@ fn write_node(out: &mut String, node: &FlowNode, depth: usize) {
         FlowNode::Comment(text) => {
             let _ = writeln!(out, "#{text}");
         }
-        FlowNode::Request { name, using } => {
-            let _ = writeln!(out, "REQUEST {}{}", name_text(name), using_text(using));
+        FlowNode::Request {
+            name,
+            alias,
+            depends,
+            using,
+        } => {
+            let _ = write!(out, "REQUEST {}", name_text(name));
+            if let Some(a) = alias {
+                let _ = write!(out, " AS {}", name_text(a));
+            }
+            out.push_str(&depends_text(depends));
+            let _ = writeln!(out, "{}", using_text(using));
+        }
+        FlowNode::Cleanup {
+            name,
+            alias,
+            depends,
+            using,
+        } => {
+            let _ = write!(out, "CLEANUP {}", name_text(name));
+            if let Some(a) = alias {
+                let _ = write!(out, " AS {}", name_text(a));
+            }
+            out.push_str(&depends_text(depends));
+            let _ = writeln!(out, "{}", using_text(using));
         }
         FlowNode::Report(stmt) => write_report(out, stmt, depth),
         FlowNode::ForEach {
@@ -1167,6 +1279,31 @@ fn write_node(out: &mut String, node: &FlowNode, depth: usize) {
             indent(out, depth);
             out.push_str("END\n");
         }
+        FlowNode::Graph {
+            name,
+            body,
+            parallel,
+        } => {
+            let _ = write!(out, "{}GRAPH", parallel_prefix(parallel));
+            if let Some(n) = name {
+                let _ = write!(out, " {}", name_text(n));
+            }
+            out.push('\n');
+            for n in body {
+                write_node(out, n, depth + 1);
+            }
+            indent(out, depth);
+            out.push_str("END\n");
+        }
+    }
+}
+
+/// The ` DEPENDS a, b` clause a step serializes with (empty when it has none).
+fn depends_text(depends: &[String]) -> String {
+    if depends.is_empty() {
+        String::new()
+    } else {
+        format!(" DEPENDS {}", depends.join(", "))
     }
 }
 
@@ -1184,6 +1321,7 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
         ReportStmt::Request {
             name,
             alias,
+            depends,
             using,
             response_fmt,
             show,
@@ -1194,6 +1332,7 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
             if let Some(a) = alias {
                 let _ = write!(out, " AS {}", name_text(a));
             }
+            out.push_str(&depends_text(depends));
             out.push_str(&using_text(using));
             if let Some(fmt) = response_fmt {
                 let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
@@ -1495,8 +1634,37 @@ impl FlowNode {
             }
             FlowNode::Param(p) => param_text(p),
             FlowNode::Comment(text) => format!("#{text}"),
-            FlowNode::Request { name, using } => {
-                format!("REQUEST {name}{}", using_text(using))
+            FlowNode::Request {
+                name,
+                alias,
+                depends,
+                using,
+            } => {
+                let as_text = alias
+                    .as_ref()
+                    .map(|a| format!(" AS {a}"))
+                    .unwrap_or_default();
+                format!(
+                    "REQUEST {name}{as_text}{}{}",
+                    depends_text(depends),
+                    using_text(using)
+                )
+            }
+            FlowNode::Cleanup {
+                name,
+                alias,
+                depends,
+                using,
+            } => {
+                let as_text = alias
+                    .as_ref()
+                    .map(|a| format!(" AS {a}"))
+                    .unwrap_or_default();
+                format!(
+                    "CLEANUP {name}{as_text}{}{}",
+                    depends_text(depends),
+                    using_text(using)
+                )
             }
             FlowNode::Report(stmt) => report_label(stmt),
             FlowNode::ForEach {
@@ -1520,6 +1688,11 @@ impl FlowNode {
                 parallel_prefix(parallel),
                 env_clause_text(clause)
             ),
+            FlowNode::Graph { name, parallel, .. } => format!(
+                "{}GRAPH{}",
+                parallel_prefix(parallel),
+                name.as_ref().map(|n| format!(" {n}")).unwrap_or_default()
+            ),
         }
     }
 
@@ -1535,6 +1708,7 @@ impl FlowNode {
             FlowNode::Report(ReportStmt::Request {
                 name,
                 alias,
+                depends,
                 using,
                 response_fmt,
                 show,
@@ -1545,6 +1719,10 @@ impl FlowNode {
                 if let Some(a) = alias {
                     let _ = write!(out, " AS {}", name_text(a));
                 }
+                // The outline is the only view of a statement that has a `WITH`
+                // block, so a `DEPENDS` left out here is a dependency the author
+                // cannot see anywhere in the editor at all.
+                out.push_str(&depends_text(depends));
                 out.push_str(&using_text(using));
                 if let Some(fmt) = response_fmt {
                     let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
@@ -1582,7 +1760,9 @@ impl FlowNode {
     /// The loop body of a `FOR …` node (mutable), or `None` for a leaf node.
     pub fn body_mut(&mut self) -> Option<&mut Vec<FlowNode>> {
         match self {
-            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => Some(body),
+            FlowNode::ForEach { body, .. }
+            | FlowNode::ForEnvs { body, .. }
+            | FlowNode::Graph { body, .. } => Some(body),
             _ => None,
         }
     }
@@ -1594,6 +1774,7 @@ fn report_label(stmt: &ReportStmt) -> String {
         ReportStmt::Request {
             name,
             alias,
+            depends,
             using,
             response_fmt,
             show,
@@ -1604,6 +1785,7 @@ fn report_label(stmt: &ReportStmt) -> String {
             if let Some(a) = alias {
                 let _ = write!(out, " AS {a}");
             }
+            out.push_str(&depends_text(depends));
             out.push_str(&using_text(using));
             if let Some(fmt) = response_fmt {
                 let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));

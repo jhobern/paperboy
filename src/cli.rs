@@ -9,7 +9,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::IsTerminal;
 
-use ratatui::crossterm::style::Stylize;
+// Imported from `crossterm` directly rather than through ratatui's re-export:
+// the headless runner keeps its coloured output in builds that have no
+// terminal UI (and therefore no ratatui) at all.
+use crossterm::style::Stylize;
 
 use crate::environment::{looks_like_env, parse_vars};
 use crate::generators::SystemSource;
@@ -227,6 +230,35 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
 
     let out = if batch {
         let mut vars = vars.clone();
+        // Two requests that each compute a `nonce` would share one value in
+        // batch (see above), and be sent each other's. Rename the later
+        // claimants instead, rewriting their own references to match, so every
+        // request gets a value computed for it — as streaming gives it. Only a
+        // colliding name is touched, so an ordinary file is unchanged.
+        let mut gen_entries = gen_entries.clone();
+        let renames = crate::request::uniquify_batch_generators(&mut gen_entries, &vars);
+        let run_content = if renames.is_empty() {
+            run_content.clone()
+        } else {
+            collection_to_hurl(&gen_entries)
+        };
+        for r in &renames {
+            eprintln!(
+                "{}",
+                paint(
+                    color,
+                    Hue::Yellow,
+                    &format!(
+                        "  * {}",
+                        strings
+                            .cli_gen_renamed
+                            .replace("{name}", &r.original)
+                            .replace("{new}", &r.renamed)
+                            .replace("{title}", &r.title)
+                    )
+                )
+            );
+        }
         let blocks =
             crate::request::expand_batch_generators(&gen_entries, &vars, &SystemSource::new());
         for (title, errors) in &blocks.errors {
@@ -245,25 +277,15 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
                 .flat_map(|(_, errs)| errs.iter().cloned())
                 .collect();
             RunOutput {
+                generated: Default::default(),
                 entries: vec![],
                 error: Some(crate::i18n::summarise_gen_errors(&strings, &flat).join("; ")),
             }
         } else {
-            // Said out loud rather than silently resolved: in batch the two
-            // requests share one value, so the second one's signature is computed
-            // over the first one's nonce. Streaming (the default) gives each its
-            // own, so the fix is usually to drop `--batch` — which is what the
-            // message suggests.
-            for name in &blocks.collisions {
-                eprintln!(
-                    "{}",
-                    paint(
-                        color,
-                        Hue::Yellow,
-                        &format!("  ! {}", strings.cli_gen_collision.replace("{name}", name))
-                    )
-                );
-            }
+            // No collision loop here: `uniquify_batch_generators` above has
+            // already given each claimant its own name, so `blocks.collisions`
+            // is empty by construction. What the user is told instead is the
+            // rename itself, printed where the renaming happened.
             // A generator whose name the environment already binds computes nothing
             // in batch: one shared value set can't shadow the value from this
             // request on without rewriting it for the requests above too, so the
@@ -305,8 +327,13 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
                     return EntrySetup::Bind(Vec::new());
                 }
                 let mut merged = known.clone();
-                let errors =
-                    crate::generators::expand(&entry.generators, &mut merged, &SystemSource::new());
+                // With the request behind it, exactly as a single send has it,
+                // so `body()` and its neighbours mean the same thing headless.
+                let errors = crate::generators::expand(
+                    &entry.generators,
+                    &mut merged,
+                    &SystemSource::for_request(crate::generators::RequestFacts::of(entry)),
+                );
                 // Reported once per request however often it repeats, so a
                 // `[Options] retry` does not print the same typo five times.
                 if !std::mem::replace(&mut gen_reported[i], true) {
@@ -337,6 +364,29 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
                     eo,
                 );
                 record(eo);
+            },
+            |i, attempt, limit| {
+                // All of a retried entry's attempts come back at once, so
+                // without this the run goes silent for `retry` ×
+                // `retry-interval` — a minute of nothing for a poll that is
+                // working perfectly — and then prints the lot. Announced as
+                // each attempt starts instead, which is also before Hurl
+                // sleeps for the interval.
+                if attempt == 0 {
+                    return;
+                }
+                let of = limit.total().map_or(String::new(), |t| format!(" of {t}"));
+                println!(
+                    "  {}",
+                    paint(
+                        color,
+                        Hue::Yellow,
+                        &format!("\u{21bb} [{}/{total}] retry {attempt}{of}\u{2026}", i + 1)
+                    )
+                );
+                // Block-buffered when stdout is a pipe or a file, and the whole
+                // point of the line is to arrive now rather than at the end.
+                let _ = std::io::Write::flush(&mut std::io::stdout());
             },
         )
     };
@@ -370,6 +420,13 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
 /// run of that request passed. Out-of-range indices are ignored rather than
 /// panicking — the runner is the authority on how many entries there were.
 fn credit(per_request: &mut [Option<bool>], eo: &EntryOutcome) {
+    // A retry attempt that a later one replaced decides nothing: the request
+    // asked to be tried until it held, and it held. Counting it would report a
+    // poll that succeeded on its third go as a failure -- which is the whole
+    // reason `[Options] retry` exists, undone at the last step.
+    if eo.superseded {
+        return;
+    }
     if let Some(slot) = per_request.get_mut(eo.entry_index) {
         *slot = Some(slot.unwrap_or(true) && eo.ok);
     }
@@ -378,12 +435,24 @@ fn credit(per_request: &mut [Option<bool>], eo: &EntryOutcome) {
 /// Print one request's result to stdout, coloured if `color` is enabled.
 fn print_entry(color: bool, idx: usize, total: usize, title: Option<&str>, eo: &EntryOutcome) {
     println!();
+    // A superseded attempt is still printed -- seeing that a poll answered
+    // "not ready" twice is most of what you want from a poll -- but it is
+    // labelled, so three blocks with two red ones read as one request that
+    // took three goes rather than as two failures.
+    let attempt = if eo.superseded { "  (retried)" } else { "" };
     println!(
         "{}",
         paint(
             color,
             Hue::Cyan,
-            &format!("[{}/{}] {} {}", idx + 1, total, eo.method, eo.url)
+            &format!(
+                "[{}/{}] {} {}{}",
+                idx + 1,
+                total,
+                eo.method,
+                eo.url,
+                attempt
+            )
         )
     );
     if let Some(title) = title.filter(|t| !t.is_empty()) {
@@ -531,6 +600,30 @@ mod tests {
         );
         let passed = per_request.iter().filter(|r| **r == Some(true)).count();
         assert_eq!(passed, 1, "never more passes than there are requests");
+    }
+
+    /// The counterpart for `retry`: an attempt a later one replaced decides
+    /// nothing. Counted, it made a poll that succeeded on its third go report
+    /// `Passed: 0  Failed: 1` -- and exit non-zero -- which is the one thing
+    /// `[Options] retry` is there to prevent.
+    #[test]
+    fn a_superseded_retry_attempt_does_not_fail_the_request() {
+        use crate::hurl::run::EntryOutcome;
+        let attempt = |ok: bool, superseded: bool| EntryOutcome {
+            entry_index: 0,
+            ok,
+            superseded,
+            ..EntryOutcome::default()
+        };
+        let mut per_request = vec![None; 1];
+        for eo in [
+            attempt(false, true),
+            attempt(false, true),
+            attempt(true, false),
+        ] {
+            super::credit(&mut per_request, &eo);
+        }
+        assert_eq!(per_request, vec![Some(true)]);
     }
 
     /// An outcome for a request the collection doesn't have is ignored rather

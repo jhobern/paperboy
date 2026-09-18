@@ -29,8 +29,9 @@ all three.
 ## Install
 
 ```sh
-cargo install paperboy --locked                 # terminal UI + headless runner
-cargo install paperboy --locked --features gui  # …and the graphical UI
+cargo install paperboy --locked                       # terminal UI + headless runner
+cargo install paperboy --locked --features gui        # …and the graphical UI
+cargo install paperboy --locked --no-default-features # headless runner only
 ```
 
 `--locked` is recommended: it builds the dependency versions PaperBoy was
@@ -43,6 +44,13 @@ The `gui` feature is opt-in because eframe/winit/wgpu roughly double the
 dependency tree. Both builds share the same state file, so you lose nothing by
 switching. Running `--gui` without it prints the command to install one with it.
 
+`--no-default-features` turns the terminal UI off and leaves the headless
+runner, which is the shape wanted for CI images and Docker containers: it drops
+40 dependencies and about a third of PaperBoy's own source, none of which a
+scripted `-c`/`-r` run would ever execute. The resulting binary takes the same
+arguments and writes the same reports; only the interactive front-end is
+missing, and running it with no arguments says so rather than doing nothing.
+
 ### Build prerequisites
 
 Five things Cargo can't fetch for you:
@@ -54,7 +62,7 @@ Five things Cargo can't fetch for you:
 | Fedora/RHEL | `sudo dnf install pkgconf-pkg-config gcc make perl libxml2-devel clang-devel` |
 | Arch | `sudo pacman -S pkgconf base-devel perl libxml2 clang` |
 | Alpine | `sudo apk add build-base pkgconfig perl libxml2-dev clang-dev` |
-| Windows (MSVC) | `vcpkg install libxml2:x64-windows-static-md` |
+| Windows (MSVC) | see [Windows](#windows) below |
 
 **libxml2 + `pkg-config`** because `hurl`/`hurl_core` depend unconditionally on
 the `libxml` crate (Hurl's XPath asserts *are* libxml2's XPath engine), and that
@@ -66,6 +74,9 @@ sources — which is why there is no `libcurl-dev` row above. The `gui` feature
 adds no build-time requirement; its X11/Wayland libraries are `dlopen`ed at
 runtime.
 
+On Windows (MSVC) the same needs are met by different tools, so it gets its own
+section below.
+
 On macOS the Command Line Tools cover everything except `pkg-config`, which is
 the failure most people hit. If your libxml2 came from Homebrew rather than the
 SDK:
@@ -73,6 +84,53 @@ SDK:
 ```sh
 export PKG_CONFIG_PATH="$(brew --prefix libxml2)/lib/pkgconfig:$PKG_CONFIG_PATH"
 ```
+
+#### Windows
+
+Nothing here is unusual, but almost every piece arrives from a different place
+than it does on Unix, so in order:
+
+1. **Visual Studio Build Tools**, workload *Desktop development with C++* —
+   this is `cl.exe`, `nmake` and the Windows SDK. `cargo` finds them through
+   the registry, so they don't have to be on `PATH`; building from an **x64
+   Native Tools Command Prompt for VS** is still the least surprising way.
+
+2. **libxml2, from vcpkg.** On MSVC the `libxml` crate asks vcpkg and nothing
+   else — there is no pkg-config fallback — and it finds vcpkg through
+   `VCPKG_ROOT` (or a previous `vcpkg integrate install`), *not* by looking for
+   `vcpkg.exe` on `PATH`:
+
+   ```bat
+   git clone https://github.com/microsoft/vcpkg C:\vcpkg
+   C:\vcpkg\bootstrap-vcpkg.bat
+   setx VCPKG_ROOT C:\vcpkg
+   vcpkg install libxml2:x64-windows-static-md
+   ```
+
+   The triplet is the part worth reading twice. `x64-windows-static-md` is a
+   static libxml2 built against the *dynamic* CRT, which is what Rust's MSVC
+   targets link — it is what vcpkg-rs asks for by default, and installing the
+   plain `x64-windows` port instead is the usual first wrong turn. Use
+   `arm64-windows-static-md` on ARM64. (`VCPKGRS_DYNAMIC=1` switches to the DLL
+   ports, and `VCPKGRS_TRIPLET` overrides the choice outright — `build.rs`
+   honours both when it tells you which triplet is missing.)
+
+3. **LLVM, Strawberry Perl and NASM:**
+
+   ```bat
+   winget install LLVM.LLVM StrawberryPerl.StrawberryPerl NASM.NASM
+   ```
+
+   or `choco install llvm strawberryperl nasm`. LLVM supplies `libclang.dll`
+   for bindgen — if it isn't found, point at it with
+   `setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"`. Perl and NASM are for the
+   vendored OpenSSL build (`perl Configure`, then NASM for the crypto
+   assembly), and **NASM's installer does not add itself to `PATH`**, which
+   OpenSSL needs it to be — so add `C:\Program Files\NASM` yourself.
+
+`build.rs` checks all of this before the build starts and names the triplet and
+the tree it actually looked in, so a wrong `VCPKG_ROOT` reads as one line rather
+than as a link error several minutes later.
 
 PaperBoy's `build.rs` checks for all five before the build gets going and fails
 with the package-manager command your machine actually wants (it detects
@@ -102,8 +160,15 @@ From a checkout:
 ```sh
 cargo run                           # terminal UI
 cargo run --features gui -- --gui   # graphical UI
+cargo run --no-default-features -- -c collection.hurl   # headless only
 cargo test                          # add --features gui for the GUI's tests
 ```
+
+PaperBoy builds in four shapes — headless, terminal, terminal + GUI, and GUI
+alone — and CI checks all four, because a configuration nothing builds is a
+configuration that stops compiling. Each must also stay warning-free; the
+dead-code analysis is carried by the two shapes that include the terminal UI
+(see the note at the top of `src/main.rs` for why).
 
 ## Concepts
 
@@ -194,6 +259,23 @@ Worth knowing:
 - **The request preview substitutes `{{ VAR }}`** and colours each by status —
   green loaded, cyan literal, orange loading, red missing — while the editor
   keeps the original text. Secrets are masked as eight dots.
+- **A JSON body can be laid out again** — `p` in the main view, `Alt+P` in the
+  request editor, **Format** in the GUI. The body is re-indented in place
+  rather than round-tripped through a JSON parser, so comments, a bare
+  `{{ TEMPLATE }}` standing where a value goes, number spelling (`1.50`, `1e3`,
+  a 19-digit id) and duplicate keys all survive; a body that isn't JSON is
+  refused rather than mangled.
+- **Captures are visible in two places, because there are two questions.** The
+  Response pane's **Captures** tab lists what *that* request captured when it
+  last ran, marking a value a later run has since replaced as *superseded*. The
+  live pool — what `{{ VAR }}` is worth *right now* — is in the terminal UI's
+  `v` **Variables** popup and the GUI's Environments panel ▸ **Variables** tab.
+  Both list the bound environment's variables and the capture pool together, in
+  the precedence substitution applies: the environment *overridden by* the pool,
+  so an environment row a capture is shadowing is marked as such rather than
+  quietly showing a value that isn't the one being sent. Values are masked by
+  default (`m` / **Reveal**) since a capture is usually a token; copying still
+  yields the real value, and `# [Gen]` computed values are never listed.
 - **Sections start empty** and dropdowns only auto-open on an empty cell, so
   arrowing through a populated table doesn't keep reopening them.
 - **Settings ▸ Preferences** persists: confirm on exit/clear, confirm before
@@ -298,16 +380,15 @@ a value into something that looks like a reference triggers a load attempt, and
 a "still secret?" checkbox decides whether the new value stays masked.
 
 **Loading a `.vars` file substitutes nothing on its own.** It only joins the
-Global Environments list. It has to be either:
+Global Environments list. It then has to be *activated on a tab*: `a` in the
+Global Environments panel (GUI: the **Active** button, a double-click, or
+right-click → Activate).
 
-- **active** — `a` in the Global Environments panel (GUI: the **Active**
-  button). One at a time, shared by every tab; or
-- **linked** — `p` in the Requests list pins one to the active collection (GUI:
-  **Linked**).
-
-Both at once merge, with the linked value winning. A collection still showing
-raw `{{ VAR }}`, or a red "variables in this request are undefined" band, nearly
-always means this step was missed.
+The environment belongs to the tab, not to the app: one per tab, and activating
+one leaves every other tab alone. Open the same collection in two tabs to run it
+against staging and prod side by side. A collection still showing raw
+`{{ VAR }}`, or a red "variables in this request are undefined" band, nearly
+always means this step was missed on *that* tab.
 
 A variable that is *defined but empty* is not undefined and warns about nothing
 — it substitutes as an empty string. With Basic Auth that produces a
@@ -394,15 +475,61 @@ braces, because the value doesn't exist yet.
 | Encoding | `base64`, `base64url`, `base64_decode`, `hex`, `urlencode`, `urldecode`, `json_string` |
 | Hashes | `md5`, `sha1`, `sha256`, `sha512` |
 | MACs | `hmac_sha1(key, msg)`, `hmac_sha256`, `hmac_sha512` |
-| Text | `concat(…)`, `upper`, `lower`, `trim` |
+| Text | `concat(…)`, `upper`, `lower`, `trim`, `split(text, sep, n)`, `regex(text, pattern)` |
+| JSON | `jsonpath(text, path)` |
+| Request | `method`, `url`, `path`, `query`, `header(name)`, `body`, `request_name` |
+
+`jsonpath(text, path)` reads a value out of a JSON document the block already
+has in hand — this request's own `body()`, or a response an earlier request
+captured whole. When the value comes straight from a response a `[Captures]`
+row is the right tool; this is for the cases a capture can't reach, which is
+anything that has to be *computed* from the value: signing part of a payload,
+or building this request's body out of pieces of the last one's. It walks `$`,
+`.name`, `["name"]`, `[n]` and `[?(@.key == 'x')]` — the last of which is how
+you address an API that returns its fields as a list of key/value objects. A
+string comes back as its text (not with the quotes still on), an object or
+array as compact JSON, and `null` is an error rather than the four characters
+`null`. Wildcards, recursive descent, slices and unions are refused by name
+rather than half-implemented, pointing you at the `[Captures]` row that has
+Hurl's full JSONPath: the same path meaning two different things in one
+request is worse than not being able to write it.
 
 Every hash and MAC returns lowercase hex — matching `sha256sum` and CryptoJS's
 `.toString()`, so a ported Postman script lands right — and each has a `_b64`
-variant returning standard padded Base64. The encoding is in the name rather
+variant returning standard padded Base64 and a `_b64url` variant returning the
+URL-safe alphabet without padding — the encoding a JWT segment is made of,
+where `+`, `/` and `=` are all wrong. The encoding is in the name rather
 than a default because a signature in the wrong one is the right length,
 entirely plausible to look at, and rejected with the same `401` as a wrong
 secret. Note that `base64(sha256(m))` is *not* `sha256_b64(m)`: the first
 encodes 64 hex characters, the second the 32 bytes they spell.
+
+The **Request** functions read the request the block belongs to — the method as
+sent, the body as it goes on the wire (no JSON comments, no switched-off
+headers) — which is how a signature over "the thing I am about to send" is
+written. They read the text as authored, substituted against the rows above
+them: a row reading `body()` sees earlier rows filled in and later ones still as
+`{{name}}`, so a value can never depend on a row that depends on it. Without a
+request behind the block — the editor's live check on a row you are still
+typing — they say so rather than answering with nothing, because an HMAC over a
+silently empty body is a signature that authorises nothing.
+
+`split` counts pieces from the end when given a negative index, so the last
+segment of a path is `split(path(), "/", -1)` — JavaScript's `.pop()`, which is
+the shape these scripts are written in. `regex` is the escape hatch for what
+`split` can't reach: the first capture group if the pattern has one, otherwise
+the whole match. Both treat "no such piece" and "matched nothing" as faults
+rather than an empty answer, since that text goes on to be signed or sent.
+
+**A name is written bare, not in braces.** Everywhere else in PaperBoy a
+variable is `{{name}}`; inside a generator expression it is just `name`, because
+an expression already names things — `concat("Bearer ", TOKEN)`. Writing
+`"{{TOKEN}}"` there is refused rather than accepted as a string, since a
+signature over the eight characters `{{TOKEN}}` is the right length, entirely
+plausible, and rejected with the same `401` as a wrong secret. (`\{` is the
+escape, for a string that really does want a brace.) A row can also be a plain
+literal — `expected = "APPROVED"` — which is how an assert compares against a
+per-request expectation: `jsonpath "$.status" == "{{expected}}"`.
 
 **Canonicalisation is yours.** PaperBoy signs exactly the bytes you assemble; it
 will not build a canonical request from the live headers, so AWS SigV4 and
@@ -595,6 +722,8 @@ paperboy -r report.trail                                  # collection from the 
 paperboy -c api.hurl -r report.trail -o out.csv           # or given explicitly; - is stdout
 paperboy -c api.hurl -e prod.vars -e staging.vars -r report.trail
 paperboy -c api.hurl -r report.trail --dry-run            # expand it, send nothing
+paperboy -r report.trail -o out.html -o out.json          # one run, several formats
+paperboy -r report.trail --param CASES_DIR=./batch-07     # set a PARAM the report declares
 ```
 
 Without `-c`/`-e` the report's own `# collection:` / `# environment:` headers
@@ -602,5 +731,244 @@ apply, resolved relative to the report. `-e` is repeatable: each file is named
 by its stem and becomes selectable in an `ENVS` loop, so `-e prod.vars -e
 staging.vars` satisfies `FOR … IN ENVS BASELINE("prod"), COMPARISON("staging")`;
 the first is also the base variable layer. `-o`'s extension picks the format
-(`.csv`, `.json`, `.html`, `.xlsx`), `-` writes CSV to stdout, and omitting it
-derives the filename from the report's own headers.
+(`.csv`, `.json`, `.html`, `.xlsx`, `.pdf`), `-` writes CSV to stdout, and
+omitting it derives the filename from the report's own headers.
+
+`-o` is repeatable, and every file comes from **one** run of the requests — the
+report is rendered once per format from the same result, never run twice. That
+is what an application embedding PaperBoy needs: `-o out.html -o out.json` gives
+it a rendering to show a user and a structure to parse, with no risk of the two
+disagreeing because they came from separate runs. `-` may be given at most once
+(two formats down one pipe would interleave into neither), the same path twice
+is refused as a typo, and every format is checked *before* any request is sent,
+so a misspelled extension costs nothing. If one file fails to write, the others
+are left in place and the run exits `1`.
+
+`--param NAME=VALUE` supplies a value for a `PARAM` the report declares, and is
+repeatable. It is what lets one report serve many runs: a report that declares
+
+```
+PARAM FOLDER CASES_DIR = "./cases"
+FOR CASE IN FOLDERS "{{CASES_DIR}}"
+```
+
+is pointed somewhere new with `--param CASES_DIR=./batch-07` rather than by
+editing the file — which is never rewritten, so a report under version control
+keeps meaning the same thing to everyone. The value beats the declared default,
+is checked against the declaration (a `CHOICE` must be one of its options, a
+`NUMBER` must parse), and a name the report doesn't declare is an error rather
+than a value that silently does nothing. A `PARAM` with no default *requires*
+a `--param`, since there is nothing to fall back on.
+
+Exit codes are a contract for callers: `0` ran clean, `1` a setup error or a
+run with per-row errors, `3` some steps were skipped because something they
+depended on failed, and `2` (clap's) means the command line itself was wrong.
+Progress goes to stderr, so `-o -` leaves stdout clean for a pipe.
+
+#### Dependency graphs
+
+Inside a `GRAPH … END` region the order statements are written in stops being
+the order they run in. PaperBoy reads what each request needs and what each
+produces, works out the ordering that satisfies those, and runs that. A region
+that cannot be ordered — two requests each waiting on the other — is an error,
+and nothing in the report is sent: the author has said written order is not the
+specification, so falling back to it would be the one answer guaranteed to be
+wrong.
+
+```
+GRAPH release
+    REQUEST auth/login AS login          # captures token
+    REQUEST orders/create AS order       # uses {{token}}
+    REQUEST orders/get USING(id = {{order.id}})
+END
+```
+
+Wrapping an existing block in `GRAPH … END` changes nothing while everything
+succeeds: with no edges to reorder by, a region runs in written order. Two
+things do change once something goes wrong or is ambiguous, and both are the
+point of the region rather than accidents of it:
+
+- **A failure stops what depended on it.** Flat, every later request is sent
+  regardless; in a region, the steps downstream of a failure are skipped and
+  the run exits `3`. A request that cannot work without a token nobody
+  captured has nothing to tell you, and sending it anyway costs a real call
+  against a real service.
+- **An ambiguous capture is an error, not last-writer-wins.** Flat, two
+  requests capturing `token` are resolved by written order. In a region there
+  is no written order to fall back on, so a step reading `{{token}}` that two
+  steps in its region capture is refused. Name the one you mean —
+  `{{login.token}}` — and it is unambiguous again.
+
+A dotted name in a report's own text always means *step, then capture*. The
+namespace is reserved: an environment variable whose key happens to contain a
+dot cannot answer one, because it would answer precisely when the step had not
+captured — quietly supplying a stale credential at the moment the reference was
+supposed to fail. A dotted name whose prefix is not a step in scope is an error,
+wherever it is written: a `USING` value, a computed column, or a producer path.
+
+Inference reads every place a value can actually be used: a URL, a header, a
+body, a `[Captures]` or `[Asserts]` expression, and the bare identifiers of a
+`# [Gen]` row, which are variable references despite having no braces. It does
+not read a disabled row or a `[Reports]` field — nothing substitutes into
+either, so an edge drawn from one would reorder a region for text that never
+runs.
+
+`--targets a,b` runs only the named steps and whatever they transitively
+depend on, so a release check can ask for one answer without paying for the
+whole report. Naming a step that no region declares is an error rather than a
+silent empty run, and so is naming a set of targets that leaves out a step the
+rest of the report still refers to: the reference could only reach the run as a
+literal `{{create.sid}}`. Only qualified references are checked: a plain
+`{{sid}}` is answered by whatever is standing in the capture chain, and pruning
+can't know what else might answer it — the environment isn't even loaded at that
+point — so a selection that leaves a flat reference's producer out is allowed
+through. A `TRUTH` template counts as a reference like any other, wherever it is
+written — on a computed column, on a variable column, on a `WITH` field or in
+the `columns:` directive. It is resolved against the row's cells, which are
+keyed by step, so pruning the step it names would leave every row in that column
+scoring `Untested` for no stated reason. A `USING(…)` override is read as part of the request too, since it
+decides what is actually sent — it can strand a teardown that looked clean, or
+clear one that didn't. `--dry-run` lists the steps grouped by how deep in the graph they sit,
+which is how you check the shape of a region without sending anything.
+
+`DEPENDS` states an ordering the data doesn't show. Inference only sees values
+flowing from a capture to a reference, and some dependencies leave no such
+trace — uploading a file that a later request fetches by an id it already had,
+say. `REQUEST dfa/result DEPENDS upload` says so outright. Names are the step
+names, separated by commas, and a `DEPENDS` is only meaningful inside a region:
+outside one, written order already *is* the order, so PaperBoy rejects it
+rather than let it look like it did something.
+
+Clauses may be written in any order, and a long statement may gather them into
+a bracketed group opening on the statement's own line:
+
+```
+GRAPH
+    REQUEST dfa/result AS result (
+        DEPENDS upload, session
+        USING(query.id = "{{session.id}}")
+    )
+END
+```
+
+#### Running a region in parallel
+
+`PARALLEL(n) GRAPH … END` lets up to `n` steps overlap. Each is taken the
+moment its dependencies are done — not a wave at a time, which would make the
+region cost the slowest step at every depth. A cap is permission, not an
+instruction: a chain still runs one at a time however high `n` is set, and the
+report is identical at any degree, because rows, columns and errors are merged
+in plan order rather than in the order workers happened to finish.
+
+#### Shuffling, and why
+
+A region is a *claim* that its edges — inferred and declared — are the complete
+set. PaperBoy cannot verify that claim. It can help you falsify it.
+
+With the default tie-break, ready steps run in written order, so a dependency
+nobody declared keeps working by accident and surfaces months later when
+something unrelated moves. `--shuffle` picks at random among the steps that are
+ready, which turns that into a failure now, and prints the seed:
+
+```
+  Shuffle    : seed 4711 (replay with --shuffle=4711)
+```
+
+`--shuffle=4711` replays that run. Shuffling only reorders steps that may
+legally run in any order; it never runs a step before what it depends on.
+
+How exact the replay is depends on the degree. A sequential region replays
+*exactly*: the seed alone decides every choice. A `PARALLEL(n)` region replays
+its dispatch *preferences* exactly, but which step becomes ready next also
+depends on which request came back first, and no seed controls the network. So
+a shuffled failure in a parallel region is far more likely to reproduce under
+its seed than without one, but it is not guaranteed to. If you find one and
+want it nailed down, re-run the seed with `PARALLEL(1)` — a missing dependency
+is a property of the ordering, not of the concurrency, so it will still be
+there.
+
+#### Cleanup
+
+`CLEANUP` marks a request that undoes something — deleting a session, releasing
+a lock. It is written where it belongs logically but runs at the end of its
+block: at the end of the flow at the top level, at the end of each iteration
+inside a `FOR`. Cleanups run in reverse dependency order, so a thing is torn
+down before whatever it was built on.
+
+```
+REQUEST auth/login AS login
+CLEANUP auth/logout USING(header.Authorization = "{{login.token}}")
+REQUEST orders/create
+```
+
+A cleanup whose dependency never succeeded is skipped — there is nothing to
+undo — and a cleanup that fails is reported as a warning rather than an error,
+because a teardown failing is nearly always a consequence of the real failure
+and shouldn't be allowed to bury it.
+
+"Its dependency" means whatever it names in `DEPENDS`, plus whichever step
+actually produced each value it reads. A request that fails can still have
+captured, so the step a cleanup is gated on is the one whose value it will be
+handed, not the last one that happened to succeed — otherwise a teardown could
+be authorised by one step and then sent with a different, failed step's
+identifier. Cleanups can depend on each other, by `DEPENDS` or by reading one
+another's captures, and are ordered accordingly; a cycle between them is
+refused: every member of a ring waits on a member that has not run, so none of
+them is sent. A cleanup can only depend on one in its own
+block, and can only read one's captures there too: an enclosing block unwinds
+after this one, so a cleanup out there could never have run in time. For the
+same reason an ordinary step can never read a cleanup's capture — teardown runs
+after every step in its block.
+
+Which step a cleanup waits for and which one it is *gated* on are two different
+questions. The order has to be settled before anything has run, so it can only
+ask which steps declare a name; the gate is asked when the teardown is
+dispatched, by which point the step that actually wrote the value it is being
+handed is a fact. A sibling cleanup that was skipped, or that ran without
+capturing, therefore doesn't vouch for a value it never wrote — the step that
+did write it is the one that has to have succeeded.
+
+#### Carrying the requests in the report
+
+A report normally names a collection to draw its requests from. It can instead
+carry them itself, in a `REQUESTS` section — plain Hurl, which must be the last
+thing in the file:
+
+```
+# name: Health check
+
+GRAPH
+    REPORT REQUEST ping
+END
+
+REQUESTS
+
+# ping
+GET https://example.com/ping
+[Asserts]
+status == 200
+```
+
+That runs with no `# collection:` line and no sibling `.hurl` file:
+`paperboy -r health.trail`. A report that embeds its requests may still name a
+collection as well, in which case both sets are available and a name used by
+both is an error — a reference has to mean one thing.
+
+Embed when the requests exist only to serve the flow, so that the whole check
+travels as one file and nothing can be moved out from under it. Reference a
+collection when the requests *are* the API surface under test and other things
+use them too. Note what embedding does and doesn't buy: it removes the sibling
+collection file, not a fixture directory that `FOR … IN FILES` reads.
+
+#### Exit codes
+
+| Code | Meaning |
+| ---- | ------- |
+| `0`  | Everything ran and every assertion passed. |
+| `1`  | Something failed: a request, an assertion, or the report itself. |
+| `3`  | Steps were skipped because something they depended on failed. |
+
+`3` implies `1` — a skip only ever follows a failure — and says the run is
+additionally incomplete, so a pipeline that only cares about pass/fail can
+treat any non-zero code the same way while one that reruns can tell the
+difference. `2` is left alone: it is what `clap` uses for a bad command line.

@@ -66,6 +66,11 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         lbl_probe_hint,
         lbl_probe_this,
         lbl_copy_this,
+        lbl_captures,
+        lbl_no_captures,
+        lbl_reveal,
+        lbl_reveal_hint,
+        lbl_superseded,
     ) = {
         let s = &app.strings;
         (
@@ -87,6 +92,11 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             s.gui_probe_button_hint,
             s.gui_probe_assert_this,
             s.gui_probe_copy_this,
+            s.gui_sec_captures,
+            s.gui_no_captures,
+            s.gui_reveal,
+            s.gui_reveal_hint,
+            s.resp_capture_superseded,
         )
     };
 
@@ -100,7 +110,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // server returned no body, which is exactly backwards: the reader is being
     // told the result of a request rather than that there isn't one yet.
     let sent = shown.is_some();
-    let (status, status_text, body, error, headers, asserts, duration) = match shown {
+    let (status, status_text, body, error, headers, asserts, duration, captures) = match shown {
         Some(r) => (
             r.status,
             r.status_text.clone(),
@@ -114,6 +124,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             r.headers.clone(),
             r.assert_results.clone(),
             r.duration_ms,
+            r.captures.clone(),
         ),
         None => (
             0,
@@ -123,6 +134,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             Vec::new(),
             Vec::new(),
             None,
+            Vec::new(),
         ),
     };
 
@@ -202,16 +214,34 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             // when there is a body to compact. It is display-only: the Copy
             // button above always yields the full body, so a copied value is
             // never truncated.
+            //
+            // `widgets::selectable` rather than `ui.selectable_label`, which is
+            // `frame_when_inactive(selected)` — unframed when off, so beside the
+            // framed Copy and Probe buttons it read as a stray word rather than
+            // as something to press.
             if !body.is_empty() && app.response_section == ResponseSection::Body {
                 let mut compact = app.response_compact;
-                if ui
-                    .selectable_label(compact, lbl_compact)
+                if widgets::selectable(ui, compact, lbl_compact)
                     .on_hover_text(lbl_compact_hint)
                     .clicked()
                 {
                     compact = !compact;
                 }
                 app.response_compact = compact;
+            }
+            // The Captures mask toggle, sharing the Compact toggle's bargain:
+            // display-only, with Copy still yielding the real values. Shown only
+            // on the Captures section and only when there is something masked,
+            // so it never sits there offering to reveal an empty list.
+            if !captures.is_empty() && app.response_section == ResponseSection::Captures {
+                let mut reveal = app.response_reveal;
+                if widgets::selectable(ui, reveal, lbl_reveal)
+                    .on_hover_text(lbl_reveal_hint)
+                    .clicked()
+                {
+                    reveal = !reveal;
+                }
+                app.response_reveal = reveal;
             }
         });
     });
@@ -234,6 +264,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             asserts.len()
         )
     };
+    let captures_label = format!("{lbl_captures}{}", widgets::count_suffix(captures.len()));
     widgets::section_tabs(
         ui,
         &theme,
@@ -242,6 +273,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             (ResponseSection::Body, lbl_body),
             (ResponseSection::Headers, lbl_headers),
             (ResponseSection::Asserts, assert_label.as_str()),
+            (ResponseSection::Captures, captures_label.as_str()),
         ],
     );
     ui.separator();
@@ -367,12 +399,25 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     // offered no assert -- which made the target the text
                     // rather than the row it is in.
                     let band = ui.max_rect().x_range();
+                    // Striped by hand rather than with `Grid::striped`: egui
+                    // paints that stripe across the *grid's* width, which is
+                    // as wide as the widest pair of labels, while the row --
+                    // the thing that hovers, and the thing the stripe is there
+                    // to delimit -- is the full width of the panel. The two
+                    // disagreeing left every stripe stopping short of the
+                    // highlight it was supposed to be under. One `row_rect`
+                    // now feeds both, so they cannot drift apart again.
+                    let stripe = ui.visuals().faint_bg_color;
                     egui::Grid::new("resp_headers")
                         .num_columns(2)
                         .spacing([12.0, 4.0])
-                        .striped(true)
                         .show(ui, |ui| {
                             for (i, (k, v)) in headers.iter().enumerate() {
+                                // Reserved before the labels and filled in
+                                // after: the row's extent is only known once
+                                // both are laid out, but the stripe has to be
+                                // painted *behind* them.
+                                let stripe_slot = ui.painter().add(egui::Shape::Noop);
                                 let name = ui.label(RichText::new(k).strong().color(theme.accent));
                                 let value =
                                     ui.label(RichText::new(v).monospace().color(theme.text));
@@ -381,6 +426,12 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                                     name.rect.union(value.rect).y_range(),
                                 )
                                 .expand2(egui::vec2(0.0, 2.0));
+                                if i % 2 == 1 {
+                                    ui.painter().set(
+                                        stripe_slot,
+                                        egui::epaint::RectShape::filled(row_rect, 2.0, stripe),
+                                    );
+                                }
                                 // Interacted with as one thing, after both
                                 // labels: the whole row is a single subject, so
                                 // it hovers and opens its menu as a single
@@ -433,6 +484,63 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                             });
                         }
                     }
+                }
+            }
+            // What *this* request captured, last time it ran — a snapshot, not
+            // the live pool. The response keeps it for as long as the request
+            // keeps its last response, so another run capturing the same name
+            // would leave this figure on screen looking current; `is_superseded`
+            // is what makes the row admit it instead. The whole pool, and what
+            // each name is worth *now*, is the Environments panel's job.
+            ResponseSection::Captures => {
+                if !sent {
+                    ui.colored_label(theme.dim, lbl_unsent);
+                } else if captures.is_empty() {
+                    ui.colored_label(theme.dim, lbl_no_captures);
+                } else {
+                    let ci = app.active_ci();
+                    let reveal = app.response_reveal;
+                    let stale: Vec<bool> = captures
+                        .iter()
+                        .map(|(k, v)| {
+                            app.session
+                                .collections
+                                .get(ci)
+                                .is_some_and(|c| crate::vars_view::is_superseded(c, k, v))
+                        })
+                        .collect();
+                    egui::Grid::new("resp_captures")
+                        .num_columns(2)
+                        .spacing([12.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (i, (key, value)) in captures.iter().enumerate() {
+                                ui.label(RichText::new(key).strong().color(theme.accent));
+                                ui.horizontal(|ui| {
+                                    let shown = ui.label(
+                                        RichText::new(crate::vars_view::shown_value(value, reveal))
+                                            .monospace()
+                                            .color(theme.text),
+                                    );
+                                    // Yields the real value even while the row
+                                    // is masked. Masking is a defence against
+                                    // onlookers, not against the person at the
+                                    // keyboard, who listed the value precisely
+                                    // because they need to paste it somewhere.
+                                    shown.context_menu(|ui| {
+                                        if ui.button(lbl_copy_this).clicked() {
+                                            ui.ctx().copy_text(value.clone());
+                                            copied = true;
+                                            ui.close();
+                                        }
+                                    });
+                                    if stale[i] {
+                                        ui.colored_label(theme.dim, lbl_superseded);
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
                 }
             }
         });
@@ -707,6 +815,50 @@ mod probe_route_tests {
         assert!(
             washes.iter().all(|(r, _)| !r.contains(other)),
             "the highlight reached a row the pointer was nowhere near"
+        );
+    }
+
+    /// The zebra stripe and the hover highlight are the same row, so they are
+    /// the same size. `Grid::striped` painted only as far as the widest pair
+    /// of labels, which left the stripe stopping short of the highlight laid
+    /// over it -- two rectangles for one row, visibly disagreeing about where
+    /// it ended.
+    #[test]
+    fn a_header_stripe_is_as_wide_as_the_row_that_highlights() {
+        let mut app = app_with(
+            r#"{"a":1}"#,
+            vec![
+                ("X-Request-Id".into(), "r-42".into()),
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            200,
+        );
+        app.response_section = ResponseSection::Headers;
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        let painted = panel_frame(&mut app, &ctx, vec![]);
+        let second = centre_of(&painted, "application/json");
+
+        panel_output(&mut app, &ctx, vec![egui::Event::PointerMoved(second)]);
+        let full = panel_output(&mut app, &ctx, vec![]);
+        let all = fills(&full);
+        let wash = all
+            .iter()
+            .filter(|(r, c)| c.a() > 0 && c.a() < 255 && r.contains(second))
+            .map(|(r, _)| *r)
+            .next()
+            .expect("the hovered row is washed");
+        // The striped row is the same row, drawn opaque underneath.
+        let faint = ctx.style_of(egui::Theme::Dark).visuals.faint_bg_color;
+        let stripe = all
+            .iter()
+            .filter(|(r, c)| *c == faint && r.contains(second))
+            .map(|(r, _)| *r)
+            .next()
+            .expect("the second row is striped");
+        assert!(
+            (stripe.width() - wash.width()).abs() < 0.5,
+            "stripe {stripe:?} is not the width of the highlight {wash:?}"
         );
     }
 
@@ -1040,6 +1192,174 @@ mod unsent_tests {
         GuiApp::for_test(session)
     }
 
+    /// Masked by default. A capture is almost always a bearer token — that is
+    /// what `[Captures]` is largely for — and unlike an environment variable it
+    /// carries no "secret" marking to go by, so the panel cannot tell a token
+    /// from a page count and assumes the worse of the two.
+    #[test]
+    fn the_captures_section_masks_its_values_until_reveal_is_ticked() {
+        let mut app = app_with(Some(ApiResponse {
+            status: 200,
+            captures: vec![("access_token".to_string(), "ey.super.secret".to_string())],
+            ..Default::default()
+        }));
+
+        let painted = draw(&mut app, ResponseSection::Captures);
+        assert!(
+            painted.iter().any(|t| t == "access_token"),
+            "the name is listed: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|t| t == crate::environment::SECRET_MASK),
+            "the value should be masked: {painted:?}"
+        );
+        assert!(
+            !painted.iter().any(|t| t.contains("ey.super.secret")),
+            "the value must not be on screen: {painted:?}"
+        );
+
+        app.response_reveal = true;
+        let painted = draw(&mut app, ResponseSection::Captures);
+        assert!(
+            painted.iter().any(|t| t == "ey.super.secret"),
+            "Reveal shows it: {painted:?}"
+        );
+    }
+
+    /// Labels with a widget frame painted behind them.
+    ///
+    /// A framed button paints its background rectangle and then its text. The
+    /// rectangle has to be *visible* to count: egui emits a `RectShape` for an
+    /// inactive frameless widget too, filled with a fully transparent colour,
+    /// so testing for the shape alone would be satisfied by the very thing this
+    /// is meant to catch. Panel and striping backgrounds are visible but do not
+    /// hug their text, hence the size bound.
+    fn framed_labels(app: &mut GuiApp, section: ResponseSection) -> Vec<String> {
+        app.response_section = section;
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(700.0, 600.0),
+        ));
+        let out = ctx.run_ui(input, |panel| super::ui(app, panel));
+        fn walk(
+            s: &egui::epaint::Shape,
+            rects: &mut Vec<egui::Rect>,
+            texts: &mut Vec<(String, egui::Rect)>,
+        ) {
+            match s {
+                egui::epaint::Shape::Rect(r) => {
+                    let visible = r.fill.a() > 0
+                        || (r.stroke.width > 0.0 && r.stroke.color.a() > 0)
+                        || (r.blur_width > 0.0);
+                    if visible {
+                        rects.push(r.rect);
+                    }
+                }
+                egui::epaint::Shape::Text(t) => texts.push((
+                    t.galley.text().to_string(),
+                    egui::Rect::from_min_size(t.pos, t.galley.size()),
+                )),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, rects, texts)),
+                _ => {}
+            }
+        }
+        let mut rects = Vec::new();
+        let mut texts = Vec::new();
+        for c in &out.shapes {
+            walk(&c.shape, &mut rects, &mut texts);
+        }
+        texts
+            .into_iter()
+            .filter(|(_, tr)| {
+                rects.iter().any(|r| {
+                    r.contains_rect(*tr)
+                        && r.width() <= tr.width() + 24.0
+                        && r.height() <= tr.height() + 16.0
+                })
+            })
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    /// The toggle shares a row with the framed Copy and Probe buttons, so it has
+    /// to read as one in both states. `ui.selectable_label` is
+    /// `frame_when_inactive(selected)` — no frame at all while it is off — which
+    /// left "Reveal" looking like a stray word rather than something to press.
+    #[test]
+    fn the_reveal_toggle_is_framed_even_when_it_is_off() {
+        let mut app = app_with(Some(ApiResponse {
+            status: 200,
+            captures: vec![("access_token".to_string(), "ey.super.secret".to_string())],
+            ..Default::default()
+        }));
+        app.response_reveal = false;
+        let reveal = app.strings.gui_reveal.to_string();
+
+        let framed = framed_labels(&mut app, ResponseSection::Captures);
+        assert!(
+            framed.iter().any(|t| *t == reveal),
+            "the unselected Reveal toggle has no frame: {framed:?}"
+        );
+        // Guards the detector itself: a plain label must not be counted, or the
+        // assertion above would pass however the toggle is drawn.
+        assert!(
+            !framed.iter().any(|t| t == "access_token"),
+            "a plain label was counted as framed: {framed:?}"
+        );
+    }
+
+    /// The reason the tab is not simply the live pool: a response keeps its
+    /// captures for as long as the request keeps its last response, so a later
+    /// run of some *other* request would leave this figure on screen looking
+    /// current.
+    #[test]
+    fn a_capture_the_pool_has_moved_past_is_marked_superseded() {
+        let mut app = app_with(Some(ApiResponse {
+            status: 200,
+            captures: vec![("token".to_string(), "first".to_string())],
+            ..Default::default()
+        }));
+        let superseded = app.strings.resp_capture_superseded.to_string();
+        app.response_reveal = true;
+
+        let painted = draw(&mut app, ResponseSection::Captures);
+        assert!(
+            !painted.contains(&superseded),
+            "nothing has replaced it yet: {painted:?}"
+        );
+
+        app.session.collections[0]
+            .captures
+            .insert("token".to_string(), "second".to_string());
+
+        let painted = draw(&mut app, ResponseSection::Captures);
+        assert!(
+            painted.iter().any(|t| t == "first") && painted.contains(&superseded),
+            "the snapshot must admit it is one: {painted:?}"
+        );
+    }
+
+    /// The tab carries a count, the way Asserts does, so a request that
+    /// captured something says so without being opened.
+    #[test]
+    fn the_captures_tab_carries_a_count() {
+        let mut app = app_with(Some(ApiResponse {
+            status: 200,
+            captures: vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string()),
+            ],
+            ..Default::default()
+        }));
+        let painted = draw(&mut app, ResponseSection::Body);
+        assert!(
+            painted.iter().any(|t| t.contains("(2)")),
+            "the tab should show how many there are: {painted:?}"
+        );
+    }
+
     /// A request that has never been sent has no response to describe, so the
     /// panel must say that rather than describing one. Every section had its
     /// own "nothing here" note and every one of them read as a *result*:
@@ -1056,6 +1376,7 @@ mod unsent_tests {
             ("body", ResponseSection::Body),
             ("headers", ResponseSection::Headers),
             ("asserts", ResponseSection::Asserts),
+            ("captures", ResponseSection::Captures),
         ] {
             let painted = draw(&mut app, section);
             assert!(

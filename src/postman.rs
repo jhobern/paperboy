@@ -1722,6 +1722,47 @@ fn note_losses(
         };
         push_note(out, title, owner, detail);
     }
+    // A wait is worth naming on its own: it is the one thing in these scripts
+    // that has a Hurl equivalent but no *assertion* to hang it on, so neither
+    // note above would ever mention it.
+    for e in events {
+        let script = e
+            .script
+            .exec
+            .iter()
+            .map(|l| l.trim_end_matches('\r'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let Some(ms) = script_wait_ms(&script) else {
+            continue;
+        };
+        // A poll's own wait is `retry-interval`, and the polling note below
+        // already says so. Saying `delay` as well would have the reader write
+        // both and wait twice per go.
+        if script.contains("setNextRequest") {
+            continue;
+        }
+        let owner = e.inherited.then(|| e.owner.clone());
+        let detail = if e.listen == "prerequest" {
+            format!(
+                "{} pre-request script waited {ms}ms before sending; that is `[Options] delay: \
+                 {ms}`, which is on the request already but switched off — turn it on if the \
+                 wait mattered",
+                scope(&owner)
+            )
+        } else {
+            // A test script runs *after* the response, so its wait belongs to
+            // whatever goes next — which is a different request, and possibly
+            // not even the following one. Guessing would put the delay on the
+            // wrong request, so this one is only ever said.
+            format!(
+                "{} test script waited {ms}ms after the response; that wait belongs to whatever \
+                 ran next, so put `[Options] delay: {ms}` on that request",
+                scope(&owner)
+            )
+        };
+        push_note(out, title, owner, detail);
+    }
     // Said separately, and for both script kinds, because it is not a lost
     // assertion but a lost *order*: a collection whose scripts choose what runs
     // next does not do the same thing when it is run top to bottom, and the
@@ -1751,6 +1792,80 @@ fn note_losses(
             push_note(out, title, owner.clone(), detail);
         }
     }
+}
+
+/// `setTimeout(fn, 2000)` / `sleep(2000)` -- the wait a polling script puts
+/// between its goes. The number is what `[Options] retry-interval` wants, in
+/// the same units.
+///
+/// The callback in between is skipped rather than parsed: it is arbitrary
+/// JavaScript, brackets and commas and all. The skip is greedy so that the
+/// *last* comma wins -- in `setTimeout(() => { f(1, 25) }, 2000)` the delay is
+/// the final argument, not the first number that happens to follow a comma --
+/// and bounded so a malformed script cannot drag the match across half the
+/// file.
+static WAIT_MS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)\b(?:setTimeout|sleep|wait)\s*\((?:.{0,200},)?\s*(\d{2,})\s*\)").unwrap()
+});
+
+/// The bound a polling script counts up to: `attempts < 3`, `count <= 5`,
+/// `tries > 10`. Only the number matters here.
+static ATTEMPT_BOUND_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:attempt|attempts|count|counter|tries|retry|retries|i|n)\s*[<>]=?\s*(\d+)")
+        .unwrap()
+});
+
+/// The thing a polling script waits to stop seeing: the JSON field and value in
+/// the condition that keeps it going. `Response.VerificationResult ===
+/// "ResultUnavailable"` gives `("Response.VerificationResult",
+/// "ResultUnavailable")`, which is the assert that ends the poll.
+static POLL_CONDITION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?:json\(\)|jsonData|data|body|response)\s*((?:\.[A-Za-z_][A-Za-z0-9_]*)+)\s*(===?|!==?)\s*["']([^"']+)["']"#,
+    )
+    .unwrap()
+});
+
+/// The other way a Postman script waits: spinning on the clock, because
+/// Postman's sandbox has no blocking sleep. `while (Date.now() - start < 2000)`
+/// is the same instruction as `setTimeout(…, 2000)` and deserves the same
+/// reading.
+static BUSY_WAIT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:Date\.now\(\)|new Date\(\)|getTime\(\))[^<>\n]{0,60}[<>]=?\s*(\d{2,})").unwrap()
+});
+
+/// The wait a script asks for, in milliseconds, however it spells it.
+///
+/// Deliberately only the *first* one: a script that waits twice is doing
+/// something this cannot summarise in a single `delay`, and the first number is
+/// at least the one the reader will recognise when they go looking.
+fn script_wait_ms(script: &str) -> Option<u64> {
+    WAIT_MS_RE
+        .captures(script)
+        .or_else(|| BUSY_WAIT_RE.captures(script))
+        .and_then(|c| c[1].parse::<u64>().ok())
+}
+
+/// How a polling script's own shape translates into `[Options]`, as far as it
+/// can be read off the script.
+///
+/// Best-effort by design: what comes out is the text of a *note*, so a wait or
+/// a bound the script states in a way this does not recognise costs the reader
+/// a detail, not a wrong request. The alternative -- emitting the options
+/// directly -- would be guessing with the user's requests.
+fn polling_shape(script: &str) -> (Option<u64>, Option<u64>, Option<String>) {
+    let wait = script_wait_ms(script);
+    let bound = ATTEMPT_BOUND_RE
+        .captures(script)
+        .and_then(|c| c[1].parse::<u64>().ok());
+    let assert = POLL_CONDITION_RE.captures(script).map(|c| {
+        let path = c[1].trim_start_matches('.');
+        // The script says what keeps it *going*; the assert says what has to be
+        // true to *stop*, so the comparison is turned around.
+        let op = if c[2].starts_with('!') { "==" } else { "!=" };
+        format!("jsonpath \"$.{path}\" {op} \"{}\"", &c[3])
+    });
+    (wait, bound, assert)
 }
 
 // `pm.execution.setNextRequest(` and the older `postman.setNextRequest(`.
@@ -1788,11 +1903,28 @@ fn next_request_fates(script: &str, title: &str) -> Vec<String> {
         let guarded = conditional.get(call.start).copied().unwrap_or(false)
             || !starts_statement(&code, call.start);
         match unquote(arg) {
-            Some(name) if name.trim() == own => push(format!(
-                "this request ran itself again (`setNextRequest(\"{own}\")`) — that is a polling \
-                 loop, which Hurl writes as `[Options] retry: <n>` plus the assert that has to \
-                 pass in the end, rather than as a repeated request"
-            )),
+            Some(name) if name.trim() == own => {
+                // Said as a recipe rather than as a fact about Postman: this is
+                // the one `setNextRequest` shape that has an exact Hurl
+                // equivalent, so the note is worth the trouble of naming the
+                // numbers the script was using and the assert that ends the
+                // poll. Whatever could not be read off the script is left as a
+                // placeholder the reader fills in, rather than guessed at.
+                let (wait, bound, assert) = polling_shape(script);
+                let retry = bound.map_or("<n>".to_string(), |b| b.to_string());
+                let interval = wait.map_or("<ms>".to_string(), |w| w.to_string());
+                let assert = assert.unwrap_or_else(|| {
+                    "the assert that is true once the answer is ready".to_string()
+                });
+                push(format!(
+                    "this request ran itself again (`setNextRequest(\"{own}\")`) — that is a \
+                     polling loop, and Hurl writes one as options on the request rather than as a \
+                     repeated request: `[Options]` `retry: {retry}` and `retry-interval: \
+                     {interval}`, with `{assert}` under `[Asserts]`. Hurl then re-sends this \
+                     request until that assert holds, and the whole poll counts as the one \
+                     request it is"
+                ))
+            }
             Some(name) if guarded => push(format!(
                 "a script sometimes jumped to `{name}` instead of carrying on; PaperBoy runs a \
                  collection in file order and has no way to say \"only sometimes\", so check \
@@ -2038,6 +2170,23 @@ fn map_request(
     // it was written for.
     if profile.strict_ssl == Some(false) {
         entry.options.push(KvRow::new("insecure", "true"));
+    }
+    // A pre-request script that waits is saying "hold off before sending this
+    // one", and that is exactly `[Options] delay`. It is emitted disabled: the
+    // wait is real, but it is also the one imported setting that makes a run
+    // *slower* for reasons the reader did not ask for, so it arrives written
+    // down and switched off rather than quietly costing two seconds a send.
+    if let Some(ms) = script_wait_ms(&script_text(events, "prerequest")).filter(|_| {
+        // Unless the script is a poll: then the wait is `retry-interval`, not a
+        // one-off delay, and writing both would wait twice per go.
+        !script_text(events, "prerequest").contains("setNextRequest")
+    }) {
+        entry.options.push(KvRow {
+            key: "delay".to_string(),
+            value: ms.to_string(),
+            enabled: false,
+            desc: String::new(),
+        });
     }
     // Captured variables from the request's `test` script (#24). A request that
     // gets captures serializes with a `HTTP *` line automatically; one with none
@@ -2526,7 +2675,10 @@ fn gen_expression(value: &str, uuid_aliases: &[String]) -> Option<String> {
     if let Some(text) = unquote(value) {
         // `[Gen]` has no escape syntax, so a literal carrying a quote or a
         // backslash cannot be written down as one and is left to the note.
-        return (!text.contains(['"', '\\'])).then(|| format!("\"{text}\""));
+        if text.contains(['"', '\\']) {
+            return None;
+        }
+        return literal_expression(text);
     }
     if is_hurl_number(value) {
         return Some(value.to_string());
@@ -2552,6 +2704,54 @@ fn gen_expression(value: &str, uuid_aliases: &[String]) -> Option<String> {
         | "Math.round(newDate().getTime()/1000)" => Some("timestamp".to_string()),
         "newDate().toISOString()" => Some("iso8601".to_string()),
         _ => replaced_dynamic(&c),
+    }
+}
+
+/// A string the script assigned, as a generator expression.
+///
+/// Plain text is itself, quoted. Text carrying `{{name}}` is *not*: a generator
+/// expression names variables directly, and a row that evaluated to the literal
+/// characters `{{base}}/orders` would be substituted into the request as those
+/// characters -- Hurl does not expand a value it has just substituted -- so the
+/// request would go out with the braces still in it. Joining the pieces with
+/// `concat` says what the script meant and is checked like any other row.
+///
+/// A placeholder that is not a plain variable name -- Postman's `{{$guid}}` and
+/// friends, or a name Hurl would read only part of -- is left to the conversion
+/// note instead of guessed at, for the reason every other unclaimed dynamic is:
+/// a plausible wrong value is harder to notice than a gap that is written down.
+fn literal_expression(text: &str) -> Option<String> {
+    if !text.contains("{{") {
+        return Some(format!("\"{text}\""));
+    }
+    let mut pieces: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        let close = rest.find("}}")?;
+        if close < open {
+            return None;
+        }
+        let name = rest[open + 2..close].trim();
+        if !crate::hurl::is_variable_name(name) {
+            return None;
+        }
+        if open > 0 {
+            pieces.push(format!("\"{}\"", &rest[..open]));
+        }
+        pieces.push(name.to_string());
+        rest = &rest[close + 2..];
+    }
+    // A trailing `}}` with no `{{` before it is text, not half a placeholder.
+    if rest.contains("{{") {
+        return None;
+    }
+    if !rest.is_empty() {
+        pieces.push(format!("\"{rest}\""));
+    }
+    match pieces.len() {
+        0 => None,
+        1 => Some(pieces.remove(0)),
+        _ => Some(format!("concat({})", pieces.join(", "))),
     }
 }
 
@@ -5386,6 +5586,68 @@ mod script_tests {
         );
     }
 
+    /// A script that assembles a value out of other variables is the common
+    /// shape `pm.environment.set` takes, and the braces cannot survive into the
+    /// row: a generator names variables directly, and a value substituted into
+    /// the request is not expanded again, so the braces would go out on the
+    /// wire. They become `concat` of the pieces instead.
+    #[test]
+    fn a_templated_literal_becomes_the_pieces_it_is_made_of() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"x","event":[{"listen":"prerequest","script":{"exec":[
+             "pm.environment.set('whole', '{{base}}');",
+             "pm.environment.set('tail', '{{base}}/orders');",
+             "pm.environment.set('mid', 'a{{base}}b{{leg}}c');",
+             "pm.environment.set('plain', 'nothing here');"]}}],
+           "request":{"method":"GET","url":"https://h/x"}}]}"#;
+        let c = convert_postman(json);
+        assert_eq!(
+            c.entries[0].generators,
+            vec![
+                // One placeholder and nothing else is simply the name: wrapping
+                // it in `concat` would be a toll booth.
+                ("whole".to_string(), "base".to_string()),
+                ("tail".to_string(), r#"concat(base, "/orders")"#.to_string()),
+                (
+                    "mid".to_string(),
+                    r#"concat("a", base, "b", leg, "c")"#.to_string()
+                ),
+                ("plain".to_string(), "\"nothing here\"".to_string()),
+            ]
+        );
+        // Every row it emits must be a row the generator language accepts --
+        // an importer that writes an expression the parser refuses produces a
+        // block that is one long error.
+        for (_, expr) in &c.entries[0].generators {
+            assert!(
+                crate::generators::check(&[(String::from("v"), expr.clone())]).is_empty(),
+                "{expr} is not a valid generator expression"
+            );
+        }
+    }
+
+    /// A placeholder PaperBoy cannot name -- Postman's own dynamics, or a name
+    /// Hurl would read only part of -- is left to the conversion note rather
+    /// than guessed at.
+    #[test]
+    fn a_placeholder_that_is_not_a_plain_name_is_left_to_the_note() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"x","event":[{"listen":"prerequest","script":{"exec":[
+             "pm.environment.set('a', '{{$randomFirstName}}');",
+             "pm.environment.set('b', '{{not a name}}');"]}}],
+           "request":{"method":"GET","url":"https://h/x"}}]}"#;
+        let c = convert_postman(json);
+        assert!(
+            c.entries[0].generators.is_empty(),
+            "{:?}",
+            c.entries[0].generators
+        );
+        assert!(
+            !c.notes.is_empty(),
+            "the script was dropped without saying so"
+        );
+    }
+
     /// A test script's status check is the one assertion nearly every Postman
     /// collection has, and Hurl states it on the request line.
     #[test]
@@ -5490,6 +5752,54 @@ mod script_tests {
                 .any(|d| d.contains("polling loop") && d.contains("retry")),
             "{notes:?}"
         );
+    }
+
+    /// The numbers a polling script counts with are the numbers `[Options]`
+    /// wants, so the note quotes them rather than making the reader read the
+    /// script a second time to find them.
+    #[test]
+    fn a_polling_loop_note_carries_the_numbers_the_script_was_using() {
+        let notes = next_request_notes(
+            "get_result",
+            r#"
+            const jsonData = pm.response.json();
+            let attempts = pm.environment.get("attempts") || 0;
+            if (jsonData.Response.VerificationResult === "ResultUnavailable" && attempts < 3) {
+                pm.environment.set("attempts", attempts + 1);
+                setTimeout(function () {}, 2000);
+                pm.execution.setNextRequest("get_result");
+            }
+            "#,
+        );
+        let note = notes
+            .iter()
+            .find(|d| d.contains("polling loop"))
+            .unwrap_or_else(|| panic!("{notes:?}"));
+        assert!(note.contains("retry: 3"), "{note}");
+        assert!(note.contains("retry-interval: 2000"), "{note}");
+        // The script says what keeps it going; the assert says what stops it.
+        assert!(
+            note.contains(r#"jsonpath "$.Response.VerificationResult" != "ResultUnavailable""#),
+            "{note}"
+        );
+    }
+
+    /// A script can say its wait, its bound or its condition in a shape this
+    /// does not read. That costs the reader a number, not a wrong request — so
+    /// the note still says what to write, with a blank where the number goes.
+    #[test]
+    fn a_polling_loop_note_leaves_a_blank_for_what_it_could_not_read() {
+        let notes = next_request_notes(
+            "get_result",
+            "if (!done) { pm.execution.setNextRequest('get_result'); }",
+        );
+        let note = notes
+            .iter()
+            .find(|d| d.contains("polling loop"))
+            .unwrap_or_else(|| panic!("{notes:?}"));
+        assert!(note.contains("retry: <n>"), "{note}");
+        assert!(note.contains("retry-interval: <ms>"), "{note}");
+        assert!(note.contains("the assert that is true once"), "{note}");
     }
 
     /// An unconditional jump *is* an order, and an order is the one thing here
@@ -5807,6 +6117,109 @@ mod defect_regressions {
               {{"name":"{title}","event":[{}],"request":{{"method":"GET","url":"{url}"}}}}]}}"#,
             ev.join(",")
         ))
+    }
+
+    /// A pre-request wait is the one script instruction with an exact Hurl
+    /// equivalent that no assertion carries, so it is converted rather than
+    /// merely mourned — off by default, since an imported collection that
+    /// silently runs slower is its own kind of surprise.
+    #[test]
+    fn a_pre_request_wait_becomes_a_delay_option_that_is_written_but_not_on() {
+        let c = conv(
+            "const sleep = ms => new Promise(r => setTimeout(r, 1500));\nawait sleep(1500);",
+            "",
+            "https://h/x",
+            "x",
+        );
+        let delay = c.entries[0]
+            .options
+            .iter()
+            .find(|o| o.key == "delay")
+            .unwrap_or_else(|| panic!("{:?}", c.entries[0].options));
+        assert_eq!(delay.value, "1500");
+        assert!(
+            !delay.enabled,
+            "an imported wait should arrive switched off"
+        );
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.detail.contains("waited 1500ms") && n.detail.contains("switched off")),
+            "{:?}",
+            c.notes
+        );
+    }
+
+    /// Postman's sandbox has no blocking sleep, so half of these waits are
+    /// written as a spin on the clock. It is the same instruction.
+    #[test]
+    fn a_busy_wait_on_the_clock_is_read_as_the_wait_it_is() {
+        let c = conv(
+            "const start = Date.now();\nwhile (Date.now() - start < 3000) { }",
+            "",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            c.entries[0]
+                .options
+                .iter()
+                .find(|o| o.key == "delay")
+                .map(|o| o.value.as_str()),
+            Some("3000"),
+            "{:?}",
+            c.entries[0].options
+        );
+    }
+
+    /// A test script runs after the response, so its wait belongs to whichever
+    /// request goes next. Putting it on *this* request would delay the wrong
+    /// send, so this one is said and not done.
+    #[test]
+    fn a_wait_in_a_test_script_is_named_rather_than_put_on_this_request() {
+        let c = conv("", "setTimeout(() => {}, 2000);", "https://h/x", "x");
+        assert!(
+            c.entries[0].options.iter().all(|o| o.key != "delay"),
+            "{:?}",
+            c.entries[0].options
+        );
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.detail.contains("belongs to whatever ran next")),
+            "{:?}",
+            c.notes
+        );
+    }
+
+    /// A poll's wait is `retry-interval`, which the polling note already
+    /// spells out. Saying `delay` as well would have the reader wait twice on
+    /// every go round.
+    #[test]
+    fn a_polls_wait_is_not_also_reported_as_a_delay() {
+        let c = conv(
+            "",
+            "if (!done) {\n  setTimeout(() => {}, 2000);\n  postman.setNextRequest('x');\n}",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].options.iter().all(|o| o.key != "delay"),
+            "{:?}",
+            c.entries[0].options
+        );
+        assert!(
+            c.notes.iter().all(|n| !n.detail.contains("belongs to")),
+            "{:?}",
+            c.notes
+        );
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.detail.contains("retry-interval: 2000")),
+            "{:?}",
+            c.notes
+        );
     }
 
     // P1 — an `if` inside a `function () {}` test callback is conditional.

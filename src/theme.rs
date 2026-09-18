@@ -1,8 +1,15 @@
+// `ThemeSpec` below is plain RGB + serde and is what `persistence.rs` stores,
+// so it must exist in every configuration — including a headless build that has
+// no ratatui at all. Only the *runtime* half of this module (`Theme`, which is
+// ratatui-typed, and the two helpers that produce ratatui colours) is drawing
+// code, so only that half is gated on a front-end being present.
+#[cfg(any(feature = "tui", feature = "gui"))]
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::Language;
 
+#[cfg(any(feature = "tui", feature = "gui"))]
 pub(crate) struct Theme {
     pub(crate) bg: Color,
     pub(crate) panel: Color,
@@ -154,6 +161,7 @@ impl<'de> Deserialize<'de> for ThemeSpec {
 }
 
 impl ThemeSpec {
+    #[cfg(any(feature = "tui", feature = "gui"))]
     pub(crate) fn to_theme(&self) -> Theme {
         let c = |[r, g, b]: [u8; 3]| Color::Rgb(r, g, b);
         Theme {
@@ -503,11 +511,12 @@ pub(crate) fn is_builtin(name: &str) -> bool {
 /// The runtime theme for a language's preset. Retained for callers/tests that
 /// want a language preset directly; the live app resolves through
 /// [`crate::tui::app::TuiApp::theme`] to honour custom themes.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "tui", feature = "gui")))]
 pub(crate) fn theme(lang: &Language) -> Theme {
     preset_for_language(lang).to_theme()
 }
 
+#[cfg(any(feature = "tui", feature = "gui"))]
 pub(crate) fn method_color(method: &str) -> Color {
     match crate::hurl::method_rgb(method) {
         Some((r, g, b)) => Color::Rgb(r, g, b),

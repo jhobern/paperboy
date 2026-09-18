@@ -909,6 +909,7 @@ mod tests {
 
     fn row(cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {
+            role: crate::report::model::RowRole::default(),
             cells: cells
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -916,6 +917,7 @@ mod tests {
             vars: HashMap::new(),
             key: vec![],
             path: Vec::new(),
+            comparison: None,
             target: None,
         }
     }

@@ -216,9 +216,9 @@ pub(crate) struct SaveFlow {
 impl SaveFlow {
     /// Build a flow for pushing collection `ci` back to where it came from.
     ///
-    /// `env` is the collection's effective (linked, or active-global)
-    /// environment, if it has one; when it does, the wizard offers to write it
-    /// alongside. Requires `col.git_origin` — callers gate "Save to Git" on it.
+    /// `env` is the collection's effective (its tab's) environment, if it has
+    /// one; when it does, the wizard offers to write it alongside. Requires
+    /// `col.git_origin` — callers gate "Save to Git" on it.
     pub(crate) fn for_collection(ci: usize, col: &Collection, env: Option<&Environment>) -> Self {
         let origin = col.git_origin.clone();
         let env_path = env

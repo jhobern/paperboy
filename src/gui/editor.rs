@@ -7,21 +7,17 @@ use std::collections::{HashMap, HashSet};
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{self, Color32, FontId, RichText, TextFormat};
 
+use crate::hurl::json_format::Prettified;
 use crate::hurl::{FormField, FormFieldKind, HurlEntry, KvRow};
-use crate::i18n::Strings;
+use crate::i18n::{Status, Strings};
 use crate::request::{SubstInfo, SubstKind, apply_request_json, build_request_json};
 
 use super::app::{EditorSection, GuiApp};
 use super::theme::GuiTheme;
 use super::widgets;
 
-/// Inline warning marker shown immediately before a substituted value whose
-/// Global Environment source is shadowed by the collection's linked
-/// Environment — matches the terminal UI's `SHADOW_ICON`.
-const SHADOW_ICON: &str = "!";
-
-/// Which substitution [`SubstKind`]s (and whether any shadowing) were actually
-/// rendered in the Code preview, so the legend shows only the relevant dots.
+/// Which substitution [`SubstKind`]s were actually rendered in the Code
+/// preview, so the legend shows only the relevant dots.
 #[derive(Default)]
 struct SubstSeen {
     loaded: bool,
@@ -31,7 +27,6 @@ struct SubstSeen {
     undefined: bool,
     /// At least one `{{ VAR }}` is computed by the request's `# [Gen]` block.
     computed: bool,
-    shadowed: bool,
 }
 
 impl SubstSeen {
@@ -69,8 +64,8 @@ fn subst_color(kind: SubstKind, th: &GuiTheme) -> Color32 {
     }
 }
 
-/// Render the substitution legend (coloured dots for each status present, plus
-/// the shadowed hint) beneath the Code preview, matching the terminal UI.
+/// Render the substitution legend (a coloured dot for each status present)
+/// beneath the Code preview, matching the terminal UI.
 fn subst_legend(ui: &mut egui::Ui, seen: &SubstSeen, th: &GuiTheme, s: &Strings) {
     if !seen.any() {
         return;
@@ -85,14 +80,13 @@ fn subst_legend(ui: &mut egui::Ui, seen: &SubstSeen, th: &GuiTheme, s: &Strings)
             (seen.computed, s.subst_hint_generated, th.computed),
         ] {
             if present {
-                ui.colored_label(color, format!("\u{25cf} {word}"));
+                // Dot and word are one item, so a wrap can't strand a bare
+                // dot at the end of a line.
+                ui.horizontal(|ui| {
+                    super::widgets::status_dot(ui, color);
+                    ui.colored_label(color, word);
+                });
             }
-        }
-        if seen.shadowed {
-            ui.colored_label(
-                th.pending,
-                format!("{SHADOW_ICON} {}", s.subst_hint_shadowed),
-            );
         }
     });
 }
@@ -107,7 +101,6 @@ fn subst_legend(ui: &mut egui::Ui, seen: &SubstSeen, th: &GuiTheme, s: &Strings)
 fn highlight_code_editable(
     text: &str,
     vars: &HashMap<String, SubstInfo>,
-    shadowed: &HashSet<String>,
     th: &GuiTheme,
     font: FontId,
     seen: &mut SubstSeen,
@@ -129,9 +122,6 @@ fn highlight_code_editable(
         match vars.get(inner) {
             Some(info) => {
                 seen.mark(info.kind);
-                if shadowed.contains(inner) {
-                    seen.shadowed = true;
-                }
                 job.append(token, 0.0, fmt(subst_color(info.kind, th)));
             }
             // Nothing defines this one. It used to fall through as ordinary
@@ -157,11 +147,7 @@ fn highlight_code_editable(
 /// second full colouring pass to learn four booleans. This walks the same
 /// placeholders without building anything, and stops as soon as it has seen
 /// everything there is to see.
-fn substitution_statuses(
-    text: &str,
-    vars: &HashMap<String, SubstInfo>,
-    shadowed: &HashSet<String>,
-) -> SubstSeen {
+fn substitution_statuses(text: &str, vars: &HashMap<String, SubstInfo>) -> SubstSeen {
     let mut seen = SubstSeen::default();
     let mut rest = text;
     while let Some(open) = rest.find("{{") {
@@ -171,12 +157,7 @@ fn substitution_statuses(
         let close = open + 2 + close_rel;
         let inner = rest[open + 2..close].trim();
         match vars.get(inner) {
-            Some(info) => {
-                seen.mark(info.kind);
-                if shadowed.contains(inner) {
-                    seen.shadowed = true;
-                }
-            }
+            Some(info) => seen.mark(info.kind),
             None => seen.mark(SubstKind::Undefined),
         }
         rest = &rest[close + 2..];
@@ -192,7 +173,6 @@ fn cached_code_job(
     ui: &egui::Ui,
     text: &str,
     vars: &HashMap<String, SubstInfo>,
-    shadowed: &HashSet<String>,
     th: &GuiTheme,
     font: FontId,
 ) -> LayoutJob {
@@ -202,7 +182,7 @@ fn cached_code_job(
     crate::gui::report_editor::fnv1a(text.as_bytes(), crate::gui::report_editor::FNV_OFFSET)
         .hash(&mut h);
     font.size.to_bits().hash(&mut h);
-    // Both are hash maps/sets, so combine each entry order-independently.
+    // A hash map, so combine each entry order-independently.
     let mut refs = 0u64;
     for (k, info) in vars {
         // Only the name and the kind, deliberately: the *editable* highlighter
@@ -213,9 +193,6 @@ fn cached_code_job(
             k.as_bytes(),
             crate::gui::report_editor::FNV_OFFSET ^ info.kind as u64,
         );
-    }
-    for k in shadowed {
-        refs ^= crate::gui::report_editor::fnv1a(k.as_bytes(), 0x9e37_79b9_7f4a_7c15);
     }
     refs.hash(&mut h);
     // The colours themselves come from the theme.
@@ -228,7 +205,7 @@ fn cached_code_job(
         return job;
     }
     let mut ignored = SubstSeen::default();
-    let job = highlight_code_editable(text, vars, shadowed, th, font, &mut ignored);
+    let job = highlight_code_editable(text, vars, th, font, &mut ignored);
     ui.data_mut(|d| d.insert_temp(id, (key, job.clone())));
     job
 }
@@ -306,7 +283,6 @@ fn draw_code_section(
     sel: usize,
     code_show_hurl: &mut bool,
     subst_vars: &HashMap<String, SubstInfo>,
-    shadowed: &HashSet<String>,
 ) -> bool {
     let mut changed = false;
 
@@ -343,7 +319,7 @@ fn draw_code_section(
     }
 
     // Legend: which substitution statuses appear in the current buffer.
-    let seen = substitution_statuses(&app.code_edit.buf, subst_vars, shadowed);
+    let seen = substitution_statuses(&app.code_edit.buf, subst_vars);
 
     // A fixed-height editor that fills the panel (not shrink-wrapped to its
     // text), leaving room below for the legend and any parse error.
@@ -358,11 +334,10 @@ fn draw_code_section(
     let rows = (editor_h / row_h).floor().max(6.0) as usize;
 
     let subst_vars_l = subst_vars;
-    let shadowed_l = shadowed;
     let theme_l = theme;
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
         let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let mut job = cached_code_job(ui, buf.as_str(), subst_vars_l, shadowed_l, theme_l, font);
+        let mut job = cached_code_job(ui, buf.as_str(), subst_vars_l, theme_l, font);
         job.wrap.max_width = wrap;
         ui.fonts_mut(|f| f.layout_job(job))
     };
@@ -641,7 +616,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     ui.separator();
 
     // Substitution preview data for the Code view: how each `{{ VAR }}` should
-    // be shown/coloured, and which keys the linked env shadows. Computed here
+    // be shown/coloured. Computed here
     // (before the entry is mutably borrowed by the section closure) and only
     // when the Code tab is active, since it borrows the whole collection.
     //
@@ -676,14 +651,11 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     } else {
         Vec::new()
     };
-    let (subst_vars, shadowed) = if section == EditorSection::Code {
+    let subst_vars = if section == EditorSection::Code {
         let env = app.session.effective_env(ci);
-        (
-            crate::request::subst_map(&app.session.collections[ci], env.as_ref()),
-            app.session.shadowed_env_keys(ci),
-        )
+        crate::request::subst_map(&app.session.collections[ci], env.as_ref())
     } else {
-        (HashMap::new(), HashSet::new())
+        HashMap::new()
     };
 
     // ── Section body ──────────────────────────────────────────────────────
@@ -697,16 +669,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         // The Code editor needs mutable access to both `app.code_edit` and the
         // collection (to apply reparsed text), so it can't run inside the
         // closure below that borrows the selected entry.
-        if draw_code_section(
-            app,
-            ui,
-            &theme,
-            ci,
-            sel,
-            &mut code_show_hurl,
-            &subst_vars,
-            &shadowed,
-        ) {
+        if draw_code_section(app, ui, &theme, ci, sel, &mut code_show_hurl, &subst_vars) {
             changed = true;
         }
     } else {
@@ -715,6 +678,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         // Which Form/Multipart file value asked for a picker this frame, if
         // any. Collected below, once the body has released the collection.
         let mut browse: Option<usize> = None;
+        // What a Format click came to, reported below for the same reason.
+        let mut prettify: Option<Status> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -755,6 +720,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                                 &gen_vars,
                                 &mut browse,
                                 &mut extract,
+                                &mut prettify,
                             ) {
                                 changed = true;
                             }
@@ -770,12 +736,16 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                             &gen_vars,
                             &mut browse,
                             &mut extract,
+                            &mut prettify,
                         ) {
                             changed = true;
                         }
                     }
                 }
             });
+        if let Some(outcome) = prettify {
+            app.session.status = Some(outcome);
+        }
         if let Some(field) = browse {
             let seed = app.session.collections[ci].entries[sel]
                 .form_fields
@@ -1058,6 +1028,9 @@ fn draw_section(
     // Where a right-click "Extract to parameter…" lands, to be confirmed in a
     // dialog once the borrow of `entry` has ended.
     extract: &mut Option<PendingExtract>,
+    // What to say about a Format click, reported once the borrow of `entry`
+    // has ended for the same reason.
+    prettify: &mut Option<Status>,
 ) -> bool {
     let mut changed = false;
     let ex_label = st.gui_extract_parameter;
@@ -1143,6 +1116,28 @@ fn draw_section(
                 }
                 if super::widgets::selectable(ui, form_mode, st.gui_body_mode_form).clicked() {
                     form_mode = true;
+                }
+                // Raw mode only: a form has no text to lay out. Offered
+                // whatever the body holds rather than appearing and
+                // disappearing as it is typed — pressing it and being told
+                // "only a JSON body can be formatted" teaches the rule, a
+                // button that flickers teaches nothing.
+                if !form_mode
+                    && ui
+                        .button(st.gui_prettify_body)
+                        .on_hover_text(st.gui_prettify_body_tooltip)
+                        .clicked()
+                {
+                    let src = entry.body_src.clone().unwrap_or_default();
+                    *prettify = Some(match crate::hurl::json_format::prettify_json(&src) {
+                        Prettified::Changed(text) => {
+                            entry.body_src = Some(text);
+                            changed = true;
+                            Status::BodyPrettified
+                        }
+                        Prettified::Unchanged => Status::BodyAlreadyTidy,
+                        Prettified::NotJson => Status::BodyNotJson,
+                    });
                 }
             });
             ui.data_mut(|d| d.insert_temp(id, form_mode));
@@ -1681,11 +1676,151 @@ mod tests {
                     &[],
                     &mut browse,
                     &mut None,
+                    &mut None,
                 );
             });
             out = painted(&full.shapes);
         }
         out
+    }
+
+    /// The centre of the first painted text that matches `needle`, which is
+    /// where a click on it has to land.
+    fn text_center(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {
+        fn walk(s: &egui::epaint::Shape, needle: &str, out: &mut Option<egui::Pos2>) {
+            match s {
+                egui::epaint::Shape::Text(t) if out.is_none() => {
+                    if t.galley.text() == needle {
+                        *out = Some(t.visual_bounding_rect().center());
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, needle, out)),
+                _ => {}
+            }
+        }
+        let mut out = None;
+        for c in shapes {
+            walk(&c.shape, needle, &mut out);
+        }
+        out
+    }
+
+    /// Drive the Body section and click the thing whose painted text is
+    /// `needle`, returning what the click reported.
+    fn click_in_body_section(entry: &mut HurlEntry, needle: &str) -> Option<Status> {
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let st = Strings::for_language(&Language::English);
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+        let mut browse = None;
+        let mut outcome = None;
+        let mut at: Option<egui::Pos2> = None;
+        // Three passes: size the fields, find the button, then click it.
+        for pass in 0..3 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            input.time = Some(pass as f64 * 0.05);
+            if pass == 2 {
+                let pos = at.expect("the button was painted");
+                input.events = vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ];
+            }
+            let full = ctx.run_ui(input, |ui| {
+                draw_section(
+                    EditorSection::Body,
+                    ui,
+                    &th,
+                    &st,
+                    entry,
+                    &[],
+                    &mut browse,
+                    &mut None,
+                    &mut outcome,
+                );
+            });
+            if pass == 1 {
+                at = text_center(&full.shapes, needle);
+            }
+        }
+        outcome
+    }
+
+    /// The GUI's half of prettify. The button is the whole gesture there, so it
+    /// has to be reachable by a real click, not merely wired up in principle.
+    #[test]
+    fn the_format_button_lays_the_body_out_and_says_so() {
+        let st = Strings::for_language(&Language::English);
+        let mut entry = HurlEntry {
+            body_src: Some(r#"{"a":1,"b":[2]}"#.into()),
+            ..Default::default()
+        };
+        let said = click_in_body_section(&mut entry, st.gui_prettify_body);
+        assert!(matches!(said, Some(Status::BodyPrettified)), "{said:?}");
+        assert_eq!(
+            entry.body_src.as_deref(),
+            Some("{\n  \"a\": 1,\n  \"b\": [\n    2\n  ]\n}")
+        );
+
+        // A second click changes nothing, and says so rather than going quiet.
+        let said = click_in_body_section(&mut entry, st.gui_prettify_body);
+        assert!(matches!(said, Some(Status::BodyAlreadyTidy)), "{said:?}");
+    }
+
+    /// A GraphQL body is the case that must not be touched: its `//` is data.
+    #[test]
+    fn the_format_button_refuses_a_body_that_is_not_json() {
+        let st = Strings::for_language(&Language::English);
+        let src = "query { user // not a comment\n}";
+        let mut entry = HurlEntry {
+            body_src: Some(src.into()),
+            ..Default::default()
+        };
+        let said = click_in_body_section(&mut entry, st.gui_prettify_body);
+        assert!(matches!(said, Some(Status::BodyNotJson)), "{said:?}");
+        assert_eq!(
+            entry.body_src.as_deref(),
+            Some(src),
+            "the body must come back untouched"
+        );
+    }
+
+    /// The form editor has no text to lay out, so the button has no business
+    /// being there — and a request that posts a form opens on that editor.
+    #[test]
+    fn the_format_button_is_absent_in_form_mode() {
+        let st = Strings::for_language(&Language::English);
+        let mut entry = HurlEntry {
+            form_fields: vec![crate::hurl::FormField {
+                key: "grant_type".into(),
+                value: "client_credentials".into(),
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = draw_body_section(&mut entry);
+        assert!(
+            !out.iter().any(|t| t == st.gui_prettify_body),
+            "painted: {out:?}"
+        );
     }
 
     /// A raw body and form fields are mutually exclusive on the wire, so the
@@ -1757,7 +1892,6 @@ mod tests {
     fn editable_highlighter_preserves_the_buffer_text_verbatim() {
         let th = GuiTheme::from_spec(&Session::default().active_theme_spec());
         let vars = HashMap::new();
-        let shadowed = HashSet::new();
         let mut seen = SubstSeen::default();
         for text in [
             "GET https://x/{{ host }}/api\nAuthorization: {{ token }}",
@@ -1765,14 +1899,7 @@ mod tests {
             "trailing {{ unclosed",
             "{{a}}{{b}} back to back",
         ] {
-            let job = highlight_code_editable(
-                text,
-                &vars,
-                &shadowed,
-                &th,
-                FontId::monospace(12.0),
-                &mut seen,
-            );
+            let job = highlight_code_editable(text, &vars, &th, FontId::monospace(12.0), &mut seen);
             assert_eq!(job.text, text, "layouter must not alter the buffer text");
         }
     }
@@ -1958,7 +2085,6 @@ mod highlight_cache_tests {
     #[test]
     fn the_legend_scan_agrees_with_the_highlighter_it_replaced() {
         let vars = vars();
-        let shadowed: HashSet<String> = ["SECRET".to_string()].into_iter().collect();
         for text in [
             "",
             "GET {{ BASE }}/a",
@@ -1970,26 +2096,23 @@ mod highlight_cache_tests {
             let _ = highlight_code_editable(
                 text,
                 &vars,
-                &shadowed,
                 &GuiTheme::from_spec(&crate::theme::default_preset()),
                 FontId::monospace(12.0),
                 &mut from_highlighter,
             );
-            let scanned = substitution_statuses(text, &vars, &shadowed);
+            let scanned = substitution_statuses(text, &vars);
             assert_eq!(
                 (
                     scanned.loaded,
                     scanned.literal,
                     scanned.pending,
                     scanned.failed,
-                    scanned.shadowed
                 ),
                 (
                     from_highlighter.loaded,
                     from_highlighter.literal,
                     from_highlighter.pending,
                     from_highlighter.failed,
-                    from_highlighter.shadowed
                 ),
                 "disagreed on {text:?}"
             );
@@ -2005,7 +2128,6 @@ mod highlight_cache_tests {
         let th = GuiTheme::from_spec(&crate::theme::default_preset());
         let ctx = egui::Context::default();
         let font = FontId::monospace(12.0);
-        let shadowed = HashSet::new();
         let text = "GET {{ BASE }}/a";
 
         let render = |shown: &str| {
@@ -2021,7 +2143,7 @@ mod highlight_cache_tests {
             let mut out = String::new();
             for _ in 0..2 {
                 let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-                    out = cached_code_job(ui, text, &vars, &shadowed, &th, font.clone()).text;
+                    out = cached_code_job(ui, text, &vars, &th, font.clone()).text;
                 });
             }
             out
@@ -2040,7 +2162,6 @@ mod highlight_cache_tests {
     #[test]
     fn the_cached_job_matches_a_freshly_built_one_and_follows_an_edit() {
         let vars = vars();
-        let shadowed = HashSet::new();
         let th = GuiTheme::from_spec(&crate::theme::default_preset());
         let ctx = egui::Context::default();
         let font = FontId::monospace(12.0);
@@ -2050,7 +2171,7 @@ mod highlight_cache_tests {
             // Twice, so the second pass is the one served from the cache.
             for _ in 0..2 {
                 let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-                    let job = cached_code_job(ui, text, &vars, &shadowed, &th, font.clone());
+                    let job = cached_code_job(ui, text, &vars, &th, font.clone());
                     got = job
                         .sections
                         .iter()
@@ -2063,7 +2184,7 @@ mod highlight_cache_tests {
 
         let fresh = |text: &str| {
             let mut ignored = SubstSeen::default();
-            highlight_code_editable(text, &vars, &shadowed, &th, font.clone(), &mut ignored)
+            highlight_code_editable(text, &vars, &th, font.clone(), &mut ignored)
                 .sections
                 .iter()
                 .map(|s| (s.byte_range.clone(), s.format.color))
@@ -3192,12 +3313,17 @@ mod computed_suggestion_tests {
     /// around this", whether or not the function *has* to be given an
     /// argument. `timestamp([offset_seconds])` used to throw the word away
     /// because its argument is optional.
+    ///
+    /// Typed rather than picked out of the browse list by position: the list
+    /// is in alphabetical order, so "the row that happens to be first" is not
+    /// the function this test is about.
     #[test]
     fn a_function_with_an_optional_argument_still_wraps_what_is_there() {
         let mut app = app_with_row("id", "uuid");
         let mut h = Harness::new();
         h.click_text(&mut app, "uuid");
         h.frame(&mut app, key(egui::Key::Home), 0.05);
+        h.frame(&mut app, vec![egui::Event::Text("timestamp".into())], 0.05);
         h.frame(&mut app, vec![], 0.05);
         h.frame(&mut app, key(egui::Key::Enter), 0.05);
         h.frame(&mut app, vec![], 0.05);
@@ -3216,6 +3342,8 @@ mod computed_suggestion_tests {
         let mut h = Harness::new();
         h.click_text(&mut app, "uuid");
         h.frame(&mut app, key(egui::Key::Home), 0.05);
+        h.frame(&mut app, vec![egui::Event::Text("timestamp".into())], 0.05);
+        h.frame(&mut app, vec![], 0.05);
         // `timestamp_ms()` is the row under `timestamp([offset_seconds])`.
         h.frame(&mut app, key(egui::Key::ArrowDown), 0.05);
         h.frame(&mut app, key(egui::Key::Enter), 0.05);
@@ -3258,6 +3386,7 @@ mod computed_suggestion_tests {
         let mut h = Harness::new();
         h.click_text(&mut app, "uuid");
         h.frame(&mut app, key(egui::Key::Home), 0.05);
+        h.frame(&mut app, vec![egui::Event::Text("timestamp".into())], 0.05);
         h.frame(&mut app, vec![], 0.05);
         let painted = h.frame(&mut app, vec![], 0.05);
         let texts: Vec<&String> = painted.iter().map(|(t, _)| t).collect();

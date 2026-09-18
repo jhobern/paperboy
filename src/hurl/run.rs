@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use hurl::runner::{
-    self, AssertResult, EntryResult, RunnerError, RunnerOptionsBuilder, Value, VariableSet,
+    self, AssertResult, EntryResult, EventListener, RunnerError, RunnerOptionsBuilder, Value,
+    VariableSet,
 };
 use hurl::util::logger::{Logger, LoggerOptionsBuilder};
 use hurl::util::path::ContextDir;
@@ -49,6 +50,20 @@ pub struct EntryOutcome {
     /// result up by one and show a response against the wrong request, which
     /// in an API client is the worst kind of wrong.
     pub entry_index: usize,
+    /// A retry attempt that a later attempt of the same request replaced.
+    ///
+    /// `[Options] retry` means "keep asking until it holds", so a poll that
+    /// answered `ResultUnavailable` twice and then succeeded is one request
+    /// that passed -- not two failures and a pass. Hurl returns every attempt
+    /// and settles the question with the last one for a given entry (its own
+    /// `is_success` does exactly this), so PaperBoy marks the superseded ones
+    /// here rather than leaving each reader of the result list to rediscover
+    /// the rule and disagree about it.
+    ///
+    /// Only ever set for a request that asks to be retried. `[Options] repeat`
+    /// also produces several outcomes per request, but those are N real runs
+    /// the user asked for, and every one of them counts.
+    pub superseded: bool,
     /// The method/URL actually sent (fully substituted, incl. chained captures).
     pub method: String,
     pub url: String,
@@ -118,6 +133,16 @@ pub struct RunOutput {
     /// A concise message for the status bar: a parse error, transport failure,
     /// or the first failed assertion. `None` when everything succeeded.
     pub error: Option<String>,
+    /// What the request's `# [Gen]` block computed for *this* send.
+    ///
+    /// A generated value is an output of the send just as a capture is — the
+    /// difference is only that it was computed before the request left rather
+    /// than read out of the response. It has to travel with the result for the
+    /// same reason a capture does: something downstream may name it, and the
+    /// alternative is that `{{step.sid}}` resolves to whatever older value of
+    /// that name happens to be lying around. Empty for every runner that does
+    /// not evaluate a `[Gen]` block, which is all of them but the live one.
+    pub generated: std::collections::HashMap<String, String>,
 }
 
 /// Builds the [`ContextDir`] that gates local file access for `[Form]`/
@@ -145,12 +170,29 @@ pub fn run_hurl(
     vars: &HashMap<String, String>,
     file_root: Option<&Path>,
 ) -> RunOutput {
+    run_hurl_watching(content, vars, file_root, |_, _, _| {})
+}
+
+/// [`run_hurl`], plus a hook called as each attempt at an entry starts.
+///
+/// `on_attempt` receives `(entry index, attempt number counting from 0, the
+/// request's [`RetryLimit`])`. Everything a retry does happens
+/// inside the single `run_entries` call below, so this is the only way for a
+/// caller to say anything at all while a poll is in progress — see
+/// [`AttemptReporter`].
+pub fn run_hurl_watching(
+    content: &str,
+    vars: &HashMap<String, String>,
+    file_root: Option<&Path>,
+    mut on_attempt: impl FnMut(usize, usize, RetryLimit),
+) -> RunOutput {
     let hurl_file = match parse_hurl_file(content) {
         Ok(h) => h,
         Err(e) => {
             return RunOutput {
                 entries: vec![],
                 error: Some(format!("Parse error (line {}): {:?}", e.pos.line, e.kind)),
+                generated: Default::default(),
             };
         }
     };
@@ -170,6 +212,17 @@ pub fn run_hurl(
     let mut stdout = Stdout::new(WriteMode::Buffered);
     let mut logger = Logger::new(&logger_opts, Stderr::new(WriteMode::Buffered), &secrets);
 
+    // One limit for the whole file: a `run_hurl` call is a single request in
+    // every front-end that reports attempts, so there is no per-entry ambiguity
+    // worth carrying here.
+    let reporter = AttemptReporter {
+        on_attempt: std::cell::RefCell::new(&mut on_attempt),
+        limit: hurl_file
+            .entries
+            .first()
+            .map(|e| entry_retry_limit(e, &variables))
+            .unwrap_or_default(),
+    };
     let result = runner::run_entries(
         &hurl_file.entries,
         content,
@@ -177,23 +230,174 @@ pub fn run_hurl(
         &runner_opts,
         &variables,
         &mut stdout,
-        None,
+        Some(&reporter),
         &mut logger,
     );
 
     let lines: Vec<&str> = content.lines().collect();
-    let mut error: Option<String> = None;
     let mut entries = Vec::new();
+    let mut errors: Vec<Option<String>> = Vec::new();
 
     for e in &result.entries {
         let (outcome, entry_error) = map_entry_result(e, &lines);
-        if error.is_none() {
-            error = entry_error;
-        }
         entries.push(outcome);
+        errors.push(entry_error);
     }
+    mark_superseded(&mut entries, |i| {
+        hurl_file.entries.get(i).is_some_and(entry_retries)
+    });
+    // The run's error is the first *surviving* failure. Taking the first of any
+    // kind would report a poll that eventually succeeded as a failed run, on
+    // the strength of the attempt that was supposed to be thrown away.
+    let error = entries
+        .iter()
+        .zip(&errors)
+        .find_map(|(e, err)| (!e.superseded).then_some(err.clone()).flatten());
 
-    RunOutput { entries, error }
+    RunOutput {
+        entries,
+        error,
+        generated: Default::default(),
+    }
+}
+
+/// How many attempts a request allows -- the denominator in "retry 2 of 5",
+/// when there is one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RetryLimit {
+    /// Nothing honest to count towards: no `retry:` row at all, or one written
+    /// `{{name}}` against a name nothing binds (a run Hurl is about to stop
+    /// anyway) or holding something that is not a number. A hint says which
+    /// attempt is running and stops there rather than inventing a total.
+    #[default]
+    Unknown,
+    /// `retry: -1` -- keep asking until it holds.
+    Forever,
+    /// `retry: N`.
+    Times(usize),
+}
+
+impl RetryLimit {
+    /// The total to put after "retry 2 of", when there is one worth putting
+    /// there. `∞` rather than nothing for a forever-poll: it keeps the shape of
+    /// the sentence and says the useful thing, which is that this request will
+    /// go on asking. It is spelled the same in every language PaperBoy speaks,
+    /// which is why it is here and not in the string table.
+    pub fn total(self) -> Option<String> {
+        match self {
+            RetryLimit::Times(n) => Some(n.to_string()),
+            RetryLimit::Forever => Some("∞".to_string()),
+            RetryLimit::Unknown => None,
+        }
+    }
+}
+
+impl From<i64> for RetryLimit {
+    /// Hurl's own reading of the number: negative is "forever" (it is written
+    /// `-1`), anything else is a count.
+    fn from(n: i64) -> Self {
+        usize::try_from(n).map_or(RetryLimit::Forever, RetryLimit::Times)
+    }
+}
+
+/// Read the retry limit off a request, resolving a `{{placeholder}}` against
+/// the variables the request is about to run with.
+///
+/// Matched on the AST rather than on the option's printed form, because `Count`
+/// prints "forever" as `-1`: reading the text would quietly turn the one case
+/// worth naming into "no limit stated".
+///
+/// A placeholder is looked *up* rather than given up on -- `retry:
+/// {{max_attempts}}` is an ordinary way to write a poll, and the value is right
+/// here in the same variable set Hurl is about to substitute from. In practice
+/// that name has to have been *captured*: Hurl demands a number there, and
+/// every variable PaperBoy binds from an environment file is text, so an
+/// environment-set limit is a run Hurl stops with "Invalid expression type"
+/// before any of this matters. It does not stand in a number of its own in that
+/// case -- no default, no "don't retry" -- so `Unknown` is only ever reported
+/// for a request that is not about to retry at all. Reading it
+/// early cannot go stale, either: Hurl resolves an entry's options once, before
+/// its retry loop starts (`get_entry_options` is called outside `run_request`),
+/// so a capture made *during* the poll does not change the limit the poll is
+/// running under -- which is exactly the number reported here.
+fn entry_retry_limit(entry: &hurl_core::ast::Entry, vars: &VariableSet) -> RetryLimit {
+    use hurl_core::ast::{CountOption, ExprKind, OptionKind};
+    use hurl_core::types::Count;
+    entry
+        .request
+        .options()
+        .iter()
+        .find_map(|opt| match &opt.kind {
+            OptionKind::Retry(CountOption::Literal(Count::Finite(n))) => {
+                Some(RetryLimit::Times(*n))
+            }
+            OptionKind::Retry(CountOption::Literal(Count::Infinite)) => Some(RetryLimit::Forever),
+            OptionKind::Retry(CountOption::Placeholder(p)) => Some(match &p.expr.kind {
+                ExprKind::Variable(v) => vars
+                    .get(&v.name)
+                    .and_then(|v| v.value().to_string().trim().parse::<i64>().ok())
+                    .map_or(RetryLimit::Unknown, RetryLimit::from),
+                // A generator function (`{{newUuid}}` and friends) is never a
+                // count.
+                ExprKind::Function(_) => RetryLimit::Unknown,
+            }),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Hurl's own progress hook, forwarded to a PaperBoy closure.
+///
+/// This is the only way to know about a retry *while it is happening*: a
+/// retried entry's results all arrive together when the runner finally gives
+/// up or succeeds, so without this a request configured `retry: 5,
+/// retry-interval: 10000` sits silently for the best part of a minute. Hurl
+/// fires the event just *before* it sleeps for the interval, precisely so a
+/// front-end can say what the wait is for.
+struct AttemptReporter<'a> {
+    /// `RefCell` because the trait hands out `&self`, while a caller that wants
+    /// to record what it sees needs `&mut`.
+    on_attempt: std::cell::RefCell<&'a mut dyn FnMut(usize, usize, RetryLimit)>,
+    limit: RetryLimit,
+}
+
+impl EventListener for AttemptReporter<'_> {
+    fn on_entry_running(
+        &self,
+        current: hurl_core::types::Index,
+        _last: hurl_core::types::Index,
+        retry_count: usize,
+    ) {
+        (self.on_attempt.borrow_mut())(current.to_zero_based(), retry_count, self.limit);
+    }
+}
+
+/// Whether a request asks Hurl to retry it until its asserts pass.
+///
+/// Read from the parsed entry rather than from PaperBoy's own `[Options]` rows,
+/// because this has to agree with what the runner actually did -- and the
+/// runner read the same AST.
+fn entry_retries(entry: &hurl_core::ast::Entry) -> bool {
+    use hurl_core::ast::OptionKind;
+    entry
+        .request
+        .options()
+        .iter()
+        .any(|opt| matches!(opt.kind, OptionKind::Retry(_)))
+}
+
+/// Mark every outcome that a later attempt of the same request replaced.
+///
+/// `outcomes` must be the results of one runner call, in the order the runner
+/// produced them: attempts of one entry are consecutive, so "another result
+/// with my index follows" is exactly "I was retried".
+fn mark_superseded(outcomes: &mut [EntryOutcome], retries: impl Fn(usize) -> bool) {
+    for i in 0..outcomes.len().saturating_sub(1) {
+        let index = outcomes[i].entry_index;
+        if outcomes[i + 1].entry_index == index && retries(index) {
+            outcomes[i].superseded = true;
+        }
+    }
 }
 
 /// The `variable:` `[Options]` a parsed Hurl entry declares, as `(name, value)`
@@ -240,6 +444,7 @@ pub fn run_hurl_streaming_with(
     file_root: Option<&Path>,
     mut before_entry: impl FnMut(usize, &HashMap<String, String>) -> EntrySetup,
     mut on_entry: impl FnMut(&EntryOutcome),
+    mut on_attempt: impl FnMut(usize, usize, RetryLimit),
 ) -> RunOutput {
     let hurl_file = match parse_hurl_file(content) {
         Ok(h) => h,
@@ -247,6 +452,7 @@ pub fn run_hurl_streaming_with(
             return RunOutput {
                 entries: vec![],
                 error: Some(format!("Parse error (line {}): {:?}", e.pos.line, e.kind)),
+                generated: Default::default(),
             };
         }
     };
@@ -322,6 +528,12 @@ pub fn run_hurl_streaming_with(
         let mut stdout = Stdout::new(WriteMode::Buffered);
         let mut logger = Logger::new(&logger_opts, Stderr::new(WriteMode::Buffered), &secrets);
 
+        // Fresh per entry: the reporter borrows the caller's closure, and the
+        // borrow only has to last as long as this one window's run.
+        let reporter = AttemptReporter {
+            on_attempt: std::cell::RefCell::new(&mut on_attempt),
+            limit: entry_retry_limit(&hurl_file.entries[i - 1], &variables),
+        };
         let result = runner::run_entries(
             &hurl_file.entries,
             content,
@@ -329,15 +541,26 @@ pub fn run_hurl_streaming_with(
             &runner_opts,
             &variables,
             &mut stdout,
-            None,
+            Some(&reporter),
             &mut logger,
         );
         // Carry captures forward into the next entry's window.
         variables = result.variables;
 
+        // Mapped as a batch before any is reported: whether an attempt was
+        // superseded is only knowable once the attempt after it is in hand, and
+        // `on_entry` is what stamps the caller's pass/fail marker.
+        let mut window: Vec<EntryOutcome> = Vec::new();
+        let mut window_errors: Vec<Option<String>> = Vec::new();
         for e in &result.entries {
             let (outcome, entry_error) = map_entry_result(e, &lines);
-            if error.is_none() {
+            window.push(outcome);
+            window_errors.push(entry_error);
+        }
+        let retried = entry_retries(&hurl_file.entries[i - 1]);
+        mark_superseded(&mut window, |_| retried);
+        for (outcome, entry_error) in window.into_iter().zip(window_errors) {
+            if error.is_none() && !outcome.superseded {
                 error = entry_error;
             }
             on_entry(&outcome);
@@ -345,7 +568,11 @@ pub fn run_hurl_streaming_with(
         }
     }
 
-    RunOutput { entries, error }
+    RunOutput {
+        entries,
+        error,
+        generated: Default::default(),
+    }
 }
 
 /// Map one runner [`EntryResult`] to the app's [`EntryOutcome`], returning it
@@ -478,6 +705,9 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
     (
         EntryOutcome {
             entry_index: e.entry_index.to_zero_based(),
+            // Decided by `mark_superseded` once the attempt after this one is
+            // known; a single result is never superseded.
+            superseded: false,
             method,
             url,
             status,
@@ -607,6 +837,329 @@ mod tests {
             }
         });
         port
+    }
+
+    /// A server that answers "not ready" `pending` times and then succeeds,
+    /// on an ephemeral port. The shape a polling request is written against.
+    fn polling_server(pending: usize) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut seen = 0;
+            while let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                seen += 1;
+                let state = if seen > pending { "Matched" } else { "Pending" };
+                // `attempts` is there for the tests that need a *number* to
+                // capture: Hurl types a captured JSON number as one, which is
+                // the only way a `retry: {{max_attempts}}` can work (see
+                // `entry_retry_limit`).
+                let body = format!("{{\"result\":\"{state}\",\"attempts\":4}}");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        port
+    }
+
+    /// A poll that succeeds on its third go is one request that passed, not two
+    /// failures and a pass. Hurl hands back every attempt and settles it with
+    /// the last (its own `is_success` does the same); PaperBoy used to treat
+    /// each attempt as an outcome in its own right, so the request it had just
+    /// retried into success was reported as a failure -- `[Options] retry`
+    /// undone at the last step, and exactly what a converted Postman polling
+    /// loop relies on.
+    #[test]
+    fn a_poll_that_succeeds_on_the_third_go_is_a_pass() {
+        let port = polling_server(2);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nretry: 5\nretry-interval: 20\nHTTP 200\n\
+             [Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let out = run_hurl(&content, &HashMap::new(), None);
+
+        assert_eq!(out.entries.len(), 3, "every attempt is still reported");
+        let surviving: Vec<&EntryOutcome> = out.entries.iter().filter(|e| !e.superseded).collect();
+        assert_eq!(surviving.len(), 1, "one request, one outcome that counts");
+        assert!(surviving[0].ok, "{:?}", surviving[0].error);
+        assert!(
+            out.error.is_none(),
+            "the run reported {:?} for a poll that succeeded",
+            out.error
+        );
+    }
+
+    /// Every attempt is announced *as it starts*, which is the only way a
+    /// front-end can say anything at all during a poll: all of a retried
+    /// entry's results arrive together when it finally settles, so a request
+    /// written `retry: 30, retry-interval: 2000` would otherwise be a minute of
+    /// silence indistinguishable from a hung connection.
+    #[test]
+    fn each_attempt_is_reported_while_the_poll_is_still_running() {
+        let port = polling_server(2);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nretry: 5\nretry-interval: 20\nHTTP 200\n\
+             [Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let mut seen: Vec<(usize, usize, RetryLimit)> = Vec::new();
+        let out = run_hurl_watching(&content, &HashMap::new(), None, |i, attempt, limit| {
+            seen.push((i, attempt, limit))
+        });
+
+        assert!(out.entries.iter().any(|e| e.ok), "the poll did succeed");
+        assert_eq!(
+            seen,
+            vec![
+                (0, 0, RetryLimit::Times(5)),
+                (0, 1, RetryLimit::Times(5)),
+                (0, 2, RetryLimit::Times(5))
+            ],
+            "the first send plus the two retries, each with the stated limit"
+        );
+    }
+
+    /// A request nobody retries reports its one attempt and no limit, so a
+    /// caller can tell "sending" from "retrying" by the attempt number alone.
+    #[test]
+    fn a_request_that_is_not_retried_reports_a_single_first_attempt() {
+        let port = polling_server(0);
+        let content = format!("GET http://127.0.0.1:{port}/\nHTTP 200\n");
+        let mut seen: Vec<(usize, usize, RetryLimit)> = Vec::new();
+        let _ = run_hurl_watching(&content, &HashMap::new(), None, |i, attempt, limit| {
+            seen.push((i, attempt, limit))
+        });
+
+        assert_eq!(seen, vec![(0, 0, RetryLimit::Unknown)]);
+    }
+
+    /// `retry: {{max_attempts}}` is an ordinary way to write a poll, and the
+    /// value is in the same variable set Hurl is about to substitute from, so
+    /// the limit is looked up rather than given up on. (It cannot go stale
+    /// either: Hurl resolves an entry's options once, before its retry loop
+    /// starts, so a capture made during the poll does not change the limit the
+    /// poll is running under.)
+    ///
+    /// Captured, not passed in: Hurl demands a *number* there, and every
+    /// variable PaperBoy binds from an environment file is text.
+    #[test]
+    fn a_placeholder_limit_is_resolved_from_the_variables() {
+        let port = polling_server(2);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\nHTTP 200\n[Captures]\n\
+             max_attempts: jsonpath \"$.attempts\"\n\n\
+             GET http://127.0.0.1:{port}/\n[Options]\nretry: {{{{max_attempts}}}}\n\
+             retry-interval: 20\nHTTP 200\n[Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let mut limits: Vec<(usize, RetryLimit)> = Vec::new();
+        let out = run_hurl_streaming_with(
+            &content,
+            &HashMap::new(),
+            None,
+            |_, _| EntrySetup::Bind(Vec::new()),
+            |_| {},
+            |i, _, limit| limits.push((i, limit)),
+        );
+
+        assert!(
+            out.entries.iter().any(|e| e.entry_index == 1 && e.ok),
+            "the poll did succeed: {:?}",
+            out.error
+        );
+        assert!(
+            limits
+                .iter()
+                .filter(|(i, _)| *i == 1)
+                .all(|(_, l)| *l == RetryLimit::Times(4)),
+            "the placeholder should have been looked up, got {limits:?}"
+        );
+    }
+
+    /// A name nothing binds has no total to report -- and inventing one would
+    /// be worse than saying nothing, since the only thing a count is good for
+    /// is being trusted. (Hurl refuses the run outright in this case; the hint
+    /// still has to say something sensible for the one attempt that is made.)
+    #[test]
+    fn a_placeholder_limit_that_resolves_to_nothing_has_no_total() {
+        let port = polling_server(1);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nretry: {{{{max_attempts}}}}\n\
+             retry-interval: 20\nHTTP 200\n[Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let mut limits: Vec<RetryLimit> = Vec::new();
+        let _ = run_hurl_watching(&content, &HashMap::new(), None, |_, _, limit| {
+            limits.push(limit)
+        });
+
+        assert!(
+            limits.iter().all(|l| *l == RetryLimit::Unknown),
+            "got {limits:?}"
+        );
+    }
+
+    /// A limit Hurl cannot make a number of is not quietly taken as some
+    /// particular number -- it fails the entry, before the request is sent, and
+    /// explicitly without retrying (an error evaluating an entry's options is
+    /// not a retryable one). Which is what makes `RetryLimit::Unknown` safe to
+    /// report: there is never a retry for it to be wrong about.
+    ///
+    /// Pinned because the alternative -- a silent fallback to "don't retry", or
+    /// to some default count -- would turn a typo in a poll's limit into a
+    /// request that quietly checks once and reports whatever it happened to
+    /// find, which is the failure mode `retry` exists to remove.
+    #[test]
+    fn a_limit_hurl_cannot_resolve_stops_the_entry_rather_than_standing_in_for_a_number() {
+        let port = polling_server(99);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nretry: {{{{n}}}}\nretry-interval: 20\n\
+             HTTP 200\n[Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        for (label, vars, expected) in [
+            ("undefined", HashMap::new(), "Undefined variable"),
+            // Every value PaperBoy binds from an environment file is text, even
+            // one that reads like a number -- so this is the case a user who
+            // writes `retry: {{max_attempts}}` in a `.vars` file actually hits.
+            (
+                "text that looks like a number",
+                HashMap::from([("n".to_string(), "3".to_string())]),
+                "Invalid expression type",
+            ),
+        ] {
+            let mut retries = 0;
+            let out = run_hurl_watching(&content, &vars, None, |_, attempt, _| {
+                retries = retries.max(attempt)
+            });
+
+            assert_eq!(retries, 0, "{label}: nothing should have been retried");
+            assert_eq!(out.entries.len(), 1, "{label}: the request was not sent");
+            let error = out.error.unwrap_or_default();
+            assert!(
+                error.contains(expected),
+                "{label}: expected {expected:?}, got {error:?}"
+            );
+        }
+    }
+
+    /// `retry: -1` is "forever": it has no number to count towards, but that is
+    /// worth saying rather than leaving out -- the reader's question is "will
+    /// this stop?", and the answer is no.
+    #[test]
+    fn a_forever_retry_is_reported_as_forever_not_as_no_limit() {
+        let port = polling_server(1);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nretry: -1\nretry-interval: 20\nHTTP 200\n\
+             [Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let mut limits: Vec<RetryLimit> = Vec::new();
+        let _ = run_hurl_watching(&content, &HashMap::new(), None, |_, _, limit| {
+            limits.push(limit)
+        });
+
+        assert!(
+            limits.iter().all(|l| *l == RetryLimit::Forever),
+            "retry: -1 is forever, not an unknown limit; got {limits:?}"
+        );
+    }
+
+    /// Streaming reports attempts per entry, and the index is the entry's --
+    /// not the attempt's ordinal, which is what a retry makes different.
+    #[test]
+    fn streaming_reports_which_entry_is_being_retried() {
+        // Two pending answers: one spent on `/first`, so `/second` needs a
+        // retry to see "Matched".
+        let port = polling_server(2);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/first\nHTTP 200\n\n\
+             GET http://127.0.0.1:{port}/second\n[Options]\nretry: 3\nretry-interval: 20\n\
+             HTTP 200\n[Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let mut seen: Vec<(usize, usize, RetryLimit)> = Vec::new();
+        let _ = run_hurl_streaming_with(
+            &content,
+            &HashMap::new(),
+            None,
+            |_, _| EntrySetup::Bind(Vec::new()),
+            |_| {},
+            |i, attempt, limit| seen.push((i, attempt, limit)),
+        );
+
+        assert_eq!(
+            seen,
+            vec![
+                (0, 0, RetryLimit::Unknown),
+                (1, 0, RetryLimit::Times(3)),
+                (1, 1, RetryLimit::Times(3))
+            ],
+            "the retry belongs to the second entry, and only it has a limit"
+        );
+    }
+
+    /// The other half of the rule: retries that never succeed are still a
+    /// failure, and the *last* attempt is the one that says so.
+    #[test]
+    fn a_poll_that_never_comes_good_still_fails() {
+        let port = polling_server(99);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nretry: 1\nretry-interval: 20\nHTTP 200\n\
+             [Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let out = run_hurl(&content, &HashMap::new(), None);
+        let surviving: Vec<&EntryOutcome> = out.entries.iter().filter(|e| !e.superseded).collect();
+        assert_eq!(surviving.len(), 1);
+        assert!(!surviving[0].ok);
+        assert!(out.error.is_some(), "a failed run must say why");
+    }
+
+    /// `repeat` is not `retry`: those are N runs the user asked for, and every
+    /// one of them counts. Nothing may be marked away, or a repeat that failed
+    /// twice and passed once would report as a pass.
+    #[test]
+    fn a_repeated_request_keeps_every_run() {
+        let port = polling_server(2);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nrepeat: 3\nHTTP 200\n\
+             [Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let out = run_hurl(&content, &HashMap::new(), None);
+        assert_eq!(out.entries.len(), 3);
+        assert!(
+            out.entries.iter().all(|e| !e.superseded),
+            "a repeat's runs are all real"
+        );
+        assert!(out.error.is_some(), "two of the three runs failed");
+    }
+
+    /// The streaming path runs each entry in its own window, so it has to apply
+    /// the same rule on its own -- and it is the path the terminal UI and a
+    /// plain `paperboy -c` both take.
+    #[test]
+    fn streaming_marks_the_superseded_attempts_too() {
+        let port = polling_server(2);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nretry: 5\nretry-interval: 20\nHTTP 200\n\
+             [Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let mut seen: Vec<(usize, bool, bool)> = Vec::new();
+        let out = run_hurl_streaming_with(
+            &content,
+            &HashMap::new(),
+            None,
+            |_, _| EntrySetup::Bind(Vec::new()),
+            |eo| seen.push((eo.entry_index, eo.ok, eo.superseded)),
+            |_, _, _| {},
+        );
+        assert_eq!(
+            seen,
+            vec![(0, false, true), (0, false, true), (0, true, false)],
+            "the caller is told which attempts to ignore, as they happen"
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
     }
 
     /// Feature: the transfer time is reported both whole and broken into its

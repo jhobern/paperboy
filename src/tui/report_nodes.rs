@@ -162,6 +162,11 @@ pub(crate) struct RequestForm {
     /// The node's `WITH … END` items, preserved verbatim across an edit (the
     /// form doesn't edit them, but must not drop them when re-serializing).
     pub(crate) with: Vec<WithItem>,
+    /// The node's `DEPENDS` list, preserved verbatim across an edit. The
+    /// terminal UI has no way to author one — a dependency only means anything
+    /// inside a `GRAPH`, which v1 runs headless — but an edit here must not be
+    /// the thing that silently deletes it.
+    pub(crate) depends: Vec<String>,
     /// The node's `USING(…)` clause as the form was opened with, kept so
     /// anything the form has no row for survives being rebuilt from it.
     pub(crate) using: Vec<UsingItem>,
@@ -276,6 +281,7 @@ impl RequestForm {
             alias: alias.unwrap_or_default(),
             fields,
             with,
+            depends: Vec::new(),
             hide_fields,
             selected: 0,
         }
@@ -1784,41 +1790,50 @@ impl TuiApp {
         node: &FlowNode,
     ) -> Option<RequestForm> {
         let report_id = self.reports[idx].report.id;
-        let (name, report, alias, response, current_show, current_hide, with, using) = match node {
-            FlowNode::Request { name, using } => (
-                name.clone(),
-                false,
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                using.clone(),
-            ),
-            FlowNode::Report(ReportStmt::Request {
-                name,
-                alias,
-                using,
-                response_fmt,
-                show,
-                hide,
-                with,
-            }) => (
-                name.clone(),
-                true,
-                alias.clone(),
-                *response_fmt,
-                show.clone(),
-                hide.clone(),
-                with.clone(),
-                using.clone(),
-            ),
-            _ => return None,
-        };
+        let (name, report, alias, response, current_show, current_hide, with, using, depends) =
+            match node {
+                FlowNode::Request {
+                    name,
+                    alias,
+                    using,
+                    depends,
+                } => (
+                    name.clone(),
+                    false,
+                    alias.clone(),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    using.clone(),
+                    depends.clone(),
+                ),
+                FlowNode::Report(ReportStmt::Request {
+                    name,
+                    alias,
+                    using,
+                    response_fmt,
+                    show,
+                    hide,
+                    with,
+                    depends,
+                }) => (
+                    name.clone(),
+                    true,
+                    alias.clone(),
+                    *response_fmt,
+                    show.clone(),
+                    hide.clone(),
+                    with.clone(),
+                    using.clone(),
+                    depends.clone(),
+                ),
+                _ => return None,
+            };
         let report_fields = self.request_report_fields(report_id, &name);
         let declared_params = self.request_parameters(report_id, &name);
         let titles = self.bound_request_titles(report_id);
-        Some(RequestForm::build(
+        let mut form = RequestForm::build(
             report_id,
             path,
             name,
@@ -1832,7 +1847,9 @@ impl TuiApp {
             with,
             using,
             current_hide,
-        ))
+        );
+        form.depends = depends;
+        Some(form)
     }
 
     fn open_report_node_request(&mut self, idx: usize) -> bool {
@@ -1924,13 +1941,17 @@ impl TuiApp {
                 show: form.show(),
                 hide: form.hide(),
                 with: form.with.clone(),
+                depends: form.depends.clone(),
             })
         } else {
             // Downgrading to a plain REQUEST drops the *reporting* options, but
-            // `USING` describes the send itself and survives.
+            // `USING` describes the send itself and survives. So does `DEPENDS`,
+            // which is about when the request runs, not what it shows.
             FlowNode::Request {
                 name: form.request.clone(),
+                alias: form.alias_opt(),
                 using: edit::using_items(&form.params, &edit::override_items(&form.overrides)),
+                depends: form.depends.clone(),
             }
         };
         self.apply_node_replace(idx, &form.path, node);
@@ -2485,6 +2506,7 @@ impl TuiApp {
             show,
             hide,
             with,
+            depends,
         })) = node_at(&flow, &form.path)
         else {
             return None;
@@ -2508,6 +2530,7 @@ impl TuiApp {
             show: show.clone(),
             hide: hide.clone(),
             with,
+            depends: depends.clone(),
         });
         self.apply_node_replace(idx, &form.path, node);
         Some(written)
