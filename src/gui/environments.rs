@@ -649,7 +649,7 @@ fn variables_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
                     .show(ui, |ui| {
                         for row in &vars {
                             ui.horizontal(|ui| {
-                                ui.colored_label(row.dot, "\u{25cf}");
+                                super::widgets::status_dot(ui, row.dot);
                                 ui.label(RichText::new(&row.key).color(theme.text));
                             });
                             ui.horizontal(|ui| {
@@ -692,7 +692,7 @@ fn variables_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
                         ui.horizontal(|ui| {
                             // Green, matching `SubstKind::Loaded`: a capture is
                             // a value resolved from a live response.
-                            ui.colored_label(theme.ok, "\u{25cf}");
+                            super::widgets::status_dot(ui, theme.ok);
                             ui.label(RichText::new(&row.key).color(theme.text));
                         });
                         ui.horizontal(|ui| {
@@ -895,15 +895,36 @@ mod tests {
 
     /// A real screen rect matters: the list lives in a `ScrollArea`, which culls
     /// anything it believes is offscreen.
-    fn draw(app: &mut GuiApp) -> Vec<String> {
+    fn draw_shapes(app: &mut GuiApp) -> Vec<egui::epaint::ClippedShape> {
         let ctx = egui::Context::default();
         let mut input = egui::RawInput::default();
         input.screen_rect = Some(egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
             egui::vec2(320.0, 600.0),
         ));
-        let out = ctx.run_ui(input, |panel| super::ui(app, panel));
-        painted_text(&out.shapes)
+        ctx.run_ui(input, |panel| super::ui(app, panel)).shapes
+    }
+
+    fn draw(app: &mut GuiApp) -> Vec<String> {
+        painted_text(&draw_shapes(app))
+    }
+
+    /// Every filled circle the frame painted, as `(fill, radius)`.
+    fn painted_circles(shapes: &[egui::epaint::ClippedShape]) -> Vec<(egui::Color32, f32)> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(egui::Color32, f32)>) {
+            match shape {
+                egui::epaint::Shape::Circle(c) if c.fill.a() > 0 && c.radius > 0.0 => {
+                    out.push((c.fill, c.radius))
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
     }
 
     fn draw_with_workspace_file_expanded(app: &mut GuiApp, path: &std::path::Path) -> Vec<String> {
@@ -1052,6 +1073,40 @@ mod tests {
     /// Variables tab and in precedence order, the way the terminal UI's `v`
     /// popup shows them: an environment row is only half an answer once a
     /// capture of that name exists.
+    /// The status dots are *painted*, not typed. `\u{25cf}` lives only in Hack,
+    /// egui's monospace font, and the proportional family these labels use has
+    /// no fallback into it — so the literal rendered as an empty tofu box on
+    /// every row (reported from a real session). Phosphor has no stand-in at
+    /// text size either, so there is nothing to assert about a glyph: the
+    /// assertion is that a disc was drawn and no `\u{25cf}` was asked for.
+    #[test]
+    fn the_variables_rows_paint_their_dots_instead_of_typing_a_glyph() {
+        let mut app = app_with_captures(&[("TOKEN", "from-capture")], "URL=https://x\n");
+        app.env_panel_tab = EnvPanelTab::Variables;
+        let ok = app.theme.ok;
+
+        let shapes = draw_shapes(&mut app);
+        let painted = painted_text(&shapes);
+        assert!(
+            painted.iter().any(|t| t == "URL") && painted.iter().any(|t| t == "TOKEN"),
+            "both rows should be on screen: {painted:?}"
+        );
+        assert!(
+            !painted.iter().any(|t| t.contains('\u{25cf}')),
+            "no row may ask for a glyph the proportional font lacks: {painted:?}"
+        );
+
+        let circles = painted_circles(&shapes);
+        assert!(
+            circles.iter().any(|(fill, _)| *fill == ok),
+            "the capture's green dot should be painted: {circles:?}"
+        );
+        assert!(
+            circles.iter().filter(|(_, r)| *r >= 1.0).count() >= 2,
+            "one dot for the environment row and one for the capture: {circles:?}"
+        );
+    }
+
     #[test]
     fn the_variables_tab_shows_both_groups_in_precedence_order() {
         let mut app = app_with_captures(&[("TOKEN", "from-capture")], "TOKEN=from-env\n");

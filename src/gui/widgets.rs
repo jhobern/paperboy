@@ -319,6 +319,29 @@ pub fn wrapping_field_font_id(
     })
 }
 
+/// A small filled circle used as a status marker — the GUI's counterpart to
+/// the terminal UI's `●`.
+///
+/// Painted rather than typed, because the obvious `\u{25cf}` renders as a tofu
+/// box here. Of the fonts egui bundles, only **Hack** carries U+25CF, and Hack
+/// is in the *monospace* family — the proportional family every label uses is
+/// Ubuntu-Light + the two emoji fonts, none of which has the glyph, and egui
+/// does not fall back from proportional into monospace. Phosphor (which covers
+/// every other icon here, see [`super::icons`]) has no replacement either: in
+/// the Light weight the app registers, its `DOT` is a speck 8% of an em across
+/// and `CIRCLE` is a thin ring. A disc is a centre and a radius, so drawing it
+/// needs no font at all — and it can then be sized to the surrounding text.
+pub fn status_dot(ui: &mut egui::Ui, color: Color32) -> egui::Response {
+    // Roughly the ink of a `●` at the same text size, and tied to the text so
+    // it tracks the app's font scaling rather than pinning to a fixed pixel.
+    let d = (ui.text_style_height(&egui::TextStyle::Body) * 0.42).round();
+    // A horizontal layout centres a short item vertically, so this sits on the
+    // midline of the label beside it.
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(d, d), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), d / 2.0, color);
+    response
+}
+
 /// A selectable label whose footprint never changes between the
 /// unselected, hovered and selected states.
 ///

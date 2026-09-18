@@ -330,6 +330,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **The GUI's status dots rendered as empty boxes.** The coloured dot beside
+  each entry in the substitution legend asked for `●` (U+25CF). Of the fonts
+  egui bundles only Hack carries that character, Hack is the *monospace*
+  family, and a proportional label does not fall back into it — so the legend
+  showed a row of tofu boxes rather than the colour key it exists to be. The
+  icon font the rest of the GUI draws from has no solid disc at text size
+  either, so the dots are now *painted* rather than typed: a disc is a centre
+  and a radius, needs no font at all, and can be sized to the text beside it.
+  The terminal UI was never affected — a terminal's font has the glyph.
+
 - **`--postman-import -o ./API` works again.** `-o` carried a
   "requires `--report`" rule, so every Postman download that named a
   destination — including the one in `--help`'s own examples — was rejected

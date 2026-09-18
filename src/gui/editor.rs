@@ -80,7 +80,12 @@ fn subst_legend(ui: &mut egui::Ui, seen: &SubstSeen, th: &GuiTheme, s: &Strings)
             (seen.computed, s.subst_hint_generated, th.computed),
         ] {
             if present {
-                ui.colored_label(color, format!("\u{25cf} {word}"));
+                // Dot and word are one item, so a wrap can't strand a bare
+                // dot at the end of a line.
+                ui.horizontal(|ui| {
+                    super::widgets::status_dot(ui, color);
+                    ui.colored_label(color, word);
+                });
             }
         }
     });
