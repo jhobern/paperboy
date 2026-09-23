@@ -552,7 +552,8 @@ fn run_with_progress(
             let mut held = harvest.lock().unwrap_or_else(|e| e.into_inner());
             held.completed += 1;
             held.rows.push((*row).clone());
-            held.errors.extend(errors.iter().cloned());
+            held.errors
+                .extend(errors.iter().map(|e| (row.path.clone(), e.clone())));
         }
         // The two progress modes are exclusive: interleaving a redrawn human
         // line with the NDJSON stream would corrupt both (the counter uses a
@@ -672,7 +673,7 @@ fn run_with_progress(
                     if !progress_json {
                         eprintln!(
                             "\r  stopping   : no new rows; up to {}s for the rows in flight and CLEANUP",
-                            control.grace.as_secs()
+                            grace_label(control.grace)
                         );
                     }
                 }
@@ -1263,11 +1264,24 @@ struct Progress {
     /// key), and a contract that can only be observed by running the binary and
     /// scraping the real stderr is one that gets broken quietly.
     out: Option<Box<dyn Fn(&str) + Sync + Send>>,
+    /// Set once `run_finished` has gone out; every later event is dropped.
+    ///
+    /// The stream's headline promise is a single terminal event — an event
+    /// *after* it breaks the contract from the other end, and a consumer that
+    /// finalises its state there will either throw or silently mis-record. The
+    /// window is real: a run given up on writes its report and exits while
+    /// straggler rows are still in flight, and one landing in the sink between
+    /// the terminal event and `process::exit` would be announced into a stream
+    /// that had already ended. A latch here rather than disarming the sink,
+    /// because it closes that shape wherever it appears rather than in the one
+    /// place we found it.
+    finished: std::sync::atomic::AtomicBool,
 }
 
 impl Progress {
     fn new(on: bool) -> Self {
         Progress {
+            finished: std::sync::atomic::AtomicBool::new(false),
             out: on.then(|| {
                 Box::new(|line: &str| {
                     let mut err = std::io::stderr().lock();
@@ -1346,6 +1360,9 @@ impl Progress {
         let Some(out) = &self.out else {
             return;
         };
+        if self.finished.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let mut obj = serde_json::Map::new();
         obj.insert("event".into(), serde_json::Value::String(event.into()));
         obj.insert("schema".into(), serde_json::json!(PROGRESS_SCHEMA));
@@ -1483,6 +1500,10 @@ impl Progress {
                 "errors": result.errors,
             }),
         );
+        // After the emit, not before — this is the one event the latch must
+        // not swallow.
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// The stop was heard and the run is winding down: no new rows will start,
@@ -1504,6 +1525,19 @@ impl Progress {
     }
 }
 
+/// A grace period as it is spoken about in prose: `30`, but `0.25` rather than
+/// a truncated `0` for the sub-second periods only a test sets today.
+///
+/// `--grace` takes whole seconds, so this is belt and braces — but the two
+/// sentences it feeds ("did not wind down within {}s") read as a lie at any
+/// duration under one, and a number that renders as zero is the worst kind.
+fn grace_label(grace: std::time::Duration) -> String {
+    match grace.subsec_nanos() {
+        0 => grace.as_secs().to_string(),
+        _ => format!("{}", grace.as_secs_f64()),
+    }
+}
+
 /// What a run has produced so far, copied out of the row stream as it goes.
 ///
 /// The insurance policy behind a stopped run: the fully assembled result only
@@ -1515,8 +1549,10 @@ struct Harvest {
     /// order — the writer sorts nothing, so these are laid back into the
     /// projected shape as they came).
     rows: Vec<ReportRow>,
-    /// The per-row errors those rows raised.
-    errors: Vec<String>,
+    /// The per-row errors those rows raised, each kept beside the path of the
+    /// row that raised it — the errors arrive in the same completion order as
+    /// the rows, and are laid back into report order the same way.
+    errors: Vec<(Vec<(usize, usize)>, String)>,
     /// How many rows completed — counted rather than taken from `rows.len()`
     /// so it keeps meaning the same thing if the rows are ever pruned.
     completed: usize,
@@ -1559,8 +1595,25 @@ fn abandoned_result(
         rows_completed: held.completed,
         rows_planned: planned,
     });
-    result.rows = held.rows.clone();
-    result.errors = held.errors.clone();
+    // Back into report order. The rows were harvested as they *finished*, so
+    // under PARALLEL they arrive scrambled, and nothing downstream sorts them:
+    // the writers lay rows down as they are given. Leaving them would break the
+    // one property that makes PARALLEL trustworthy — that a report is the same
+    // at any degree — at exactly the moment someone is squinting at it, and
+    // would make two abandoned runs of the same corpus undiffable.
+    //
+    // Sorting by path *is* the canonical order: it is the same ordering
+    // `RowSlots` assigns slot numbers in, so a `row_index` streamed during the
+    // run still points at the row it names here.
+    let mut rows = held.rows.clone();
+    rows.sort_by(|a, b| a.path.cmp(&b.path));
+    result.rows = rows;
+    // The errors inherit the same scramble, and the ordinary path merges them
+    // in plan order; a stable sort by path keeps one row's errors in the order
+    // that row raised them.
+    let mut errors = held.errors.clone();
+    errors.sort_by(|a, b| a.0.cmp(&b.0));
+    result.errors = errors.into_iter().map(|(_, e)| e).collect();
     // A warning rather than an error: nothing about the API under test went
     // wrong. It is here because "CLEANUP may not have run" is the one
     // consequence of this path that outlives the run — a leaked session or an
@@ -1568,7 +1621,7 @@ fn abandoned_result(
     result.warnings = vec![format!(
         "the run was stopped and did not wind down within {}s: rows still in flight were \
          abandoned, and CLEANUP may not have run (check for leftover sessions or locks)",
-        grace.as_secs()
+        grace_label(grace)
     )];
     result.skipped = Vec::new();
     // Ground truths and images are assembled at the end of a run, so this
@@ -2275,6 +2328,7 @@ mod tests {
         let sink = std::sync::Arc::clone(&log);
         (
             Progress {
+                finished: std::sync::atomic::AtomicBool::new(false),
                 out: Some(Box::new(move |line: &str| {
                     sink.lock().unwrap().push(line.to_string())
                 })),
@@ -2708,10 +2762,15 @@ mod tests {
     /// the sequential case exact: the run cannot finish row `stop_after` — let
     /// alone claim the next one — until it has read a response the server only
     /// writes after stopping it.
+    /// `row_delays[i]` holds back the response to row `ri` by that many
+    /// milliseconds, which is how a test decides the order rows *finish* in
+    /// under `PARALLEL` — the property the report is then expected not to
+    /// inherit. Empty leaves every row answered as fast as it can be.
     fn stopping_server(
         cancel: std::sync::Arc<Cancel>,
         stop_after: usize,
         straggler_ms: u64,
+        row_delays: Vec<u64>,
     ) -> u16 {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -2723,16 +2782,29 @@ mod tests {
             // in flight at a time, and serialising them here would hide exactly
             // the case these tests are about.
             while let Ok((mut sock, _)) = listener.accept() {
-                let (cancel, seen) = (cancel.clone(), seen.clone());
+                let (cancel, seen, row_delays) = (cancel.clone(), seen.clone(), row_delays.clone());
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 2048];
-                    let _ = sock.read(&mut buf);
+                    let read = sock.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..read]).into_owned();
                     let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     if n >= stop_after {
                         cancel.stop();
                     }
-                    if n > stop_after && straggler_ms > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(straggler_ms));
+                    // Which row asked is in the path (`GET /ping/r3`), so a
+                    // delay can be pinned to a row rather than to arrival
+                    // order — under PARALLEL the requests arrive together.
+                    let row = req
+                        .split("/ping/r")
+                        .nth(1)
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .and_then(|i| i.parse::<usize>().ok());
+                    match row.and_then(|i| row_delays.get(i).copied()) {
+                        Some(ms) => std::thread::sleep(std::time::Duration::from_millis(ms)),
+                        None if n > stop_after && straggler_ms > 0 => {
+                            std::thread::sleep(std::time::Duration::from_millis(straggler_ms))
+                        }
+                        None => {}
                     }
                     let body = "{\"ok\":true}";
                     let resp = format!(
@@ -2786,7 +2858,7 @@ mod tests {
     fn a_stopped_run_writes_the_rows_that_finished_and_says_it_is_partial() {
         let dir = temp_dir("stop");
         let control = Control::for_test();
-        let port = stopping_server(control.switch(), 2, 0);
+        let port = stopping_server(control.switch(), 2, 0, Vec::new());
         let (coll, report) = stop_fixture(&dir, port, 6, None);
         let out = dir.join("out.json");
 
@@ -2851,7 +2923,7 @@ mod tests {
         // Zero grace: the first straggler is given up on immediately, which is
         // the same code path as a 30-second wait, minus the wait.
         let control = Control::for_test().with_grace(std::time::Duration::ZERO);
-        let port = stopping_server(control.switch(), 1, 600);
+        let port = stopping_server(control.switch(), 1, 600, Vec::new());
         let (coll, report) = stop_fixture(&dir, port, 6, Some(2));
         let out = dir.join("out.json");
 
@@ -2894,5 +2966,65 @@ mod tests {
         assert_eq!(finished["exit_code"], serde_json::json!(EXIT_INTERRUPTED));
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The two ways an abandoned run can lie about itself, both of them only
+    /// on this path: rows in the order they *finished* rather than the order
+    /// the report is defined to be in, and a row announced after the stream
+    /// said it had ended.
+    #[test]
+    fn an_abandoned_parallel_report_is_still_in_report_order_and_ends_when_it_says_it_does() {
+        let dir = temp_dir("abandon_order");
+        let control = Control::for_test().with_grace(std::time::Duration::from_millis(250));
+        // The rows are answered back-to-front, so a report that simply keeps
+        // what the sink handed it comes out reversed. r0 is slow enough to
+        // still be in flight when the grace period runs out — it is the
+        // straggler whose late arrival must not reach the stream.
+        let port = stopping_server(control.switch(), 1, 0, vec![700, 60, 40, 20]);
+        let (coll, report) = stop_fixture(&dir, port, 4, Some(4));
+        let out = dir.join("out.json");
+
+        let (progress, log) = capturing();
+        let code = run_with_progress(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            vec![out.to_string_lossy().into_owned()],
+            false,
+            Vec::new(),
+            None,
+            ParamValues::new(),
+            progress,
+            control,
+        );
+        assert_eq!(code, EXIT_INTERRUPTED);
+
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+        let xs: Vec<String> = written["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["X"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            xs.len() > 1,
+            "the ordering only means something with several rows: {written}"
+        );
+        let mut sorted = xs.clone();
+        sorted.sort();
+        assert_eq!(
+            xs, sorted,
+            "an abandoned report is still a report: the same rows in the same order a \
+             sequential run would have written them"
+        );
+
+        let events = events(&log);
+        assert_eq!(
+            events.last().map(|e| e["event"].clone()),
+            Some(serde_json::json!("run_finished")),
+            "a straggler landing after the terminal event would break the one promise \
+             the stream makes: {events:#?}"
+        );
     }
 }

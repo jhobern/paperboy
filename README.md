@@ -848,8 +848,10 @@ during a report run and PaperBoy winds down rather than dying:
 5. **`--progress-json` still ends with `run_finished`**, carrying
    `interrupted: true`, `partial: true` and the two counts, preceded by a
    `run_stopping` event naming the `source` of the stop and the
-   `grace_seconds` it allows. An interrupt
-   never reduces to a silent EOF.
+   `grace_seconds` it allows. An interrupt never reduces to a silent EOF — and
+   nothing follows the terminal event either: a row that lands after a run has
+   been given up on is not announced, because a consumer that finalises its
+   state on `run_finished` would have no way to take it.
 
 ```sh
 paperboy -r nightly.trail -o out.html -o out.json --grace 60
@@ -859,7 +861,11 @@ paperboy -r nightly.trail -o out.html -o out.json --grace 60
 flight when it expires, PaperBoy gives up on them and writes the report from
 the rows that *did* finish — a degraded rendering, without the metrics and
 ground-truth scoring that can only be computed over a complete run, and
-carrying a warning that `CLEANUP` may not have run. A **second** `Ctrl-C` skips
+carrying a warning that `CLEANUP` may not have run. Its rows are still in
+report order: they are harvested as they *finish*, so under `PARALLEL` they
+arrive scrambled, and they are laid back into the report's canonical order
+before it is written — a report is the same at any degree of parallelism, and
+two stopped runs of the same corpus are diffable. A **second** `Ctrl-C` skips
 even that and exits `130` immediately: the escape hatch for a `CLEANUP` hanging
 on the very service that stopped responding.
 

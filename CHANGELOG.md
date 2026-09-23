@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.6.5] - 2026-09-23
+
+### Fixed
+
+- **A report written over a run that was given up on is back in report order.**
+  Its rows are harvested as they *finish*, so under `PARALLEL` they arrived
+  scrambled and nothing downstream sorted them — the report came out in
+  completion order. That broke the one property that makes `PARALLEL`
+  trustworthy (a report is the same at any degree) at exactly the moment
+  someone is squinting at it, and made two stopped runs of the same corpus
+  undiffable. Rows, and the per-row errors beside them, are now laid back into
+  the canonical order before the report is written.
+- **Nothing follows `run_finished` on the `--progress-json` stream.** Between
+  the terminal event and the process exiting, a straggler row landing in the
+  sink was still announced — the stream's one promise broken from the other
+  end, and a consumer that finalises its state on `run_finished` would either
+  throw or silently mis-record. `Progress` now latches: the terminal event is
+  the last line, unconditionally.
+- Sub-second grace periods no longer render as `within 0s` in the wind-down
+  warning. Only reachable from a test today, since `--grace` takes whole
+  seconds.
+
+
 ## [0.6.4] - 2026-09-23
 
 ### Added
