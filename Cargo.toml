@@ -1,6 +1,6 @@
 [package]
 name = "paperboy"
-version = "0.6.0"
+version = "0.6.5"
 edition = "2024"
 description = "A Rust TUI API tester"
 readme = "README.md"
@@ -52,7 +52,7 @@ gui = [
 
 
 [dependencies]
-tui-panel-select = { version = "0.1.6", optional = true }
+tui-panel-select = { version = "0.2", optional = true }
 tui-rgb-picker = { version = "0.1", optional = true }
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` keeps JSON object key order when we pretty-print a response
@@ -151,3 +151,9 @@ rfd = { version = "0.17", default-features = false, optional = true, features = 
     "xdg-portal",
     "wayland",
 ] }
+# Ctrl-C / SIGTERM handling for the headless report runner, which winds a run
+# down (no new rows, CLEANUP still runs, a partial report written) instead of
+# dying where it stands. Cheap here: it reaches for `nix`/`libc` on Unix and
+# `windows-sys` on Windows, all of which this tree already builds, and it is
+# the one piece of this that cannot be written portably by hand.
+ctrlc = "3.5.2"

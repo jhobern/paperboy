@@ -754,7 +754,7 @@ strings! {
     report_dry_run_hint => "←/→ columns · Esc close", "←/→ colonnes · Échap fermer", "←/→ kolonner · Esc luk";
     report_dry_run_preview_notice => "Dry run — loop bindings resolved; HTTP response fields blank", "Simulation — liaisons de boucle résolues ; champs de réponse HTTP vides", "Prøvekørsel — løkkebindinger løst; HTTP-svarfelter tomme";
     report_dry_run_warnings_heading => "Warnings", "Avertissements", "Advarsler";
-    report_cell_popup_hint => "y copy · Esc close", "y copier · Échap fermer", "y kopier · Esc luk";
+    report_cell_popup_hint => "drag select · y copy · Esc close", "glisser sélectionner · y copier · Échap fermer", "træk markér · y kopier · Esc luk";
     report_columns_title => "Columns", "Colonnes", "Kolonner";
     report_columns_hint => "Space toggle · Shift+↑/↓ move · Enter apply · Esc cancel", "Espace bascule · Maj+↑/↓ déplacer · Entrée appliquer · Échap annuler", "Mellemrum skift · Skift+↑/↓ flyt · Enter anvend · Esc annuller";
     report_columns_need_run => "Run the report first so its columns are known", "Exécutez d'abord le rapport pour connaître ses colonnes", "Kør rapporten først, så dens kolonner kendes";

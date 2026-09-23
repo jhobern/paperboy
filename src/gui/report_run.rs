@@ -263,6 +263,7 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
                 params: params.clone(),
                 sink: None,
                 shuffle: None,
+                cancel: None,
             };
             run_flow_raw(&flow, &dry_ctx)
         };
@@ -282,7 +283,7 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
             if let Ok(tx) = row_tx.lock() {
                 let msg = match ev {
                     RowEvent::Started(path) => RunUpdate::RowStarted(path.to_vec()),
-                    RowEvent::Completed(row) => RunUpdate::Row(Box::new(row.clone())),
+                    RowEvent::Completed { row, .. } => RunUpdate::Row(Box::new(row.clone())),
                 };
                 let _ = tx.send(msg);
             }
@@ -298,6 +299,7 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
             params: params.clone(),
             sink: Some(&sink),
             shuffle: None,
+            cancel: None,
         };
         let mut result = run_flow_raw(&flow, &ctx);
         // 3. Finalize (comparison/baseline collapse) off the raw rows.

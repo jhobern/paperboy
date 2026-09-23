@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use crate::environment::substitute;
@@ -149,7 +149,20 @@ pub enum RowEvent<'r> {
     /// A row has finished and is fully built (before any outer-scope broadcast
     /// cells or the final comparison/baseline collapse are applied); carries the
     /// row so the front-end can fill and un-grey its slot.
-    Completed(&'r ReportRow),
+    Completed {
+        row: &'r ReportRow,
+        /// The run errors raised while this row was being produced — the same
+        /// strings that end up in [`ReportResult::errors`], narrowed to the ones
+        /// this row is responsible for.
+        ///
+        /// Carried on the event because the result-level list is flat: it says
+        /// *that* something failed but not *which slot* to paint red, and a
+        /// streaming front-end has no other way to tell a finished row from a
+        /// finished-and-broken one until the whole run is over. Empty is the
+        /// row's verdict of "clean", not "unknown" — a row is only announced
+        /// once everything that could fail for it has run.
+        errors: &'r [String],
+    },
 }
 
 /// A per-row streaming hook: called with a [`RowEvent`] as each row starts and
@@ -160,6 +173,41 @@ pub enum RowEvent<'r> {
 /// a `Mutex`), and events may arrive out of iteration order under `PARALLEL`
 /// (the `path` still identifies the target row).
 pub type RowSink<'a> = dyn Fn(RowEvent) + Sync + 'a;
+
+/// A cooperative stop switch for a run in progress: flip it and the flow stops
+/// *starting* work, without abandoning what is already under way.
+///
+/// The contract is deliberately narrow, because the two obvious alternatives
+/// are both worse. Cancelling at the *runner* (the TUI's `CancellableRunner`,
+/// which fails every later request outright) also cancels the `CLEANUP`
+/// requests — the sessions and locks a report is obliged to release — and
+/// leaves the rows that never ran present-but-failed, blaming the API for a
+/// stop the user asked for. Cancelling mid-row would emit half-filled rows.
+///
+/// So this flag is only read where a *new* unit of work would be claimed (see
+/// [`Exec::run_iterations`]): a loop iteration already running finishes its
+/// requests and emits its row whole, every block still returns normally, and
+/// `run_cleanups` therefore runs on its ordinary path. What a stopped run
+/// leaves is a report with fewer rows, each of them complete and honest.
+#[derive(Debug, Default)]
+pub struct Cancel(AtomicBool);
+
+impl Cancel {
+    pub fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// Ask the run to stop claiming new work. Idempotent, and safe to call from
+    /// any thread (a signal handler, a stdin watcher).
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a stop has been asked for.
+    pub fn stopped(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 /// The immutable context a flow runs against: the bound collection's entries,
 /// the base variable layer (global + pinned env, resolved once), any named
@@ -204,6 +252,11 @@ pub struct RunContext<'a> {
     /// earliest-written tie-break. See [`schedule_graph`]: a region *claims*
     /// its edge set is complete, and shuffling is how that claim is falsified.
     pub shuffle: Option<u64>,
+    /// Optional stop switch (see [`Cancel`]). `None` for a run nothing can
+    /// interrupt (the tests, a dry run, an in-process front-end run); `Some`
+    /// when a caller — the headless runner, on a signal or a `stop` line —
+    /// needs the flow to stop starting new rows and wind down.
+    pub cancel: Option<&'a Cancel>,
 }
 
 /// A helper collection loaded for a report, under the alias its requests are
@@ -314,6 +367,10 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         .unwrap_or_else(|| DEFAULT_NO_MATCH.to_string());
     ReportResult {
         rows,
+        // A run that returned produced every row it was going to; only a
+        // caller that stopped one part-way (see [`Cancel`]) can say otherwise,
+        // and it sets this afterwards.
+        partial: None,
         role_targets: ex.role_targets,
         column_order: ex.column_order,
         no_match_marker,
@@ -1475,6 +1532,11 @@ impl<'a> Exec<'a> {
     /// are accumulated and either broadcast into the rows produced by nested
     /// loops or, when the block has no loop, emitted as a single row.
     fn exec_block(&mut self, nodes: &[FlowNode]) -> Vec<ReportRow> {
+        // Where this block's errors start, so the row it emits can be announced
+        // with the errors *it* raised rather than with whatever the run has
+        // accumulated so far (see `RowEvent::Completed`). A fork starts with an
+        // empty list, so on a `PARALLEL` iteration the mark is simply 0.
+        let err_mark = self.errors.len();
         // A block with no nested loop emits exactly one row (a "leaf" block).
         // Signal that row's slot as "running" up front — before any of its
         // requests are sent — so a streaming front-end shows it in flight.
@@ -1591,7 +1653,7 @@ impl<'a> Exec<'a> {
             }
             child_rows
         } else {
-            vec![self.emit_row(own)]
+            vec![self.emit_row(own, err_mark)]
         }
     }
 
@@ -1978,7 +2040,7 @@ impl<'a> Exec<'a> {
     /// keeps the returned rows correct even for reports that follow the loop.
     /// Fires the streaming [`RowSink`] (if any) with the finished row before
     /// returning it, so a live front-end sees each row as it completes.
-    fn emit_row(&self, mut cells: HashMap<String, String>) -> ReportRow {
+    fn emit_row(&self, mut cells: HashMap<String, String>, err_mark: usize) -> ReportRow {
         for (k, v) in &self.broadcast {
             cells.entry(k.clone()).or_insert_with(|| v.clone());
         }
@@ -1992,7 +2054,11 @@ impl<'a> Exec<'a> {
             comparison: self.comparison.clone(),
         };
         if let Some(sink) = self.ctx.sink {
-            sink(RowEvent::Completed(&row));
+            // `run_cleanups` *drains* the errors a teardown raised (they become
+            // warnings), so the list can be shorter than the mark taken when the
+            // block started — clamp rather than slice past the end.
+            let errors = &self.errors[err_mark.min(self.errors.len())..];
+            sink(RowEvent::Completed { row: &row, errors });
         }
         row
     }
@@ -2651,7 +2717,12 @@ impl<'a> Exec<'a> {
                             self.note_column(&k);
                         }
                         if let Some(sink) = self.ctx.sink {
-                            sink(RowEvent::Completed(&row));
+                            // A snapshot row is read from disk, not run: nothing
+                            // could have failed while producing it.
+                            sink(RowEvent::Completed {
+                                row: &row,
+                                errors: &[],
+                            });
                         }
                         rows.push(row);
                     }
@@ -2684,12 +2755,21 @@ impl<'a> Exec<'a> {
                 let next = AtomicUsize::new(0);
                 let slots: Vec<Mutex<Option<IterOut>>> =
                     (0..count).map(|_| Mutex::new(None)).collect();
+                let cancel = self.ctx.cancel;
                 std::thread::scope(|s| {
                     for _ in 0..degree {
                         s.spawn(|| {
                             loop {
                                 let i = next.fetch_add(1, Ordering::Relaxed);
                                 if i >= count {
+                                    break;
+                                }
+                                // The stop switch is read *after* claiming an
+                                // index and before running it: a worker stops
+                                // taking new iterations, while the up-to-`degree`
+                                // iterations already in flight run to completion
+                                // and emit their rows whole.
+                                if cancel.is_some_and(Cancel::stopped) {
                                     break;
                                 }
                                 let out = run_one(i);
@@ -2700,10 +2780,16 @@ impl<'a> Exec<'a> {
                 });
                 slots
                     .into_iter()
-                    .map(|m| m.into_inner().unwrap().expect("every slot is filled"))
+                    // A stopped run leaves the iterations it never claimed
+                    // empty; they are absent from the report rather than
+                    // present and failed.
+                    .flat_map(|m| m.into_inner().unwrap())
                     .collect()
             }
-            _ => (0..count).map(&run_one).collect(),
+            _ => (0..count)
+                .take_while(|_| !self.ctx.cancel.is_some_and(Cancel::stopped))
+                .map(&run_one)
+                .collect(),
         };
 
         let mut rows = Vec::new();
@@ -3422,6 +3508,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -3460,6 +3547,7 @@ mod tests {
                 .collect(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -3766,6 +3854,7 @@ mod tests {
                 .collect(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -5026,6 +5115,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: Some(seed),
+            cancel: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -6296,7 +6386,7 @@ mod tests {
         .unwrap();
         let streamed: Mutex<Vec<ReportRow>> = Mutex::new(Vec::new());
         let sink = |ev: RowEvent| {
-            if let RowEvent::Completed(row) = ev {
+            if let RowEvent::Completed { row, .. } = ev {
                 streamed.lock().unwrap().push(row.clone());
             }
         };
@@ -6311,6 +6401,7 @@ mod tests {
             params: Default::default(),
             sink: Some(&sink),
             shuffle: None,
+            cancel: None,
         };
         let result = run_flow_raw(&flow, &ctx);
         let streamed = streamed.into_inner().unwrap();
@@ -6326,6 +6417,266 @@ mod tests {
                 "streamed row is missing the broadcast outer-report column"
             );
         }
+    }
+
+    /// A streaming front-end paints one slot per row, so "what went wrong" has
+    /// to arrive per row: the result-level error list is flat and says nothing
+    /// about *which* row to mark. Each event therefore carries the errors that
+    /// row raised — and only those, so the second row of a failing loop isn't
+    /// blamed for the first one's failure as well.
+    #[test]
+    fn a_completed_row_carries_its_own_errors_only() {
+        let fake = Fake::new(&[(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("up", &[])];
+        // `ghost` is in no collection, so every iteration raises exactly one
+        // error of its own while the row is still produced.
+        let flow = parse_flow(
+            "FOR X IN [\"a\", \"b\"]\n    REPORT REQUEST up\n    REPORT REQUEST ghost\nEND\n",
+        )
+        .unwrap();
+        type Announced = Vec<(Vec<(usize, usize)>, Vec<String>)>;
+        let seen: Mutex<Announced> = Mutex::new(Vec::new());
+        let sink = |ev: RowEvent| {
+            if let RowEvent::Completed { row, errors } = ev {
+                seen.lock()
+                    .unwrap()
+                    .push((row.path.clone(), errors.to_vec()));
+            }
+        };
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: Some(&sink),
+            shuffle: None,
+            cancel: None,
+        };
+        let result = run_flow_raw(&flow, &ctx);
+        let seen = seen.into_inner().unwrap();
+
+        assert_eq!(seen.len(), 2, "one event per row");
+        assert_eq!(result.errors.len(), 2, "both iterations failed");
+        for (path, errors) in &seen {
+            assert_eq!(
+                errors.len(),
+                1,
+                "row {path:?} should carry only its own error, got {errors:?}"
+            );
+            assert!(errors[0].contains("ghost"), "{errors:?}");
+        }
+    }
+
+    /// The same, under `PARALLEL` — which is the condition the whole per-row
+    /// error story rests on: an iteration runs on a *fork* whose error list
+    /// starts empty, so the watermark taken when its block begins is 0 and the
+    /// errors it drains are its own. Four iterations are in flight at once and
+    /// each raises exactly one error; were the list shared, whichever rows
+    /// completed later would be blamed for their predecessors' failures too.
+    #[test]
+    fn a_parallel_iterations_errors_stay_with_its_own_row() {
+        let fake = Fake::new(&[(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("up", &[])];
+        let flow = parse_flow(
+            "PARALLEL(4) FOR X IN [\"a\", \"b\", \"c\", \"d\"]\n    REPORT REQUEST up\n    REPORT REQUEST ghost\nEND\n",
+        )
+        .unwrap();
+        type Announced = Vec<(Vec<(usize, usize)>, Vec<String>)>;
+        let seen: Mutex<Announced> = Mutex::new(Vec::new());
+        let sink = |ev: RowEvent| {
+            if let RowEvent::Completed { row, errors } = ev {
+                seen.lock()
+                    .unwrap()
+                    .push((row.path.clone(), errors.to_vec()));
+            }
+        };
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: Some(&sink),
+            shuffle: None,
+            cancel: None,
+        };
+        let result = run_flow_raw(&flow, &ctx);
+        let mut seen = seen.into_inner().unwrap();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(seen.len(), 4, "one event per row");
+        assert_eq!(
+            result.errors.len(),
+            4,
+            "every iteration failed once: {:?}",
+            result.errors
+        );
+        for (path, errors) in &seen {
+            assert_eq!(
+                errors.len(),
+                1,
+                "row {path:?} was blamed for another iteration's failures: {errors:?}"
+            );
+            assert!(errors[0].contains("ghost"), "{errors:?}");
+        }
+    }
+
+    /// A runner that flips a stop switch once it has answered `after`
+    /// requests — a stop arriving at a known point in the run, with no timing
+    /// to get wrong.
+    struct StopsAfter<'a> {
+        inner: &'a Fake,
+        cancel: &'a Cancel,
+        after: usize,
+        seen: AtomicUsize,
+    }
+
+    impl EntryRunner for StopsAfter<'_> {
+        fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
+            let out = self.inner.run(base, vars);
+            if self.seen.fetch_add(1, Ordering::SeqCst) + 1 >= self.after {
+                self.cancel.stop();
+            }
+            out
+        }
+    }
+
+    fn stop_run(src: &str, entries: &[HurlEntry], fake: &Fake, after: usize) -> ReportResult {
+        let flow = parse_flow(src).expect("flow parses");
+        let cancel = Cancel::new();
+        let runner = StopsAfter {
+            inner: fake,
+            cancel: &cancel,
+            after,
+            seen: AtomicUsize::new(0),
+        };
+        let ctx = RunContext {
+            entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &runner,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+            shuffle: None,
+            cancel: Some(&cancel),
+        };
+        run_flow(&flow, &ctx)
+    }
+
+    #[test]
+    fn a_stopped_loop_starts_no_further_iterations() {
+        let fake = Fake::new(&[(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("up", &[])];
+        // Six iterations, stopped once the second has answered: the row in
+        // flight finishes, and the loop claims nothing after it.
+        let res = stop_run(
+            "FOR X IN [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\"]\n    REPORT REQUEST up\nEND\n",
+            &entries,
+            &fake,
+            2,
+        );
+        assert_eq!(
+            res.rows.len(),
+            2,
+            "the row in flight finishes and no more start"
+        );
+        assert_eq!(fake.call_count(), 2, "nothing was sent after the stop");
+        assert!(
+            res.errors.is_empty(),
+            "a stop is not a failure: {:?}",
+            res.errors
+        );
+    }
+
+    #[test]
+    fn a_stopped_parallel_loop_stops_claiming_iterations() {
+        let fake = Fake::new(&[(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("up", &[])];
+        // Two workers over eight iterations. However the two interleave, the
+        // stop has to end the loop well short of all eight — the point being
+        // that a worker reads the switch before claiming, not that any exact
+        // number of rows comes back.
+        let res = stop_run(
+            "PARALLEL(2) FOR X IN [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\"]\n    \
+             REPORT REQUEST up\nEND\n",
+            &entries,
+            &fake,
+            2,
+        );
+        assert!(
+            (2..=4).contains(&res.rows.len()),
+            "expected the two in flight (and at most one more claimed in the race) \
+             to finish, got {} rows",
+            res.rows.len()
+        );
+        assert_eq!(
+            res.rows.len(),
+            fake.call_count(),
+            "every row that came back was really run"
+        );
+    }
+
+    #[test]
+    fn a_stopped_run_still_runs_its_cleanups() {
+        // The one that would actually bite: CLEANUP exists to delete sessions
+        // and release locks, so a stop that skipped it would leak them against
+        // a real service — worse than not being able to stop at all.
+        let entries = [
+            graph_entry("open", &["sid"], &[]),
+            graph_entry("purge", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[ok_capturing("open", &[("sid", "S1")])]);
+        let res = stop_run(
+            "FOR X IN [\"a\", \"b\", \"c\"]\n    REQUEST open AS open\n    REPORT REQUEST open\n\
+             END\nCLEANUP purge\n",
+            &entries,
+            &fake,
+            1,
+        );
+        assert!(
+            fake.call_order().contains(&"purge".to_string()),
+            "the teardown must still run after a stop: {:?}",
+            fake.call_order()
+        );
+        assert!(
+            res.rows.len() < 3,
+            "the loop really was cut short: {} rows",
+            res.rows.len()
+        );
     }
 
     #[test]
@@ -6373,7 +6724,7 @@ mod tests {
             parse_flow("FOR X IN [\"a\", \"b\", \"c\"]\n    REPORT REQUEST send\nEND\n").unwrap();
         let streamed: Mutex<Vec<ReportRow>> = Mutex::new(Vec::new());
         let sink = |ev: RowEvent| {
-            if let RowEvent::Completed(row) = ev {
+            if let RowEvent::Completed { row, .. } = ev {
                 streamed.lock().unwrap().push(row.clone());
             }
         };
@@ -6388,6 +6739,7 @@ mod tests {
             params: Default::default(),
             sink: Some(&sink),
             shuffle: None,
+            cancel: None,
         };
         let result = run_flow_raw(&flow, &ctx);
         let streamed = streamed.into_inner().unwrap();
@@ -6450,7 +6802,7 @@ mod tests {
             let mut log = events.lock().unwrap();
             match ev {
                 RowEvent::Started(path) => log.push((Kind::Started, path.to_vec())),
-                RowEvent::Completed(row) => log.push((Kind::Completed, row.path.clone())),
+                RowEvent::Completed { row, .. } => log.push((Kind::Completed, row.path.clone())),
             }
         };
         let ctx = RunContext {
@@ -6464,6 +6816,7 @@ mod tests {
             params: Default::default(),
             sink: Some(&sink),
             shuffle: None,
+            cancel: None,
         };
         let result = run_flow_raw(&flow, &ctx);
         let events = events.into_inner().unwrap();
@@ -6588,6 +6941,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -6729,6 +7083,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 2, "one row per matched jpg");
@@ -6777,6 +7132,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 2, "one row per case folder: {:?}", res.rows);
@@ -6823,6 +7179,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.rows.is_empty());
@@ -6963,6 +7320,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -7048,6 +7406,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let first = run_flow(&flow, &ctx);
         let snap_path = dir.join("proc.baseline");
@@ -7069,6 +7428,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let second = run_flow(&flow2, &ctx2);
 
@@ -7157,6 +7517,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let first = run_flow(&base_flow, &base_ctx);
         let snap_path = dir.join("prod.baseline");
@@ -7186,6 +7547,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let cmp = run_flow(&cmp_flow, &cmp_ctx);
 
@@ -7270,6 +7632,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let first = run_flow(&flow, &ctx);
         let snap_path = dir.join("proc.baseline");
@@ -7308,6 +7671,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 1, "rows still produced");
@@ -8036,6 +8400,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -8106,6 +8471,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -8213,6 +8579,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         std::fs::remove_dir_all(&dir).ok();
@@ -8278,6 +8645,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         // The snapshot answers `yes` everywhere: right on row a, wrong on row b.
         let first = run_flow(&parse_flow(body).expect("flow parses"), &ctx);
@@ -8318,6 +8686,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(
@@ -8348,6 +8717,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(
@@ -8384,6 +8754,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.errors.is_empty(), "{:?}", res.errors);
@@ -8420,6 +8791,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(
@@ -8449,6 +8821,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(
@@ -8474,6 +8847,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.verdicts.is_empty() && res.truths.is_empty());
@@ -8501,6 +8875,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.images.is_empty());
@@ -8749,6 +9124,7 @@ mod helper_collection_tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let result = run_flow(&flow, &ctx);
         assert_eq!(
@@ -8835,6 +9211,7 @@ mod timing_column_tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         run_flow(&flow, &ctx)
     }

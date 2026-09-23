@@ -8,6 +8,220 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.6.5] - 2026-09-23
+
+### Fixed
+
+- **A report written over a run that was given up on is back in report order.**
+  Its rows are harvested as they *finish*, so under `PARALLEL` they arrived
+  scrambled and nothing downstream sorted them — the report came out in
+  completion order. That broke the one property that makes `PARALLEL`
+  trustworthy (a report is the same at any degree) at exactly the moment
+  someone is squinting at it, and made two stopped runs of the same corpus
+  undiffable. Rows, and the per-row errors beside them, are now laid back into
+  the canonical order before the report is written.
+- **Nothing follows `run_finished` on the `--progress-json` stream.** Between
+  the terminal event and the process exiting, a straggler row landing in the
+  sink was still announced — the stream's one promise broken from the other
+  end, and a consumer that finalises its state on `run_finished` would either
+  throw or silently mis-record. `Progress` now latches: the terminal event is
+  the last line, unconditionally.
+- Sub-second grace periods no longer render as `within 0s` in the wind-down
+  warning. Only reachable from a test today, since `--grace` takes whole
+  seconds.
+
+
+## [0.6.4] - 2026-09-23
+
+### Added
+
+- **The cell drill-down popup's text is selectable.** Opening a result cell to
+  read a 200-line response body and then being able to copy only the whole of
+  it was not selecting. Drag with the mouse to select, Alt+Drag to add a second
+  region, `Shift`+arrows to extend from the keyboard, release to copy — the
+  same gestures the panes behind the popup already answered to, so the popup is
+  no longer the one place where the mouse stops working.
+
+### Fixed
+
+- **A click below the last row of a filtered result grid selects nothing.** The
+  bounds check counted *all* the result's rows rather than the visible ones, so
+  with a row filter up, clicking the empty space under the grid moved the cell
+  cursor onto a row that wasn't on screen. The cursor is a visible-row index
+  everywhere else; now it is here too.
+
+### Changed
+
+- `tui-panel-select` 0.2: the drag-to-select gesture in the popup is now driven
+  by the crate's own `MultiSelectPanel::handle_mouse` instead of being wired up
+  here. The report and main views keep their hand-written wiring, because there
+  the selection spans several panels and the clearing and copying are decisions
+  above any one of them.
+
+
+## [0.6.3] - 2026-09-23
+
+### Added
+
+- **A headless run can be stopped without losing it.** `Ctrl-C` (or `SIGTERM`)
+  during a report run no longer kills PaperBoy where it stands. It winds the
+  run down instead: no new rows are started, the rows already in flight finish,
+  `CLEANUP` runs, and the `-o` outputs you asked for are written and marked
+  partial. The principle is the one the part-written output set already
+  followed — the files are faithful renderings of a run that really happened,
+  one level up.
+
+  The order matters more than any single piece of it:
+
+  | Step | Why |
+  |------|-----|
+  | Stop claiming rows | The switch is read where a row is *claimed*, so up to five live HTTP calls under `PARALLEL(5)` finish whole rather than being abandoned mid-upload. Work already paid for is kept. |
+  | Run `CLEANUP` | The one that would actually bite. `CLEANUP` deletes sessions and releases locks; an interrupt that skipped teardown would leak them against a real service — worse than no interrupt handling at all. Every block returns on its ordinary path, so teardown is not a special case. |
+  | Write the outputs, marked partial | A report that silently looks complete while covering 60% of the corpus is a trap. |
+  | Exit `4` | "I was told to stop" is not "your API is broken" (`1`) and not "steps were skipped" (`3`). |
+
+- **Partial reports say so in every format.** `ReportResult` now carries
+  `partial` with `rows_completed` and `rows_planned`: a `PARTIAL` banner above
+  the HTML (before the toolbar and the metric cards, so it is read before the
+  numbers are), `"partial": true` plus both counts at the top level of the
+  JSON, a final `PARTIAL,37 of 120 rows ran` record in the CSV (a row, not a
+  comment — `#` is data in CSV, and a spreadsheet shows the last row as readily
+  as the first), a bold amber row under the XLSX summary, and the PDF title.
+  `partial` is *always* present in the JSON, so a consumer can test for it
+  without knowing which build wrote the file.
+
+- **`--grace SECONDS`** (default `30`) bounds the wind-down. If rows are still
+  in flight when it expires, PaperBoy gives up on them and writes the report
+  from the rows that did finish — a degraded rendering, without the metrics and
+  ground-truth scoring that can only be computed over a complete run, and
+  carrying a warning that `CLEANUP` may not have run. A **second** interrupt
+  skips even that and exits `130`: the escape hatch for a `CLEANUP` hanging on
+  the very service that stopped responding.
+
+- **`--stop-on-stdin`** adds an explicit, cross-platform stop channel: a line
+  reading `stop` on stdin begins the same wind-down, and so does EOF. Signals
+  are awkward on Windows, where there is no `SIGTERM` to send a child process,
+  and a caller already reading `--progress-json` from stderr gets a
+  bidirectional protocol by adding one flag. Opt-in precisely because EOF
+  counts, and most CI runners start processes with stdin already closed.
+
+### Changed
+
+- **`--progress-json` reports interruption rather than ending in silence.** A
+  new `run_stopping` event names the trigger and the grace period, and
+  `run_finished` gained `interrupted`, `partial`, `rows_completed` and
+  `rows_planned`. The terminal-event promise stays unconditional: a stopped run
+  ends with `run_finished` carrying `exit_code: 4`, never a silent EOF.
+- Exit codes, a documented caller contract, gained `4` (stopped) and `130`
+  (stop repeated, so forced).
+
+
+## [0.6.2] - 2026-09-23
+
+### Added
+
+- **`--progress-json`: real-time run events for a program driving PaperBoy.**
+  A headless report (`-r`) can now stream its progress as newline-delimited
+  JSON on stderr — one object per line, flushed as it happens — instead of the
+  human `done/total` counter. It is what an application embedding PaperBoy
+  needs to show a live grid: the same picture the TUI and GUI draw from the
+  same per-row hook, without parsing prose.
+
+  Five events, each carrying `schema` (the stream version, so a consumer can
+  refuse a newer PaperBoy rather than silently mis-read it):
+
+  | Event | When |
+  |-------|------|
+  | `plan` | Once, after the projection pass and before anything is sent: `total` rows and the `columns` they will fill, so the empty grid can be drawn up front. |
+  | `row_started` | A row's requests are in flight. Several are live at once under `PARALLEL`. |
+  | `row_completed` | A row is finished: its `cells`, `ok`, and the `errors` *that row* raised. |
+  | `output_written` | Each `-o` file as it lands (or fails), so a consumer knows which of a part-written set exist. |
+  | `run_finished` | Last line: `warnings`, `skipped`, `errors` and the `exit_code` the process is about to exit with. |
+
+  Every event carries `path`, the row's structural identity (`"0.3"`,
+  `"0.1.2.0"`, `""` for a report with no loop). It is assigned before the run,
+  and is unique and stable however `PARALLEL` workers interleave. Row events
+  also carry `row_index`, the slot that row occupies in the projected grid —
+  and, for a report that doesn't collapse an `ENVS` comparison, the index of
+  its row in a `-o out.json` report. That is what makes the live grid and the
+  finished file explicitly linkable: a consumer can hold a cheap live grid and
+  read the full values from the report at the end.
+
+  Progress stays cheap on purpose: `DETAIL` and `IMAGE` columns (the ones an
+  author has already marked as drill-down content, a raw response body among
+  them) are named in `plan` as `withheld_columns` and left out of every row,
+  as is any cell over 4 KB (named in that row's `withheld`). The same bytes
+  are already going to the report file.
+
+  `--progress-json` replaces the human progress counter rather than
+  interleaving with it, and suppresses the decorative summary when that would
+  also land on stderr (`-o -`), so the stream is nothing but events.
+
+  `run_finished` is emitted unconditionally. A fatal *setup* error — an
+  unreadable collection, a mistyped `--param`, a validation failure — produces
+  no `plan` and no rows, but still closes the stream with `run_finished`,
+  `exit_code: 1` and the diagnostic in `errors`, so the promise of exactly one
+  terminal event holds for every run that starts, and a consumer never has to
+  read prose to learn why a run didn't happen. (A command-line *usage* error
+  is the exception: it is rejected before PaperBoy runs.)
+
+  `--dry-run --progress-json` streams the projected grid in full — `plan` and
+  a `row_started`/`row_completed` pair per row, cells included — without
+  sending a request, so a consumer can draw the grid, or exercise its own
+  parsing, before committing to a real run.
+
+### Changed
+
+- `RowEvent::Completed` now carries the errors raised while producing the row
+  alongside the row itself. The result-level error list is flat — it says that
+  something failed, not which slot to paint red — so a streaming front-end had
+  no way to tell a finished row from a finished-and-broken one until the whole
+  run was over.
+
+
+## [0.6.1] - 2026-09-23
+
+### Fixed
+
+- **A report's run settings ignored the keyboard when opened from the
+  workspace tree.** `r`/F5 on a report row in a Workspace tab runs the report
+  the tree has selected, and a report that declares `PARAM`s stops at its
+  questions first — but those keys leave focus on the tree, and the report key
+  map was only reached while the report *body* held focus. The box came up over
+  the report and then watched the arrow keys walk the tree behind it, so a run
+  could be started against values the user had never been able to change. The
+  run settings now take the keyboard from whichever pane put them up, and hand
+  it straight back to the tree on Esc.
+
+- **A still run with failures ran two phrases together.** The movement line
+  read "Movement Nothing movedStill wrong 33": its separators hung off the
+  *figures*, and "Nothing moved" is a phrase with no figure to hang one off, so
+  the next label arrived flush against it. The gap now belongs to the segment
+  that follows.
+
+- **The results grid's pinned band could be highlighted, but copied the rows
+  behind it.** The metric summary and the column headers are painted *over* the
+  scrolling panel, so the panel's first line is the first data row — a click
+  measured against the whole pane landed as many rows too far down as there
+  were pinned lines. Dragging across the summary therefore highlighted the
+  summary and put a data row on the clipboard, and on a scored report (which
+  pins a line per ground-truthed column) clicking a cell selected a row several
+  below the one under the cursor. Clicks are now measured against the rows that
+  actually scroll; the pinned band highlights nothing, because there is nothing
+  there the panel could copy.
+
+- **`y` over the results grid dropped the column names and the score.** It
+  copied the panel's own text, which is the data rows alone, handing over a
+  block of values with nothing saying what any column was. The copy now leads
+  with the pinned band, exactly as the pane reads on screen.
+
+- **A long answer wrapped the run settings' hint in half.** The Binding panel's
+  summary named the key to change the answers *after* listing them, so one long
+  path was enough to push "p to change" over the line ending — arriving as
+  "p to" on one row and "change" on the next. The hint now sits with the label
+  it belongs to ("Run settings (p to change): …"), where only the values wrap.
+
+
 ## [0.6.0] - 2026-09-18
 
 ### Added

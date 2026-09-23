@@ -18,7 +18,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
-use tui_panel_select::{MultiSelectPanel, WrapMode};
+use tui_panel_select::{Motion, MultiSelectPanel, WrapMode};
 
 use super::app::{
     ConfirmAction, MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, Pane, PromptKind, TuiApp,
@@ -255,8 +255,18 @@ pub(crate) struct ReportTab {
     /// "running"; the partial grid in `result` is retained automatically.
     pub(crate) run_progress: Option<RunProgress>,
     /// Selection/scroll panel backing the results grid (clip-wrapped so each
-    /// row stays on one line and columns line up, like program output).
+    /// row stays on one line and columns line up, like program output). It
+    /// holds only the rows that *scroll* — see
+    /// [`results_pinned_text`](Self::results_pinned_text) for the band above.
     pub(crate) results_panel: MultiSelectPanel,
+    /// The plain text of whatever the results pane pinned above the scrolling
+    /// rows last frame: the metric summary lines, then the grid's header row.
+    ///
+    /// Recorded because those lines are painted over the panel rather than
+    /// through it, so they are in no panel's text model — and a `y` that copied
+    /// "the results" while dropping the column names and the score was copying
+    /// a table nobody could read. Empty when nothing is pinned.
+    pub(crate) results_pinned_text: Vec<String>,
     /// Keyboard/mouse cell cursor in the results grid: `(row, col)` where both
     /// are 0-indexed over the data rows and columns respectively — row 0 is the
     /// first data row, not the header. `None` until the user first navigates or
@@ -445,6 +455,7 @@ impl ReportTab {
             last_export: None,
             run_progress: None,
             results_panel,
+            results_pinned_text: Vec::new(),
             cell_cursor: None,
             results_scrolled_to: None,
             results_filter: crate::report::filter::RowFilter::All,
@@ -1079,6 +1090,7 @@ impl TuiApp {
             params: inputs.params,
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         Ok(run_flow(&inputs.flow, &ctx))
     }
@@ -1354,6 +1366,7 @@ impl TuiApp {
                     params: params.clone(),
                     sink: None,
                     shuffle: None,
+                    cancel: None,
                 };
                 run_flow_raw(&flow, &dry_ctx)
             };
@@ -1386,7 +1399,7 @@ impl TuiApp {
                             report_id,
                             path: path.to_vec(),
                         },
-                        RowEvent::Completed(row) => ReportRunUpdate::Row {
+                        RowEvent::Completed { row, .. } => ReportRunUpdate::Row {
                             report_id,
                             row: Box::new(row.clone()),
                         },
@@ -1405,6 +1418,7 @@ impl TuiApp {
                 params: params.clone(),
                 sink: Some(&sink),
                 shuffle: None,
+                cancel: None,
             };
             let mut result = run_flow_raw(&flow, &ctx);
             // 3. Finalize (comparison/baseline collapse) off the raw rows, then
@@ -2420,6 +2434,25 @@ impl TuiApp {
                 panel,
             });
         };
+        // Shift+Arrow moves the *end* of the selection, exactly as it does in
+        // the panes behind the popup — the keyboard half of the same gesture,
+        // and the way to adjust a drag without redoing it.
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && let Some(motion) = match key.code {
+                KeyCode::Left => Some(Motion::Left),
+                KeyCode::Right => Some(Motion::Right),
+                KeyCode::Up => Some(Motion::Up),
+                KeyCode::Down => Some(Motion::Down),
+                _ => None,
+            }
+        {
+            let area = self.report_cell_popup_area;
+            if area.width > 0 && area.height > 0 {
+                panel.extend(motion, area);
+            }
+            keep(self, title, content, panel);
+            return;
+        }
         match key.code {
             // Esc closes the popup.
             KeyCode::Esc => {}
@@ -3949,6 +3982,8 @@ pub(crate) fn draw_report_content(
     // `Rect::default()`, so it can never be hit).
     app.report_pane_areas = [Rect::default(); 3];
     app.report_pane_bars = [Rect::default(); 3];
+    app.report_results_body = Rect::default();
+    app.report_results_first_line = 0;
 
     // The results grid is shown full-height (no binding/validation at the top)
     // when the user has flipped to it; otherwise the source + binding +
@@ -4132,6 +4167,10 @@ fn draw_report_results(
         );
         app.report_pane_areas[ReportPane::Results.idx()] = inner;
         app.report_pane_bars[ReportPane::Results.idx()] = bar;
+        // The preview pins nothing: the panel holds every line it shows.
+        app.report_results_body = inner;
+        app.report_results_first_line = 0;
+        app.reports[idx].results_pinned_text = Vec::new();
         return;
     }
 
@@ -4304,16 +4343,26 @@ fn draw_report_results(
             &lines[1..],
             th,
         );
+        // The panel was fed `lines[1..]` into `body_area`, so that — not the
+        // whole inner rect — is what a click has to be measured against.
+        app.report_results_body = body_area;
+        app.report_results_first_line = 1;
+        app.reports[idx].results_pinned_text = pinned_lines.iter().map(line_text).collect();
         (inner, bar)
     } else {
-        draw_report_panel(
+        let (inner, bar) = draw_report_panel(
             f,
             area,
             block,
             &mut app.reports[idx].results_panel,
             &lines,
             th,
-        )
+        );
+        app.report_results_body = inner;
+        app.report_results_first_line = 0;
+        // Nothing is pinned: every line the pane shows is in the panel.
+        app.reports[idx].results_pinned_text = Vec::new();
+        (inner, bar)
     };
     app.report_pane_areas[ReportPane::Results.idx()] = inner;
     app.report_pane_bars[ReportPane::Results.idx()] = bar;
@@ -4328,6 +4377,13 @@ fn draw_report_results(
         MouseHitTarget::FocusPane(Pane::Main),
     );
     app.push_mouse_hit(MouseLayer::Base, inner, MouseHitTarget::ReportResultsCell);
+}
+
+/// A rendered [`Line`]'s text, with its styling dropped — a line carries its
+/// text in per-style pieces, and anything leaving for the clipboard (or a test
+/// assertion) wants it back in one piece.
+fn line_text(l: &Line<'static>) -> String {
+    l.spans.iter().map(|sp| sp.content.as_ref()).collect()
 }
 
 /// The lines pinned above the results grid: one metric line per ground-truthed
@@ -4376,7 +4432,7 @@ fn results_head_lines(
                     label,
                 ));
                 spans.push(Span::styled(
-                    format!("{}  ", mv.regressed),
+                    format!("{}", mv.regressed),
                     // A regression is the one figure here anybody is scanning
                     // for, so it is the one that stays plain when it is zero:
                     // red on a `0` teaches the eye to ignore the colour.
@@ -4387,9 +4443,14 @@ fn results_head_lines(
                     },
                 ));
             }
+            // The gap belongs to the segment that follows, not the one before
+            // it: "Nothing moved" ends a phrase rather than a figure, and
+            // hanging the space off the figures instead ran it straight into
+            // the next label ("Nothing movedStill wrong 33") whenever the two
+            // met — which is exactly the run a still report with failures has.
             if mv.still_wrong > 0 {
                 spans.push(Span::styled(
-                    format!("{} ", s.report_metric_still_wrong),
+                    format!("  {} ", s.report_metric_still_wrong),
                     label,
                 ));
                 spans.push(Span::styled(format!("{}", mv.still_wrong), value));
@@ -4461,12 +4522,7 @@ pub(crate) fn results_head_text(rt: &ReportTab, s: &Strings) -> Vec<String> {
     let th = crate::tui::theme::theme(&crate::i18n::Language::English);
     results_head_lines(result, &header, s, &th)
         .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|sp| sp.content.as_ref())
-                .collect::<String>()
-        })
+        .map(line_text)
         .collect()
 }
 
@@ -5186,11 +5242,19 @@ fn binding_lines<'a>(app: &'a TuiApp, idx: usize, s: &'a Strings, th: &Theme) ->
     // session, so without this the chosen values would be invisible after the
     // box closes.
     if app.report_has_params(idx) {
+        // The hint goes *in front of* the values, not after them. The values
+        // are a list of arbitrary length — one long FILES_DIR is enough to
+        // wrap the line — and a trailing hint is the part that gets pushed
+        // onto the next row and split ("… p to" / "change"), which reads as a
+        // stray fragment rather than as the key it names. Leading, it sits at
+        // a fixed place on the first row and only the values wrap.
         let mut spans = vec![
             Span::styled(
-                format!("{}:", s.param_summary_prefix),
+                format!("{} (", s.param_summary_prefix),
                 Style::default().fg(th.dim),
             ),
+            Span::styled(s.param_summary_hint, Style::default().fg(th.accent)),
+            Span::styled("):", Style::default().fg(th.dim)),
             Span::raw(" "),
         ];
         spans.extend(app.report_param_spans(idx, s, th));
@@ -5202,11 +5266,6 @@ fn binding_lines<'a>(app: &'a TuiApp, idx: usize, s: &'a Strings, th: &Theme) ->
                 Style::default().fg(th.accent),
             ));
         }
-        spans.push(Span::styled("  ", Style::default().fg(th.dim)));
-        spans.push(Span::styled(
-            s.param_summary_hint,
-            Style::default().fg(th.accent),
-        ));
         lines.push(Line::from(spans));
     }
     lines

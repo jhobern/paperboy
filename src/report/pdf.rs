@@ -105,8 +105,22 @@ impl ReportWriter for PdfWriter {
         // behaves exactly as in the other exports.
         let (columns, _detail) = super::detail::split_columns(&all_columns);
         let widths = column_widths(&columns, result);
+        // A stopped run is said in the title line, which is the one piece of
+        // text on the page that isn't a cell — and, unlike a banner, appears
+        // wherever the document's first page does. ASCII only: the built-in
+        // Helvetica metrics this module wraps against cover 32..=126, so an
+        // em-dash here would be measured as a missing glyph.
+        let title = match &result.partial {
+            Some(partial) => format!(
+                "{} - PARTIAL: {} of {} rows ran",
+                title_of(header),
+                partial.rows_completed,
+                partial.rows_planned
+            ),
+            None => title_of(header),
+        };
         let doc = Layout {
-            title: title_of(header),
+            title,
             columns: &columns,
             widths: &widths,
             result,

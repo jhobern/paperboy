@@ -771,6 +771,7 @@ impl ReportEditor {
                     params: chosen,
                     sink: None,
                     shuffle: None,
+                    cancel: None,
                 };
                 let result = run_flow_raw(&inputs.flow, &ctx);
                 // The non-blocking variable-availability warnings are worth

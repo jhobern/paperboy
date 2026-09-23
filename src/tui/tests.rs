@@ -22706,17 +22706,24 @@ fn report_results_grid_supports_mouse_selection_and_copy() {
         "results area must render"
     );
 
-    // Click-drag across the header row, then release.
+    // Click-drag across a scrolling row, then release. The row has to be one
+    // the panel actually holds: the header (and any metric summary) is pinned
+    // above it and painted over the panel, so there is nothing there to select.
+    let drag_row = app.report_results_body.y;
+    assert!(
+        drag_row > area.y,
+        "the header is pinned, so the rows start below the pane's first line"
+    );
     app.on_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: area.x,
-        row: area.y,
-        modifiers: KeyModifiers::NONE,
+        row: drag_row,
+        modifiers: KeyModifiers::ALT,
     });
     app.on_mouse(MouseEvent {
         kind: MouseEventKind::Drag(MouseButton::Left),
         column: area.x + area.width - 1,
-        row: area.y,
+        row: drag_row,
         modifiers: KeyModifiers::NONE,
     });
     assert!(
@@ -22726,7 +22733,7 @@ fn report_results_grid_supports_mouse_selection_and_copy() {
     app.on_mouse(MouseEvent {
         kind: MouseEventKind::Up(MouseButton::Left),
         column: area.x + area.width - 1,
-        row: area.y,
+        row: drag_row,
         modifiers: KeyModifiers::NONE,
     });
     assert!(
@@ -26131,6 +26138,60 @@ fn the_run_keys_reach_an_embedded_report_from_the_tree() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The questions a run stops at own the keyboard from wherever they were
+/// opened. `r` on the tree puts them up without moving focus, so gating the
+/// report key map on body focus left a box on screen whose arrow keys walked
+/// the tree behind it instead of moving between the rows being asked about.
+#[test]
+fn the_run_settings_capture_the_keyboard_from_the_tree() {
+    let (mut app, ci, root) = workspace_with_reports();
+    std::fs::write(
+        root.join("alpha.trail"),
+        "# name: Alpha\n# collection: api.hurl\nPARAM TEXT TICKET\nPARAM CHOICE(\"au\", \"eu\") REGION = \"au\"\nREPORT REQUEST Oauth\n",
+    )
+    .unwrap();
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+    );
+    select_row(&mut app, ci, alpha);
+    assert_eq!(app.focus, super::app::Pane::List, "focus is on the tree");
+    let idx = app.active_report_index().expect("a report is shown");
+
+    press(&mut app, KeyCode::Char('r'));
+    assert!(
+        app.reports[idx].params_open,
+        "Run from the tree stops at the questions"
+    );
+    let row_before = app.collections[ci].list_cursor;
+    assert_eq!(app.reports[idx].param_selected, 0);
+
+    press(&mut app, KeyCode::Down);
+    assert_eq!(
+        app.reports[idx].param_selected, 1,
+        "Down moves between the questions, not the tree"
+    );
+    assert_eq!(
+        app.collections[ci].list_cursor, row_before,
+        "the tree behind the box did not move"
+    );
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.reports[idx].param_selected, 0);
+    assert_eq!(app.collections[ci].list_cursor, row_before);
+
+    // Esc is the way out, and hands the tree its keys straight back.
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.reports[idx].params_open, "Esc puts the questions away");
+    press(&mut app, KeyCode::Down);
+    assert_ne!(
+        app.collections[ci].list_cursor, row_before,
+        "the tree moves again once the box is gone"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Enter on a report row opens the report's node editor (the report equivalent
 /// of a request's edit wizard) and moves focus into the report body — the
 /// report is already shown by the highlight, so Enter is the "edit it" action.
@@ -26300,8 +26361,13 @@ fn the_binding_panel_names_the_run_settings_and_how_to_open_them() {
     let text = squashed(&buffer_text(term.backend().buffer()));
 
     assert!(
-        text.contains(&format!("{}:", s.param_summary_prefix)),
-        "the summary is labelled with the same words as the box it opens: {text}"
+        text.contains(&format!(
+            "{} ({}):",
+            s.param_summary_prefix, s.param_summary_hint
+        )),
+        "the summary is labelled with the same words as the box it opens, and \
+         names the key up front so a long value can't wrap the hint off the \
+         end of the line: {text}"
     );
     assert!(
         text.contains("REGION=au"),
@@ -26314,6 +26380,41 @@ fn the_binding_panel_names_the_run_settings_and_how_to_open_them() {
     assert!(
         text.contains(s.param_summary_hint),
         "the line says what to press: {text}"
+    );
+}
+
+/// The key that opens the box is named *before* the values, so a long answer
+/// can't push it off the end of the line. A single directory path is enough to
+/// wrap the summary, and the hint used to be the part that wrapped — arriving
+/// as "p to" on one row and "change" on the next.
+#[test]
+fn a_long_answer_cannot_wrap_the_run_settings_hint_in_half() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = report_app();
+    let s = crate::i18n::Strings::for_language(&app.language);
+    let idx = app.active_report_index().unwrap();
+    let id = app.reports[idx].report.id;
+    app.set_report_param(
+        id,
+        "TICKET",
+        "/home/somebody/Development/a_rather_long_input_directory/absolute".into(),
+    );
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let screen = buffer_text(term.backend().buffer());
+
+    assert!(
+        screen.contains("a_rather_long_input_directory"),
+        "the long answer is on screen, so the line really does wrap: {screen}"
+    );
+    // Anchored to the label, not to the end of the values: whichever row names
+    // the settings is the row that says which key changes them, whole.
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains(s.param_summary_prefix) && l.contains(s.param_summary_hint)),
+        "the hint stays with the label it belongs to, on one row: {screen}"
     );
 }
 
@@ -27670,8 +27771,10 @@ fn mouse_click_row_maps_to_correct_data_row_by_rendered_position() {
     );
 }
 
-/// Clicking the header row (area.y in the inner rect) must NOT consume the
-/// click — `cell_cursor` stays None and text-selection still works.
+/// Clicking the pinned header row must NOT select a cell — and must not start
+/// a text selection either. The header is painted *over* the results panel, so
+/// the panel's first line is the first *data* row: a selection begun there
+/// highlighted the header while the clipboard got the row hidden behind it.
 #[test]
 fn mouse_click_on_header_row_does_not_select_a_cell() {
     use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -27701,13 +27804,135 @@ fn mouse_click_on_header_row_does_not_select_a_cell() {
         app.reports[idx].cell_cursor.is_none(),
         "clicking the header row must not set cell_cursor"
     );
-    // It also must not break text-selection: the results panel should have
-    // begun a selection (has an active region).
+    // And no phantom selection: the pinned row holds no text the panel knows
+    // about, so there is nothing there to select.
     assert!(
-        app.has_any_selection(),
-        "clicking the header row must fall through to text-selection"
+        !app.has_any_selection(),
+        "a pinned row must not begin a selection over the data row behind it"
     );
     let _ = term;
+}
+
+/// A ground-truthed run pins a metric summary above the column headers, so the
+/// first scrolling row is several rows down the pane. Clicking a row has to
+/// follow what is *on screen*: with the pinned band unaccounted for, every
+/// click landed `pinned` rows further down the data than the row under the
+/// cursor — and clicks on the summary itself were treated as cells.
+#[test]
+fn clicks_under_a_pinned_summary_land_on_the_row_the_user_sees() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = truthed_report_app();
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    assert!(area.height > 4, "the pane is on screen at this size");
+    // This fixture is scored, so there really is a band pinned above the rows.
+    let pinned = app.reports[idx].results_pinned_text.clone();
+    assert!(
+        pinned.len() > 1 && pinned.iter().any(|l| l.contains("Movement")),
+        "the summary and the header are the pinned band: {pinned:?}"
+    );
+    assert_eq!(
+        app.report_results_body.y as usize,
+        area.y as usize + pinned.len(),
+        "the scrolling rows start below everything pinned"
+    );
+
+    let buf = term.backend().buffer();
+    let row_text = |screen_row: u16| -> String {
+        (area.x..area.x + area.width)
+            .map(|x| buf[(x, screen_row)].symbol().to_string())
+            .collect()
+    };
+    // Data row 1 is the only row whose Verdict cell reads "fail".
+    let screen_row = (area.y..area.y + area.height)
+        .find(|&r| row_text(r).contains("fail"))
+        .expect("row b is on screen");
+
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 1,
+        row: screen_row,
+        modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+    });
+    assert_eq!(
+        app.reports[idx].cell_cursor.map(|(r, _)| r),
+        Some(1),
+        "the click selects the row it was made on, not one further down"
+    );
+}
+
+/// The pinned summary is painted over the results panel, so it is in no
+/// panel's text: a drag across it used to highlight the summary and copy the
+/// data row hidden behind it. Nothing there is selectable, and nothing there
+/// is a cell.
+#[test]
+fn dragging_across_the_pinned_summary_selects_nothing() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = truthed_report_app();
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    let buf = term.backend().buffer();
+    let summary_row = (area.y..area.y + area.height)
+        .find(|&r| {
+            (area.x..area.x + area.width)
+                .map(|x| buf[(x, r)].symbol().to_string())
+                .collect::<String>()
+                .contains("Movement")
+        })
+        .expect("the movement summary is on screen");
+
+    let ev = |kind, row| MouseEvent {
+        kind,
+        column: area.x + 2,
+        row,
+        modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+    };
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), summary_row));
+    app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), summary_row));
+    app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), summary_row));
+    assert!(
+        !app.has_any_selection(),
+        "a drag over the pinned summary highlights nothing, because it would \
+         have copied the row behind it"
+    );
+    assert!(
+        app.reports[idx].cell_cursor.is_none(),
+        "and the summary is not a cell either"
+    );
+}
+
+/// `y` over the results grid copies the table as it reads on screen — the
+/// score and the column names included. They are pinned above the scrolling
+/// rows and so belong to no panel, and a copy that dropped them handed over a
+/// block of values with nothing saying what any column was.
+#[test]
+fn copying_the_results_grid_includes_the_pinned_summary_and_header() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _idx) = truthed_report_app();
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let text = app
+        .report_whole_view_text()
+        .expect("the results view has text to copy");
+    assert!(
+        text.contains("Movement"),
+        "the score leads the copy: {text}"
+    );
+    assert!(
+        text.contains("Verdict"),
+        "the column names come with it: {text}"
+    );
+    assert!(text.contains("fail"), "and the rows themselves: {text}");
 }
 
 /// #9: the grid's column-header row stays pinned at the top of the pane while
@@ -32076,6 +32301,44 @@ fn the_results_view_says_what_moved_since_the_baseline() {
     );
 }
 
+/// The one line that has to hold two phrases at once — a run where nothing
+/// moved but rows are still wrong — keeps them apart. Its separators used to
+/// hang off the *figures*, and a phrase has no figure to hang one off, so the
+/// two ran together as "Nothing movedStill wrong 33".
+#[test]
+fn a_still_run_with_failures_keeps_its_two_phrases_apart() {
+    use crate::report::model::Trend;
+    let (mut app, idx) = truthed_report_app();
+    let s = Strings::english();
+    if let Some(res) = app.reports[idx].result.as_mut() {
+        // Nothing moved (no fix, no regression) and a row is still wrong —
+        // both halves of the line at once.
+        res.trends.clear();
+        res.trends.insert((0, "Verdict".into()), Trend::Unchanged);
+        res.trends.insert((2, "Verdict".into()), Trend::StillWrong);
+    }
+    let text = crate::tui::reports::results_head_text(&app.reports[idx], &s);
+    let line = text
+        .iter()
+        .find(|l| l.starts_with("Movement"))
+        .expect("a baseline means a movement line");
+    assert!(
+        !line.contains(&format!(
+            "{}{}",
+            s.report_metric_nothing_moved, s.report_metric_still_wrong
+        )),
+        "the two phrases must not run together: {line:?}"
+    );
+    assert!(
+        line.contains(&format!(
+            "{}  {}",
+            s.report_metric_nothing_moved, s.report_metric_still_wrong
+        )),
+        "they are separated like every other pair on the line: {line:?}"
+    );
+    assert!(line.ends_with('1'), "and the count still ends it: {line:?}");
+}
+
 /// The filter is reported in the results panel's *title*, not as a line inside
 /// the grid: it describes the pane rather than the run, and a row of prose
 /// above the table costs a row of the table on every screen. The key that
@@ -35550,5 +35813,147 @@ fn hurl_view_shows_the_generated_block_as_a_section() {
         fg_at_substr(&buf, "# Demo"),
         Some(th.computed),
         "an ordinary comment is still an ordinary comment:\n{text}"
+    );
+}
+
+/// A filter leaves the grid shorter than the run: the rows it hid are still in
+/// the result, but they are not on screen, and the cursor counts what is on
+/// screen. Clicking the empty pane below the last visible row used to select
+/// one of them — a highlight nobody could see, over a row nobody had asked for.
+#[test]
+fn clicks_below_a_filtered_grid_select_nothing() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = truthed_report_app();
+    app.reports[idx].results_filter = crate::report::filter::RowFilter::Incorrect;
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let visible = app.reports[idx].visible_result_rows();
+    assert_eq!(
+        visible.len(),
+        1,
+        "the filter really does hide rows: {visible:?}"
+    );
+    let body = app.report_results_body;
+    assert!(
+        body.height > 2,
+        "there is empty pane under the one row shown"
+    );
+
+    let click = |app: &mut TuiApp, row: u16| {
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: body.x + 1,
+            row,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        });
+    };
+
+    click(&mut app, body.y);
+    assert_eq!(
+        app.reports[idx].cell_cursor.map(|(r, _)| r),
+        Some(0),
+        "the one row on screen is row 0, whatever its index in the run"
+    );
+
+    app.reports[idx].cell_cursor = None;
+    for row in body.y + 1..body.y + body.height {
+        click(&mut app, row);
+        assert_eq!(
+            app.reports[idx].cell_cursor, None,
+            "the blank pane at row {row} is not a cell"
+        );
+    }
+}
+
+/// A drill-down popup exists to show one cell's whole value — often a response
+/// body of a few hundred lines. Copying all of it to get one field is not
+/// selecting, so the popup answers to the same drag-to-select, release-to-copy
+/// gesture as the panes behind it.
+#[test]
+fn dragging_in_the_cell_popup_selects_part_of_the_value() {
+    use crate::report::model::{ReportResult, ReportRow};
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let mut row = ReportRow::default();
+    row.cells
+        .insert("Body".to_string(), "alpha\nbeta\ngamma".to_string());
+    app.reports[idx].result = Some(ReportResult {
+        rows: vec![row],
+        column_order: vec!["Body".to_string()],
+        no_match_marker: String::new(),
+        ..Default::default()
+    });
+    app.reports[idx].view = super::reports::ReportView::Results;
+    press(&mut app, KeyCode::Enter); // cursor to (0, 0)
+    press(&mut app, KeyCode::Enter); // open the popup
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.report_cell_popup_area;
+    assert!(
+        area.width > 0 && area.height > 2,
+        "the popup drew its text somewhere: {area:?}"
+    );
+
+    let mouse = |app: &mut TuiApp, kind, x: u16, y: u16| {
+        app.on_mouse(MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+    // Drag from the start of "alpha" to the end of "beta": two lines of three.
+    mouse(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        area.x,
+        area.y,
+    );
+    mouse(
+        &mut app,
+        MouseEventKind::Drag(MouseButton::Left),
+        area.x + 4,
+        area.y + 1,
+    );
+    mouse(
+        &mut app,
+        MouseEventKind::Up(MouseButton::Left),
+        area.x + 4,
+        area.y + 1,
+    );
+
+    let Some(Overlay::ReportCellPopup { panel, .. }) = &app.overlay else {
+        panic!("the popup stays open through a drag");
+    };
+    let selected = panel.selected_text(None).unwrap_or_default();
+    assert!(
+        selected.contains("alpha") && selected.contains("beta"),
+        "the dragged-over lines are selected: {selected:?}"
+    );
+    assert!(!selected.contains("gamma"), "and only those: {selected:?}");
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::Copied)),
+        "releasing the drag copies it, as it does in every other panel"
+    );
+
+    // Shift+Arrow adjusts the end of that selection rather than scrolling.
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+    let Some(Overlay::ReportCellPopup { panel, .. }) = &app.overlay else {
+        panic!("the popup stays open");
+    };
+    assert!(
+        panel
+            .selected_text(None)
+            .unwrap_or_default()
+            .contains("gamma"),
+        "Shift+Down reaches the next line"
     );
 }
