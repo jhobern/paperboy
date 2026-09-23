@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.6.4] - 2026-09-23
+
+### Added
+
+- **The cell drill-down popup's text is selectable.** Opening a result cell to
+  read a 200-line response body and then being able to copy only the whole of
+  it was not selecting. Drag with the mouse to select, Alt+Drag to add a second
+  region, `Shift`+arrows to extend from the keyboard, release to copy — the
+  same gestures the panes behind the popup already answered to, so the popup is
+  no longer the one place where the mouse stops working.
+
+### Fixed
+
+- **A click below the last row of a filtered result grid selects nothing.** The
+  bounds check counted *all* the result's rows rather than the visible ones, so
+  with a row filter up, clicking the empty space under the grid moved the cell
+  cursor onto a row that wasn't on screen. The cursor is a visible-row index
+  everywhere else; now it is here too.
+
+### Changed
+
+- `tui-panel-select` 0.2: the drag-to-select gesture in the popup is now driven
+  by the crate's own `MultiSelectPanel::handle_mouse` instead of being wired up
+  here. The report and main views keep their hand-written wiring, because there
+  the selection spans several panels and the clearing and copying are decisions
+  above any one of them.
+
+
 ## [0.6.3] - 2026-09-23
 
 ### Added

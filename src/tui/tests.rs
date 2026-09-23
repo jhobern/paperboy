@@ -35815,3 +35815,145 @@ fn hurl_view_shows_the_generated_block_as_a_section() {
         "an ordinary comment is still an ordinary comment:\n{text}"
     );
 }
+
+/// A filter leaves the grid shorter than the run: the rows it hid are still in
+/// the result, but they are not on screen, and the cursor counts what is on
+/// screen. Clicking the empty pane below the last visible row used to select
+/// one of them — a highlight nobody could see, over a row nobody had asked for.
+#[test]
+fn clicks_below_a_filtered_grid_select_nothing() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = truthed_report_app();
+    app.reports[idx].results_filter = crate::report::filter::RowFilter::Incorrect;
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let visible = app.reports[idx].visible_result_rows();
+    assert_eq!(
+        visible.len(),
+        1,
+        "the filter really does hide rows: {visible:?}"
+    );
+    let body = app.report_results_body;
+    assert!(
+        body.height > 2,
+        "there is empty pane under the one row shown"
+    );
+
+    let click = |app: &mut TuiApp, row: u16| {
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: body.x + 1,
+            row,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        });
+    };
+
+    click(&mut app, body.y);
+    assert_eq!(
+        app.reports[idx].cell_cursor.map(|(r, _)| r),
+        Some(0),
+        "the one row on screen is row 0, whatever its index in the run"
+    );
+
+    app.reports[idx].cell_cursor = None;
+    for row in body.y + 1..body.y + body.height {
+        click(&mut app, row);
+        assert_eq!(
+            app.reports[idx].cell_cursor, None,
+            "the blank pane at row {row} is not a cell"
+        );
+    }
+}
+
+/// A drill-down popup exists to show one cell's whole value — often a response
+/// body of a few hundred lines. Copying all of it to get one field is not
+/// selecting, so the popup answers to the same drag-to-select, release-to-copy
+/// gesture as the panes behind it.
+#[test]
+fn dragging_in_the_cell_popup_selects_part_of_the_value() {
+    use crate::report::model::{ReportResult, ReportRow};
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let mut row = ReportRow::default();
+    row.cells
+        .insert("Body".to_string(), "alpha\nbeta\ngamma".to_string());
+    app.reports[idx].result = Some(ReportResult {
+        rows: vec![row],
+        column_order: vec!["Body".to_string()],
+        no_match_marker: String::new(),
+        ..Default::default()
+    });
+    app.reports[idx].view = super::reports::ReportView::Results;
+    press(&mut app, KeyCode::Enter); // cursor to (0, 0)
+    press(&mut app, KeyCode::Enter); // open the popup
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.report_cell_popup_area;
+    assert!(
+        area.width > 0 && area.height > 2,
+        "the popup drew its text somewhere: {area:?}"
+    );
+
+    let mouse = |app: &mut TuiApp, kind, x: u16, y: u16| {
+        app.on_mouse(MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+    // Drag from the start of "alpha" to the end of "beta": two lines of three.
+    mouse(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        area.x,
+        area.y,
+    );
+    mouse(
+        &mut app,
+        MouseEventKind::Drag(MouseButton::Left),
+        area.x + 4,
+        area.y + 1,
+    );
+    mouse(
+        &mut app,
+        MouseEventKind::Up(MouseButton::Left),
+        area.x + 4,
+        area.y + 1,
+    );
+
+    let Some(Overlay::ReportCellPopup { panel, .. }) = &app.overlay else {
+        panic!("the popup stays open through a drag");
+    };
+    let selected = panel.selected_text(None).unwrap_or_default();
+    assert!(
+        selected.contains("alpha") && selected.contains("beta"),
+        "the dragged-over lines are selected: {selected:?}"
+    );
+    assert!(!selected.contains("gamma"), "and only those: {selected:?}");
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::Copied)),
+        "releasing the drag copies it, as it does in every other panel"
+    );
+
+    // Shift+Arrow adjusts the end of that selection rather than scrolling.
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+    let Some(Overlay::ReportCellPopup { panel, .. }) = &app.overlay else {
+        panic!("the popup stays open");
+    };
+    assert!(
+        panel
+            .selected_text(None)
+            .unwrap_or_default()
+            .contains("gamma"),
+        "Shift+Down reaches the next line"
+    );
+}

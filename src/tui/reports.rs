@@ -18,7 +18,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
-use tui_panel_select::{MultiSelectPanel, WrapMode};
+use tui_panel_select::{Motion, MultiSelectPanel, WrapMode};
 
 use super::app::{
     ConfirmAction, MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, Pane, PromptKind, TuiApp,
@@ -2434,6 +2434,25 @@ impl TuiApp {
                 panel,
             });
         };
+        // Shift+Arrow moves the *end* of the selection, exactly as it does in
+        // the panes behind the popup — the keyboard half of the same gesture,
+        // and the way to adjust a drag without redoing it.
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && let Some(motion) = match key.code {
+                KeyCode::Left => Some(Motion::Left),
+                KeyCode::Right => Some(Motion::Right),
+                KeyCode::Up => Some(Motion::Up),
+                KeyCode::Down => Some(Motion::Down),
+                _ => None,
+            }
+        {
+            let area = self.report_cell_popup_area;
+            if area.width > 0 && area.height > 0 {
+                panel.extend(motion, area);
+            }
+            keep(self, title, content, panel);
+            return;
+        }
         match key.code {
             // Esc closes the popup.
             KeyCode::Esc => {}

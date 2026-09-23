@@ -37,7 +37,7 @@ const PREF_DISCARD_ON_ESC: usize = 6;
 const PREF_DEFAULT_VIEW: usize = 7;
 use crate::tui::clipboard::copy_to_clipboard;
 use tui_panel_select::wrapcache::TextPos;
-use tui_panel_select::{Motion, MultiSelectPanel};
+use tui_panel_select::{Motion, MouseConfig, MultiSelectPanel};
 
 /// The entry index a Requests-list row addresses, or `None` for a folder or
 /// "up" row.
@@ -247,6 +247,11 @@ impl TuiApp {
             self.last_mouse_row = None;
         }
         if self.overlay.is_some() {
+            // The cell drill-down popup holds a selectable panel like any
+            // other: the value it shows is the whole point of opening it, and
+            // copying all of a 200-line response body to get one field is not
+            // selecting.
+            self.on_mouse_cell_popup(ev);
             return;
         }
         // The full-screen report view has its own three panels (source /
@@ -280,6 +285,10 @@ impl TuiApp {
                 if let Some(pane) = pane {
                     self.focus = pane;
                 }
+                // Two panels share one selection here, so the panel's own
+                // `handle_mouse` isn't enough: which panel holds the live
+                // region, and whether a click clears the *other* one, are
+                // decisions above either of them.
                 if ev.modifiers.contains(KeyModifiers::ALT) {
                     // Alt+Click *adds* a region: finalize whichever panel
                     // currently holds the live one (keeping it, and any
@@ -1048,6 +1057,9 @@ impl TuiApp {
                 {
                     return;
                 }
+                // Three panels, one selection between them — as in the main
+                // view, the clearing and the copying span panels, so this
+                // stays hand-wired rather than going through `handle_mouse`.
                 if ev.modifiers.contains(KeyModifiers::ALT) {
                     // Alt+Click adds a region: finalize the live one first.
                     if let Some(active) = self.active_report_selection_pane()
@@ -1139,7 +1151,14 @@ impl TuiApp {
             return false;
         }
         let data_row = grid_line - 1;
-        if data_row >= result.rows.len() {
+        // The cursor counts rows *on screen*, as the keyboard and the popup do:
+        // with a filter up the grid holds fewer rows than the run did, and the
+        // lines below the last one — blank pane, or a `STATISTICS` summary row,
+        // which is not a data row either — belong to no cell at all. Bounding
+        // this against the run's own row count instead let a click on empty
+        // space select a row that wasn't being shown.
+        let visible = self.reports[idx].visible_result_rows();
+        if data_row >= visible.len() {
             return false;
         }
         let header = self.reports[idx]
@@ -1150,8 +1169,7 @@ impl TuiApp {
         // Reuse the same column-width computation as the renderer so the click
         // lands on the right column.
         let x_off = (col as usize).saturating_sub(area.x as usize);
-        let widths =
-            result_column_widths(result, &header, &self.reports[idx].visible_result_rows());
+        let widths = result_column_widths(result, &header, &visible);
         let n_cols = widths.len();
         if n_cols == 0 {
             return false;
@@ -1232,6 +1250,50 @@ impl TuiApp {
             rt.source_panel.clear();
             rt.validation_panel.clear();
             rt.results_panel.clear();
+        }
+    }
+
+    /// Mouse selection inside the report cell drill-down popup: drag to
+    /// select, Alt+Drag to add a second region, release to copy — the same
+    /// gestures the panes behind it answer to, so the popup isn't a place
+    /// where the mouse stops working.
+    ///
+    /// A click outside the popup's text is left alone rather than clearing the
+    /// selection: the popup is small and centred, so "outside" is usually the
+    /// border or the view behind it, and losing a selection to a stray click
+    /// there would be the opposite of what the click was for.
+    fn on_mouse_cell_popup(&mut self, ev: MouseEvent) {
+        let area = self.report_cell_popup_area;
+        let copy_on_release =
+            matches!(ev.kind, MouseEventKind::Up(MouseButton::Left)) && self.mouse_drag_moved;
+        let Some(Overlay::ReportCellPopup { panel, .. }) = self.overlay.as_mut() else {
+            return;
+        };
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        if matches!(ev.kind, MouseEventKind::Drag(MouseButton::Left)) {
+            self.mouse_drag_moved = true;
+        }
+        // The panel drives the whole gesture. `copy_on_release` stays off
+        // because every copy in this app has to go through our clipboard
+        // wrapper (which pins the mode under test); the crate would call its
+        // own, unpinned, and the suite would reach the real clipboard.
+        let config = MouseConfig {
+            copy_on_release: false,
+            clear_on_outside_click: false,
+            add_region_modifier: Some(KeyModifiers::ALT),
+        };
+        panel.handle_mouse(ev, area, &config);
+        let copied = match copy_on_release {
+            true => panel.selected_text(None).filter(|t| !t.is_empty()),
+            false => None,
+        };
+        // Copying is the reason to select at all, and the release is where the
+        // rest of the app does it — but the clipboard call needs `self` back.
+        if let Some(text) = copied {
+            crate::tui::clipboard::copy_to_clipboard(&text);
+            self.status = Some(crate::i18n::Status::Copied);
         }
     }
 

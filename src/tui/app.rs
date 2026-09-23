@@ -1360,6 +1360,11 @@ pub struct TuiApp {
     /// grid's header row is pinned (the panel was fed `lines[1..]`), `0`
     /// otherwise (the panel holds the header too, unscrolled past).
     pub(crate) report_results_first_line: usize,
+    /// The inner rect the report cell drill-down popup's text was last drawn
+    /// into, so a drag across it can be measured the way the panes behind it
+    /// are. The popup is an overlay drawn over whatever the view already had,
+    /// so its geometry exists nowhere else.
+    pub(crate) report_cell_popup_area: Rect,
     /// Set while dragging a report panel's scrollbar thumb (which panel), so a
     /// `Drag` keeps adjusting its scroll even if the cursor leaves the
     /// one-column track. Cleared on `Up`.
@@ -1628,6 +1633,7 @@ impl Default for TuiApp {
             report_pane_bars: [Rect::default(); 3],
             report_results_body: Rect::default(),
             report_results_first_line: 0,
+            report_cell_popup_area: Rect::default(),
             report_scrollbar_drag: None,
             prompt_editor_area: Rect::default(),
             list_scroll_w: std::cell::Cell::new(0),

@@ -1994,8 +1994,13 @@ fn paint_selection_highlight(f: &mut Frame, app: &TuiApp, th: &Theme) {
                 .highlight_regions(app.report_results_body),
         );
     }
+    paint_regions(f, &cells, style);
+}
+
+/// Restyle every screen cell a panel's selection covers.
+fn paint_regions(f: &mut Frame, cells: &[(u16, u16, u16)], style: Style) {
     let buf = f.buffer_mut();
-    for (row, from, to) in cells {
+    for &(row, from, to) in cells {
         for col in from..to {
             if let Some(cell) = buf.cell_mut((col, row)) {
                 cell.set_style(style);
@@ -5083,6 +5088,19 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
     }) = app.overlay.as_mut()
     {
         let inner = super::reports::draw_result_cell_popup_overlay(f, title, content, panel, s, th);
+        app.report_cell_popup_area = inner;
+        // The popup's own selection has to be painted here rather than with
+        // every other panel's: `paint_selection_highlight` ran before this
+        // overlay was drawn, so anything it painted underneath has just been
+        // covered over.
+        if let Some(Overlay::ReportCellPopup { panel, .. }) = app.overlay.as_ref() {
+            let regions = panel.highlight_regions(inner);
+            paint_regions(
+                f,
+                &regions,
+                Style::default().bg(th.select_bg).fg(th.select_fg),
+            );
+        }
         app.push_mouse_hit(
             MouseLayer::Overlay,
             inner,
