@@ -8,6 +8,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.6.2] - 2026-09-23
+
+### Added
+
+- **`--progress-json`: real-time run events for a program driving PaperBoy.**
+  A headless report (`-r`) can now stream its progress as newline-delimited
+  JSON on stderr — one object per line, flushed as it happens — instead of the
+  human `done/total` counter. It is what an application embedding PaperBoy
+  needs to show a live grid: the same picture the TUI and GUI draw from the
+  same per-row hook, without parsing prose.
+
+  Five events, each carrying `schema` (the stream version, so a consumer can
+  refuse a newer PaperBoy rather than silently mis-read it):
+
+  | Event | When |
+  |-------|------|
+  | `plan` | Once, after the projection pass and before anything is sent: `total` rows and the `columns` they will fill, so the empty grid can be drawn up front. |
+  | `row_started` | A row's requests are in flight. Several are live at once under `PARALLEL`. |
+  | `row_completed` | A row is finished: its `cells`, `ok`, and the `errors` *that row* raised. |
+  | `output_written` | Each `-o` file as it lands (or fails), so a consumer knows which of a part-written set exist. |
+  | `run_finished` | Last line: `warnings`, `skipped`, `errors` and the `exit_code` the process is about to exit with. |
+
+  Every event carries `path`, the row's structural identity (`"0.3"`,
+  `"0.1.2.0"`, `""` for a report with no loop). It is assigned before the run,
+  and is unique and stable however `PARALLEL` workers interleave. Row events
+  also carry `row_index`, the slot that row occupies in the projected grid —
+  and, for a report that doesn't collapse an `ENVS` comparison, the index of
+  its row in a `-o out.json` report. That is what makes the live grid and the
+  finished file explicitly linkable: a consumer can hold a cheap live grid and
+  read the full values from the report at the end.
+
+  Progress stays cheap on purpose: `DETAIL` and `IMAGE` columns (the ones an
+  author has already marked as drill-down content, a raw response body among
+  them) are named in `plan` as `withheld_columns` and left out of every row,
+  as is any cell over 4 KB (named in that row's `withheld`). The same bytes
+  are already going to the report file.
+
+  `--progress-json` replaces the human progress counter rather than
+  interleaving with it, and suppresses the decorative summary when that would
+  also land on stderr (`-o -`), so the stream is nothing but events.
+
+  `run_finished` is emitted unconditionally. A fatal *setup* error — an
+  unreadable collection, a mistyped `--param`, a validation failure — produces
+  no `plan` and no rows, but still closes the stream with `run_finished`,
+  `exit_code: 1` and the diagnostic in `errors`, so the promise of exactly one
+  terminal event holds for every run that starts, and a consumer never has to
+  read prose to learn why a run didn't happen. (A command-line *usage* error
+  is the exception: it is rejected before PaperBoy runs.)
+
+  `--dry-run --progress-json` streams the projected grid in full — `plan` and
+  a `row_started`/`row_completed` pair per row, cells included — without
+  sending a request, so a consumer can draw the grid, or exercise its own
+  parsing, before committing to a real run.
+
+### Changed
+
+- `RowEvent::Completed` now carries the errors raised while producing the row
+  alongside the row itself. The result-level error list is flat — it says that
+  something failed, not which slot to paint red — so a streaming front-end had
+  no way to tell a finished row from a finished-and-broken one until the whole
+  run was over.
+
+
 ## [0.6.1] - 2026-09-23
 
 ### Fixed

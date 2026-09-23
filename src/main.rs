@@ -112,6 +112,7 @@ static AFTER_HELP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 \x20 paperboy -c collection.hurl -r report.trail -o out.csv   Write the report to a file (- = stdout)\n\
 \x20 paperboy -r report.trail -o out.html -o out.json   One run, several formats\n\
 \x20 paperboy -r report.trail --param CASES_DIR=./batch-07   Run a report, setting a PARAM it declares\n\
+\x20 paperboy -r report.trail -o out.json --progress-json   Run a report, streaming JSON progress events to stderr\n\
 \x20 paperboy --postman-import                          List the Postman workspaces your API key can see\n\
 \x20 paperboy --postman-import --postman-workspace ID -o ./API   Download a whole Postman workspace\n\
 \x20 paperboy --postman-import --postman-all -o ./API           Download every workspace the key can see\n\n\
@@ -216,6 +217,18 @@ struct Cli {
         requires = "report"
     )]
     params: Vec<(String, String)>,
+
+    /// With `-r`: stream machine-readable progress as newline-delimited JSON on
+    /// stderr (one event object per line, flushed as it happens) instead of the
+    /// human `done/total` counter. Events: `plan` (row total and column names,
+    /// before anything is sent), `row_started`, `row_completed`,
+    /// `output_written` and a final `run_finished` carrying the exit code.
+    /// Every event carries `schema` (the stream version) and a row `path`
+    /// identifying the slot, which is stable under `PARALLEL`; row events also
+    /// carry `row_index`, the row's position in a `-o out.json` report — so a
+    /// live UI can link the two.
+    #[arg(long, requires = "report")]
+    progress_json: bool,
 
     /// Launch the native graphical UI (eframe/egui) instead of the terminal UI.
     /// Ignored in the headless modes (`-c`/`-r`). Only available when built
@@ -329,6 +342,7 @@ fn main() {
             cli.targets,
             cli.shuffle,
             cli.params.into_iter().collect(),
+            cli.progress_json,
         ));
     }
 

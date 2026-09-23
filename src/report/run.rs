@@ -149,7 +149,20 @@ pub enum RowEvent<'r> {
     /// A row has finished and is fully built (before any outer-scope broadcast
     /// cells or the final comparison/baseline collapse are applied); carries the
     /// row so the front-end can fill and un-grey its slot.
-    Completed(&'r ReportRow),
+    Completed {
+        row: &'r ReportRow,
+        /// The run errors raised while this row was being produced — the same
+        /// strings that end up in [`ReportResult::errors`], narrowed to the ones
+        /// this row is responsible for.
+        ///
+        /// Carried on the event because the result-level list is flat: it says
+        /// *that* something failed but not *which slot* to paint red, and a
+        /// streaming front-end has no other way to tell a finished row from a
+        /// finished-and-broken one until the whole run is over. Empty is the
+        /// row's verdict of "clean", not "unknown" — a row is only announced
+        /// once everything that could fail for it has run.
+        errors: &'r [String],
+    },
 }
 
 /// A per-row streaming hook: called with a [`RowEvent`] as each row starts and
@@ -1475,6 +1488,11 @@ impl<'a> Exec<'a> {
     /// are accumulated and either broadcast into the rows produced by nested
     /// loops or, when the block has no loop, emitted as a single row.
     fn exec_block(&mut self, nodes: &[FlowNode]) -> Vec<ReportRow> {
+        // Where this block's errors start, so the row it emits can be announced
+        // with the errors *it* raised rather than with whatever the run has
+        // accumulated so far (see `RowEvent::Completed`). A fork starts with an
+        // empty list, so on a `PARALLEL` iteration the mark is simply 0.
+        let err_mark = self.errors.len();
         // A block with no nested loop emits exactly one row (a "leaf" block).
         // Signal that row's slot as "running" up front — before any of its
         // requests are sent — so a streaming front-end shows it in flight.
@@ -1591,7 +1609,7 @@ impl<'a> Exec<'a> {
             }
             child_rows
         } else {
-            vec![self.emit_row(own)]
+            vec![self.emit_row(own, err_mark)]
         }
     }
 
@@ -1978,7 +1996,7 @@ impl<'a> Exec<'a> {
     /// keeps the returned rows correct even for reports that follow the loop.
     /// Fires the streaming [`RowSink`] (if any) with the finished row before
     /// returning it, so a live front-end sees each row as it completes.
-    fn emit_row(&self, mut cells: HashMap<String, String>) -> ReportRow {
+    fn emit_row(&self, mut cells: HashMap<String, String>, err_mark: usize) -> ReportRow {
         for (k, v) in &self.broadcast {
             cells.entry(k.clone()).or_insert_with(|| v.clone());
         }
@@ -1992,7 +2010,11 @@ impl<'a> Exec<'a> {
             comparison: self.comparison.clone(),
         };
         if let Some(sink) = self.ctx.sink {
-            sink(RowEvent::Completed(&row));
+            // `run_cleanups` *drains* the errors a teardown raised (they become
+            // warnings), so the list can be shorter than the mark taken when the
+            // block started — clamp rather than slice past the end.
+            let errors = &self.errors[err_mark.min(self.errors.len())..];
+            sink(RowEvent::Completed { row: &row, errors });
         }
         row
     }
@@ -2651,7 +2673,12 @@ impl<'a> Exec<'a> {
                             self.note_column(&k);
                         }
                         if let Some(sink) = self.ctx.sink {
-                            sink(RowEvent::Completed(&row));
+                            // A snapshot row is read from disk, not run: nothing
+                            // could have failed while producing it.
+                            sink(RowEvent::Completed {
+                                row: &row,
+                                errors: &[],
+                            });
                         }
                         rows.push(row);
                     }
@@ -6296,7 +6323,7 @@ mod tests {
         .unwrap();
         let streamed: Mutex<Vec<ReportRow>> = Mutex::new(Vec::new());
         let sink = |ev: RowEvent| {
-            if let RowEvent::Completed(row) = ev {
+            if let RowEvent::Completed { row, .. } = ev {
                 streamed.lock().unwrap().push(row.clone());
             }
         };
@@ -6325,6 +6352,125 @@ mod tests {
                 Some(&"201".to_string()),
                 "streamed row is missing the broadcast outer-report column"
             );
+        }
+    }
+
+    /// A streaming front-end paints one slot per row, so "what went wrong" has
+    /// to arrive per row: the result-level error list is flat and says nothing
+    /// about *which* row to mark. Each event therefore carries the errors that
+    /// row raised — and only those, so the second row of a failing loop isn't
+    /// blamed for the first one's failure as well.
+    #[test]
+    fn a_completed_row_carries_its_own_errors_only() {
+        let fake = Fake::new(&[(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("up", &[])];
+        // `ghost` is in no collection, so every iteration raises exactly one
+        // error of its own while the row is still produced.
+        let flow = parse_flow(
+            "FOR X IN [\"a\", \"b\"]\n    REPORT REQUEST up\n    REPORT REQUEST ghost\nEND\n",
+        )
+        .unwrap();
+        type Announced = Vec<(Vec<(usize, usize)>, Vec<String>)>;
+        let seen: Mutex<Announced> = Mutex::new(Vec::new());
+        let sink = |ev: RowEvent| {
+            if let RowEvent::Completed { row, errors } = ev {
+                seen.lock()
+                    .unwrap()
+                    .push((row.path.clone(), errors.to_vec()));
+            }
+        };
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: Some(&sink),
+            shuffle: None,
+        };
+        let result = run_flow_raw(&flow, &ctx);
+        let seen = seen.into_inner().unwrap();
+
+        assert_eq!(seen.len(), 2, "one event per row");
+        assert_eq!(result.errors.len(), 2, "both iterations failed");
+        for (path, errors) in &seen {
+            assert_eq!(
+                errors.len(),
+                1,
+                "row {path:?} should carry only its own error, got {errors:?}"
+            );
+            assert!(errors[0].contains("ghost"), "{errors:?}");
+        }
+    }
+
+    /// The same, under `PARALLEL` — which is the condition the whole per-row
+    /// error story rests on: an iteration runs on a *fork* whose error list
+    /// starts empty, so the watermark taken when its block begins is 0 and the
+    /// errors it drains are its own. Four iterations are in flight at once and
+    /// each raises exactly one error; were the list shared, whichever rows
+    /// completed later would be blamed for their predecessors' failures too.
+    #[test]
+    fn a_parallel_iterations_errors_stay_with_its_own_row() {
+        let fake = Fake::new(&[(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("up", &[])];
+        let flow = parse_flow(
+            "PARALLEL(4) FOR X IN [\"a\", \"b\", \"c\", \"d\"]\n    REPORT REQUEST up\n    REPORT REQUEST ghost\nEND\n",
+        )
+        .unwrap();
+        type Announced = Vec<(Vec<(usize, usize)>, Vec<String>)>;
+        let seen: Mutex<Announced> = Mutex::new(Vec::new());
+        let sink = |ev: RowEvent| {
+            if let RowEvent::Completed { row, errors } = ev {
+                seen.lock()
+                    .unwrap()
+                    .push((row.path.clone(), errors.to_vec()));
+            }
+        };
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: Some(&sink),
+            shuffle: None,
+        };
+        let result = run_flow_raw(&flow, &ctx);
+        let mut seen = seen.into_inner().unwrap();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(seen.len(), 4, "one event per row");
+        assert_eq!(
+            result.errors.len(),
+            4,
+            "every iteration failed once: {:?}",
+            result.errors
+        );
+        for (path, errors) in &seen {
+            assert_eq!(
+                errors.len(),
+                1,
+                "row {path:?} was blamed for another iteration's failures: {errors:?}"
+            );
+            assert!(errors[0].contains("ghost"), "{errors:?}");
         }
     }
 
@@ -6373,7 +6519,7 @@ mod tests {
             parse_flow("FOR X IN [\"a\", \"b\", \"c\"]\n    REPORT REQUEST send\nEND\n").unwrap();
         let streamed: Mutex<Vec<ReportRow>> = Mutex::new(Vec::new());
         let sink = |ev: RowEvent| {
-            if let RowEvent::Completed(row) = ev {
+            if let RowEvent::Completed { row, .. } = ev {
                 streamed.lock().unwrap().push(row.clone());
             }
         };
@@ -6450,7 +6596,7 @@ mod tests {
             let mut log = events.lock().unwrap();
             match ev {
                 RowEvent::Started(path) => log.push((Kind::Started, path.to_vec())),
-                RowEvent::Completed(row) => log.push((Kind::Completed, row.path.clone())),
+                RowEvent::Completed { row, .. } => log.push((Kind::Completed, row.path.clone())),
             }
         };
         let ctx = RunContext {

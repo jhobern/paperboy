@@ -765,6 +765,63 @@ run with per-row errors, `3` some steps were skipped because something they
 depended on failed, and `2` (clap's) means the command line itself was wrong.
 Progress goes to stderr, so `-o -` leaves stdout clean for a pipe.
 
+#### Watching a run from another program (`--progress-json`)
+
+`--progress-json` replaces the human `done/total` counter with newline-delimited
+JSON on stderr: one event object per line, flushed as it happens, so a caller
+reads it incrementally (`for line in proc.stderr` and an ordinary `json.loads`
+per line — no streaming parser).
+
+```sh
+paperboy -r nightly.trail -o out.json --progress-json 2>events.ndjson
+```
+
+```json
+{"event":"plan","schema":1,"report":"nightly","dry_run":false,"total":2,"columns":["Case","Status"],"withheld_columns":["Raw: Response"]}
+{"event":"row_started","schema":1,"path":"0.0","row_index":0}
+{"event":"row_completed","schema":1,"path":"0.0","row_index":0,"ok":true,"target":null,"cells":{"Case":"a","Status":"200"},"errors":[],"withheld":[]}
+{"event":"output_written","schema":1,"path":"out.json","format":"json","ok":true,"error":null}
+{"event":"run_finished","schema":1,"ok":true,"exit_code":0,"rows":2,"warnings":[],"skipped":[],"errors":[]}
+```
+
+`plan` arrives once, after the projection pass and before a single request is
+sent, so a UI can draw the whole empty grid up front. `row_started` and
+`row_completed` fill it — several rows are in flight at once under `PARALLEL`,
+which is why every row event carries **`path`**: the row's structural identity
+(`"0.3"`, `"0.1.2.0"`, `""` for a report with no loop), assigned before the run
+and stable however the workers interleave. Alongside it, `row_index` is the
+slot that row occupies in the projected grid — and, for a report that doesn't
+collapse an `ENVS` comparison, the index of its row in a `-o out.json` report.
+That is what makes the live grid and the finished file explicitly linkable: a
+consumer can keep progress cheap and read the full values from the report at
+the end. `run_finished` is the last line and carries the exit code the process
+is about to use.
+
+The stream stays cheap deliberately: `DETAIL` and `IMAGE` columns — the ones the
+report itself marks as drill-down content, a raw response body among them — are
+named in `plan` as `withheld_columns` and left out of every row, as is any cell
+over 4 KB (named in that row's `withheld`). Those bytes are already being
+written to the report file; streaming them per row as well would make progress
+cost more than the run.
+
+`schema` is on every event so a consumer can refuse a stream it doesn't
+understand rather than mis-read it. The human progress counter and summary are
+suppressed rather than interleaved (the summary only when it would share stderr,
+i.e. with `-o -`), so the stream is nothing but events.
+
+`run_finished` is unconditional. A fatal *setup* error — an unreadable
+collection, a mistyped `--param`, a validation failure — emits no `plan` and no
+rows, but it still ends the stream with `run_finished`, `exit_code: 1` and the
+diagnostic in `errors`, so a consumer always has exactly one terminal event to
+wait on and never has to parse prose to find out what went wrong. (Only a
+command-line *usage* error is prose: clap rejects it and exits 2 before PaperBoy
+runs at all.)
+
+`--dry-run --progress-json` streams the whole grid too — `plan` and a
+`row_started`/`row_completed` pair per projected row, cells and all — without
+sending a request. It is the cheap way for a consumer to draw the grid, or to
+check its own parsing, before committing to a real run.
+
 #### Dependency graphs
 
 Inside a `GRAPH … END` region the order statements are written in stops being

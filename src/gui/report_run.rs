@@ -282,7 +282,7 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
             if let Ok(tx) = row_tx.lock() {
                 let msg = match ev {
                     RowEvent::Started(path) => RunUpdate::RowStarted(path.to_vec()),
-                    RowEvent::Completed(row) => RunUpdate::Row(Box::new(row.clone())),
+                    RowEvent::Completed { row, .. } => RunUpdate::Row(Box::new(row.clone())),
                 };
                 let _ = tx.send(msg);
             }

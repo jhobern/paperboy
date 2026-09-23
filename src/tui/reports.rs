@@ -1397,7 +1397,7 @@ impl TuiApp {
                             report_id,
                             path: path.to_vec(),
                         },
-                        RowEvent::Completed(row) => ReportRunUpdate::Row {
+                        RowEvent::Completed { row, .. } => ReportRunUpdate::Row {
                             report_id,
                             row: Box::new(row.clone()),
                         },
