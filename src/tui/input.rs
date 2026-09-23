@@ -1065,7 +1065,16 @@ impl TuiApp {
                     // difference between the keyboard following the click and
                     // it staying on the tree.
                     self.focus = Pane::Main;
-                    let area = self.report_pane_area(pane);
+                    let area = self.report_selection_area(pane);
+                    // A click on the results grid's pinned band (the metric
+                    // summary and the header row) is not on the panel's text at
+                    // all — those lines are painted over the top of it. Starting
+                    // a selection there anyway clamped it onto the first
+                    // scrolling row, so the summary highlighted while the
+                    // clipboard quietly got the data row hidden behind it.
+                    if area.height == 0 || !area.contains(Position::new(ev.column, ev.row)) {
+                        return;
+                    }
                     if let Some(panel) = self.report_panel_mut(pane) {
                         panel.begin(area, (ev.column, ev.row));
                     }
@@ -1098,40 +1107,38 @@ impl TuiApp {
     /// the click was consumed (landed on a valid data cell); `false` means the
     /// click should fall through to the text-selection handler.
     ///
-    /// Geometry: `report_pane_areas[Results]` is set to `inner` (the rect
-    /// returned by `block.inner(area)`), meaning the border has already been
-    /// stripped. When a result is shown the header row (grid line 0) is *pinned*
-    /// at inner row 0 and only the data rows below it scroll, so
-    /// `results_panel.scroll()` is a DATA-ROW offset. Therefore:
-    ///   y_off = row − area.y
-    ///   y_off == 0            → the pinned header row (fall through to select)
-    ///   data_row = (y_off − 1) + scroll   (for y_off >= 1)
+    /// Geometry: the rows that scroll are `report_results_body`, which is the
+    /// pane's inner rect minus everything pinned above it — the metric summary
+    /// (nothing, or a line per ground-truthed column) and then the grid's
+    /// header row. `results_panel.scroll()` counts lines of *that* panel, whose
+    /// first line is grid line `report_results_first_line`. So:
+    ///   grid_line = (row − body.y) + scroll + first_line
+    ///   grid line 0 is the header; data row `n` is grid line `n + 1`
+    /// A click above `body` is on the pinned band and falls through.
     fn on_mouse_results_cell_click(&mut self, col: u16, row: u16) -> bool {
         let Some(idx) = self.active_report_index() else {
             return false;
         };
         let area = self.report_pane_areas[ReportPane::Results.idx()];
-        if area.width == 0 || area.height == 0 {
+        let body = self.report_results_body;
+        if area.width == 0 || area.height == 0 || body.width == 0 || body.height == 0 {
             return false;
         }
-        // The pane_at check already confirmed the click is inside the inner
-        // rect, but guard defensively against underflow.
-        if row < area.y {
-            return false;
-        }
-        let y_off = (row - area.y) as usize;
-        if y_off >= area.height as usize {
+        // The pinned band (and anything past the last rendered row) is not a
+        // cell; fall through to the text-selection path.
+        if row < body.y || row >= body.y.saturating_add(body.height) {
             return false;
         }
         let Some(result) = &self.reports[idx].result else {
             return false;
         };
-        if y_off == 0 {
-            // Pinned header row — fall through to text selection.
+        let scroll = self.reports[idx].results_panel.scroll() as usize;
+        let grid_line = (row - body.y) as usize + scroll + self.report_results_first_line;
+        // Grid line 0 is the header row — only reachable when it isn't pinned.
+        if grid_line == 0 {
             return false;
         }
-        let scroll = self.reports[idx].results_panel.scroll() as usize;
-        let data_row = (y_off - 1) + scroll;
+        let data_row = grid_line - 1;
         if data_row >= result.rows.len() {
             return false;
         }
@@ -1177,8 +1184,19 @@ impl TuiApp {
             .find(|p| self.report_pane_bars[p.idx()].contains(point))
     }
 
-    fn report_pane_area(&self, pane: ReportPane) -> Rect {
-        self.report_pane_areas[pane.idx()]
+    /// The screen rect a report panel's *selectable text* occupies — what
+    /// `begin`/`drag`/`extend` measure a point against.
+    ///
+    /// For the Source and Validation panes that is simply the pane. The Results
+    /// pane is the exception: its metric summary and grid header are pinned
+    /// above the rows that scroll and are painted by the panel's *caller*, so
+    /// only `report_results_body` holds text the panel knows about. Measuring
+    /// against the whole pane instead shifted every row by the pinned height.
+    fn report_selection_area(&self, pane: ReportPane) -> Rect {
+        match pane {
+            ReportPane::Results => self.report_results_body,
+            _ => self.report_pane_areas[pane.idx()],
+        }
     }
 
     /// The active report tab's `MultiSelectPanel` for `pane` (mutable).
@@ -1221,7 +1239,7 @@ impl TuiApp {
         let Some(pane) = self.active_report_selection_pane() else {
             return;
         };
-        let area = self.report_pane_area(pane);
+        let area = self.report_selection_area(pane);
         if let Some(panel) = self.report_panel_mut(pane) {
             panel.drag(area, point);
         }
@@ -1257,7 +1275,7 @@ impl TuiApp {
         let Some(pane) = self.active_report_selection_pane() else {
             return;
         };
-        let area = self.report_pane_area(pane);
+        let area = self.report_selection_area(pane);
         if let Some(panel) = self.report_panel_mut(pane) {
             panel.extend(motion, area);
         }
@@ -1272,21 +1290,39 @@ impl TuiApp {
         if self.copy_report_selection_only() {
             return;
         }
-        let Some(idx) = self.active_report_index() else {
-            return;
-        };
-        let rt = &self.reports[idx];
-        let whole = match rt.view {
-            crate::tui::reports::ReportView::Results => rt.results_panel.whole_text(),
-            crate::tui::reports::ReportView::Source => rt.source_panel.whole_text(),
-            // The node outline isn't a text panel; `y` there is a no-op.
-            crate::tui::reports::ReportView::Nodes => None,
-        };
-        if let Some(text) = whole
+        if let Some(text) = self.report_whole_view_text()
             && !text.is_empty()
         {
-            copy_to_clipboard(text);
+            copy_to_clipboard(&text);
             self.status = Some(Status::Copied);
+        }
+    }
+
+    /// The whole text of whichever panel the report view primarily shows —
+    /// what `y` copies when nothing is selected.
+    ///
+    /// The results grid is assembled rather than taken: its pinned band (the
+    /// score, then the column names) is painted *over* the panel rather than
+    /// through it, so the panel's own text is the data rows alone. A copy of
+    /// "the results" that starts at the first row, with no header and no
+    /// accuracy, is a table the reader has to guess the shape of.
+    pub(crate) fn report_whole_view_text(&self) -> Option<String> {
+        let idx = self.active_report_index()?;
+        let rt = &self.reports[idx];
+        match rt.view {
+            crate::tui::reports::ReportView::Results => {
+                let body = rt.results_panel.whole_text().unwrap_or_default();
+                if rt.results_pinned_text.is_empty() {
+                    Some(body.to_string())
+                } else {
+                    Some(format!("{}\n{body}", rt.results_pinned_text.join("\n")))
+                }
+            }
+            crate::tui::reports::ReportView::Source => {
+                rt.source_panel.whole_text().map(str::to_string)
+            }
+            // The node outline isn't a text panel; `y` there is a no-op.
+            crate::tui::reports::ReportView::Nodes => None,
         }
     }
 
@@ -1689,7 +1725,17 @@ impl TuiApp {
         // arms below are safe). When the report body holds focus, route body
         // keys to the report handler; otherwise fall through so the single tree
         // keeps driving tab/pane/tree navigation.
-        if self.focus == Pane::Main && self.active_report_index().is_some() {
+        //
+        // The one exception is the run settings: they are a box in the middle
+        // of the screen, and a box in the middle of the screen owns the
+        // keyboard. They open straight from the tree (the `r`/F5 arm below runs
+        // the report without ever entering the body, and a report that asks for
+        // values opens its questions instead of running), so gating them on
+        // body focus left the questions up while the arrow keys quietly walked
+        // the tree behind them.
+        if let Some(idx) = self.active_report_index()
+            && (self.focus == Pane::Main || self.reports[idx].params_open)
+        {
             self.on_key_report_body(key);
             return;
         }

@@ -8,6 +8,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.6.1] - 2026-09-23
+
+### Fixed
+
+- **A report's run settings ignored the keyboard when opened from the
+  workspace tree.** `r`/F5 on a report row in a Workspace tab runs the report
+  the tree has selected, and a report that declares `PARAM`s stops at its
+  questions first — but those keys leave focus on the tree, and the report key
+  map was only reached while the report *body* held focus. The box came up over
+  the report and then watched the arrow keys walk the tree behind it, so a run
+  could be started against values the user had never been able to change. The
+  run settings now take the keyboard from whichever pane put them up, and hand
+  it straight back to the tree on Esc.
+
+- **A still run with failures ran two phrases together.** The movement line
+  read "Movement Nothing movedStill wrong 33": its separators hung off the
+  *figures*, and "Nothing moved" is a phrase with no figure to hang one off, so
+  the next label arrived flush against it. The gap now belongs to the segment
+  that follows.
+
+- **The results grid's pinned band could be highlighted, but copied the rows
+  behind it.** The metric summary and the column headers are painted *over* the
+  scrolling panel, so the panel's first line is the first data row — a click
+  measured against the whole pane landed as many rows too far down as there
+  were pinned lines. Dragging across the summary therefore highlighted the
+  summary and put a data row on the clipboard, and on a scored report (which
+  pins a line per ground-truthed column) clicking a cell selected a row several
+  below the one under the cursor. Clicks are now measured against the rows that
+  actually scroll; the pinned band highlights nothing, because there is nothing
+  there the panel could copy.
+
+- **`y` over the results grid dropped the column names and the score.** It
+  copied the panel's own text, which is the data rows alone, handing over a
+  block of values with nothing saying what any column was. The copy now leads
+  with the pinned band, exactly as the pane reads on screen.
+
+- **A long answer wrapped the run settings' hint in half.** The Binding panel's
+  summary named the key to change the answers *after* listing them, so one long
+  path was enough to push "p to change" over the line ending — arriving as
+  "p to" on one row and "change" on the next. The hint now sits with the label
+  it belongs to ("Run settings (p to change): …"), where only the values wrap.
+
+
 ## [0.6.0] - 2026-09-18
 
 ### Added

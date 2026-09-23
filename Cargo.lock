@@ -2034,7 +2034,7 @@ dependencies = [
 
 [[package]]
 name = "guillotiere"
-version = "0.7.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b17e70c989c36bad147b27a58d148c0741c51448aa5653436547323e524d0ab"
 dependencies = [
@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "paperboy"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64",
  "chrono",

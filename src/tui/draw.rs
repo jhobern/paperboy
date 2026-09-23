@@ -1988,7 +1988,10 @@ fn paint_selection_highlight(f: &mut Frame, app: &TuiApp, th: &Theme) {
         );
         cells.extend(
             rt.results_panel
-                .highlight_regions(app.report_pane_areas[ReportPane::Results.idx()]),
+                // Bounded to the scrolling rows, not the whole pane: the pinned
+                // summary and header are drawn over the top of it and hold no
+                // selectable text of their own.
+                .highlight_regions(app.report_results_body),
         );
     }
     let buf = f.buffer_mut();

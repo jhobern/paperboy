@@ -1344,6 +1344,22 @@ pub struct TuiApp {
     /// The one-column scrollbar Rect for each report panel (same indexing as
     /// `report_pane_areas`), for scrollbar click-to-jump / drag-to-scroll.
     pub(crate) report_pane_bars: [Rect; 3],
+    /// The *scrolling* part of the Results pane: the rows `results_panel`
+    /// actually rendered this frame, which is `report_pane_areas[Results]`
+    /// minus whatever is pinned above it (the metric summary, then the grid's
+    /// header row — see `draw_report_results`).
+    ///
+    /// Recorded separately because the panel's own text model holds only the
+    /// scrolling lines: hit-testing a click against the *whole* pane made
+    /// every row map `pinned` rows too far, so a drag across the pinned
+    /// summary highlighted the summary and copied the data row underneath it.
+    /// `Rect::default()` when the results grid isn't drawn this frame.
+    pub(crate) report_results_body: Rect,
+    /// Which grid line `results_panel`'s first line is, so a click in
+    /// `report_results_body` can be turned back into a data row. `1` while the
+    /// grid's header row is pinned (the panel was fed `lines[1..]`), `0`
+    /// otherwise (the panel holds the header too, unscrolled past).
+    pub(crate) report_results_first_line: usize,
     /// Set while dragging a report panel's scrollbar thumb (which panel), so a
     /// `Drag` keeps adjusting its scroll even if the cursor leaves the
     /// one-column track. Cleared on `Up`.
@@ -1610,6 +1626,8 @@ impl Default for TuiApp {
             mouse_drag_moved: false,
             report_pane_areas: [Rect::default(); 3],
             report_pane_bars: [Rect::default(); 3],
+            report_results_body: Rect::default(),
+            report_results_first_line: 0,
             report_scrollbar_drag: None,
             prompt_editor_area: Rect::default(),
             list_scroll_w: std::cell::Cell::new(0),
