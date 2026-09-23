@@ -230,6 +230,29 @@ struct Cli {
     #[arg(long, requires = "report")]
     progress_json: bool,
 
+    /// With `-r`: also accept a stop request on **stdin** — a line `stop`, or
+    /// end-of-input, winds the run down. The cross-platform half of the control
+    /// channel: a parent process can write one line on any OS, where sending a
+    /// signal to a child on Windows is either ungraceful (`TerminateProcess`)
+    /// or needs a console process group. With `--progress-json` it completes
+    /// the pair: events out on stderr, control in on stdin. EOF counts, so a
+    /// run also stops when the program that started it goes away. A second
+    /// `stop` gives up at once (exit 130), skipping the wind-down.
+    ///
+    /// Off by default, because a run started with stdin closed (`< /dev/null`,
+    /// most CI runners) would otherwise stop the moment it began.
+    #[arg(long, requires = "report")]
+    stop_on_stdin: bool,
+
+    /// With `-r`: how many seconds a stopped run waits for the rows already in
+    /// flight and its `CLEANUP` steps before giving up on them (default 30).
+    /// A stop never abandons a request mid-send if it can help it — the work is
+    /// already paid for, and `CLEANUP` is what releases the sessions and locks
+    /// the run took. When the wait runs out the rows that finished are still
+    /// written, marked partial, but `CLEANUP` may not have run.
+    #[arg(long, value_name = "SECONDS", requires = "report")]
+    grace: Option<u64>,
+
     /// Launch the native graphical UI (eframe/egui) instead of the terminal UI.
     /// Ignored in the headless modes (`-c`/`-r`). Only available when built
     /// with the `gui` feature (`cargo install paperboy --locked --features gui`).
@@ -343,6 +366,8 @@ fn main() {
             cli.shuffle,
             cli.params.into_iter().collect(),
             cli.progress_json,
+            cli.grace,
+            cli.stop_on_stdin,
         ));
     }
 

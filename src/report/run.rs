@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use crate::environment::substitute;
@@ -174,6 +174,41 @@ pub enum RowEvent<'r> {
 /// (the `path` still identifies the target row).
 pub type RowSink<'a> = dyn Fn(RowEvent) + Sync + 'a;
 
+/// A cooperative stop switch for a run in progress: flip it and the flow stops
+/// *starting* work, without abandoning what is already under way.
+///
+/// The contract is deliberately narrow, because the two obvious alternatives
+/// are both worse. Cancelling at the *runner* (the TUI's `CancellableRunner`,
+/// which fails every later request outright) also cancels the `CLEANUP`
+/// requests — the sessions and locks a report is obliged to release — and
+/// leaves the rows that never ran present-but-failed, blaming the API for a
+/// stop the user asked for. Cancelling mid-row would emit half-filled rows.
+///
+/// So this flag is only read where a *new* unit of work would be claimed (see
+/// [`Exec::run_iterations`]): a loop iteration already running finishes its
+/// requests and emits its row whole, every block still returns normally, and
+/// `run_cleanups` therefore runs on its ordinary path. What a stopped run
+/// leaves is a report with fewer rows, each of them complete and honest.
+#[derive(Debug, Default)]
+pub struct Cancel(AtomicBool);
+
+impl Cancel {
+    pub fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// Ask the run to stop claiming new work. Idempotent, and safe to call from
+    /// any thread (a signal handler, a stdin watcher).
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a stop has been asked for.
+    pub fn stopped(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// The immutable context a flow runs against: the bound collection's entries,
 /// the base variable layer (global + pinned env, resolved once), any named
 /// environments an `ENVS` loop may select, the report file's directory (for
@@ -217,6 +252,11 @@ pub struct RunContext<'a> {
     /// earliest-written tie-break. See [`schedule_graph`]: a region *claims*
     /// its edge set is complete, and shuffling is how that claim is falsified.
     pub shuffle: Option<u64>,
+    /// Optional stop switch (see [`Cancel`]). `None` for a run nothing can
+    /// interrupt (the tests, a dry run, an in-process front-end run); `Some`
+    /// when a caller — the headless runner, on a signal or a `stop` line —
+    /// needs the flow to stop starting new rows and wind down.
+    pub cancel: Option<&'a Cancel>,
 }
 
 /// A helper collection loaded for a report, under the alias its requests are
@@ -327,6 +367,10 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         .unwrap_or_else(|| DEFAULT_NO_MATCH.to_string());
     ReportResult {
         rows,
+        // A run that returned produced every row it was going to; only a
+        // caller that stopped one part-way (see [`Cancel`]) can say otherwise,
+        // and it sets this afterwards.
+        partial: None,
         role_targets: ex.role_targets,
         column_order: ex.column_order,
         no_match_marker,
@@ -2711,12 +2755,21 @@ impl<'a> Exec<'a> {
                 let next = AtomicUsize::new(0);
                 let slots: Vec<Mutex<Option<IterOut>>> =
                     (0..count).map(|_| Mutex::new(None)).collect();
+                let cancel = self.ctx.cancel;
                 std::thread::scope(|s| {
                     for _ in 0..degree {
                         s.spawn(|| {
                             loop {
                                 let i = next.fetch_add(1, Ordering::Relaxed);
                                 if i >= count {
+                                    break;
+                                }
+                                // The stop switch is read *after* claiming an
+                                // index and before running it: a worker stops
+                                // taking new iterations, while the up-to-`degree`
+                                // iterations already in flight run to completion
+                                // and emit their rows whole.
+                                if cancel.is_some_and(Cancel::stopped) {
                                     break;
                                 }
                                 let out = run_one(i);
@@ -2727,10 +2780,16 @@ impl<'a> Exec<'a> {
                 });
                 slots
                     .into_iter()
-                    .map(|m| m.into_inner().unwrap().expect("every slot is filled"))
+                    // A stopped run leaves the iterations it never claimed
+                    // empty; they are absent from the report rather than
+                    // present and failed.
+                    .flat_map(|m| m.into_inner().unwrap())
                     .collect()
             }
-            _ => (0..count).map(&run_one).collect(),
+            _ => (0..count)
+                .take_while(|_| !self.ctx.cancel.is_some_and(Cancel::stopped))
+                .map(&run_one)
+                .collect(),
         };
 
         let mut rows = Vec::new();
@@ -3449,6 +3508,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -3487,6 +3547,7 @@ mod tests {
                 .collect(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -3793,6 +3854,7 @@ mod tests {
                 .collect(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -5053,6 +5115,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: Some(seed),
+            cancel: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -6338,6 +6401,7 @@ mod tests {
             params: Default::default(),
             sink: Some(&sink),
             shuffle: None,
+            cancel: None,
         };
         let result = run_flow_raw(&flow, &ctx);
         let streamed = streamed.into_inner().unwrap();
@@ -6396,6 +6460,7 @@ mod tests {
             params: Default::default(),
             sink: Some(&sink),
             shuffle: None,
+            cancel: None,
         };
         let result = run_flow_raw(&flow, &ctx);
         let seen = seen.into_inner().unwrap();
@@ -6452,6 +6517,7 @@ mod tests {
             params: Default::default(),
             sink: Some(&sink),
             shuffle: None,
+            cancel: None,
         };
         let result = run_flow_raw(&flow, &ctx);
         let mut seen = seen.into_inner().unwrap();
@@ -6472,6 +6538,145 @@ mod tests {
             );
             assert!(errors[0].contains("ghost"), "{errors:?}");
         }
+    }
+
+    /// A runner that flips a stop switch once it has answered `after`
+    /// requests — a stop arriving at a known point in the run, with no timing
+    /// to get wrong.
+    struct StopsAfter<'a> {
+        inner: &'a Fake,
+        cancel: &'a Cancel,
+        after: usize,
+        seen: AtomicUsize,
+    }
+
+    impl EntryRunner for StopsAfter<'_> {
+        fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
+            let out = self.inner.run(base, vars);
+            if self.seen.fetch_add(1, Ordering::SeqCst) + 1 >= self.after {
+                self.cancel.stop();
+            }
+            out
+        }
+    }
+
+    fn stop_run(src: &str, entries: &[HurlEntry], fake: &Fake, after: usize) -> ReportResult {
+        let flow = parse_flow(src).expect("flow parses");
+        let cancel = Cancel::new();
+        let runner = StopsAfter {
+            inner: fake,
+            cancel: &cancel,
+            after,
+            seen: AtomicUsize::new(0),
+        };
+        let ctx = RunContext {
+            entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &runner,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+            shuffle: None,
+            cancel: Some(&cancel),
+        };
+        run_flow(&flow, &ctx)
+    }
+
+    #[test]
+    fn a_stopped_loop_starts_no_further_iterations() {
+        let fake = Fake::new(&[(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("up", &[])];
+        // Six iterations, stopped once the second has answered: the row in
+        // flight finishes, and the loop claims nothing after it.
+        let res = stop_run(
+            "FOR X IN [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\"]\n    REPORT REQUEST up\nEND\n",
+            &entries,
+            &fake,
+            2,
+        );
+        assert_eq!(
+            res.rows.len(),
+            2,
+            "the row in flight finishes and no more start"
+        );
+        assert_eq!(fake.call_count(), 2, "nothing was sent after the stop");
+        assert!(
+            res.errors.is_empty(),
+            "a stop is not a failure: {:?}",
+            res.errors
+        );
+    }
+
+    #[test]
+    fn a_stopped_parallel_loop_stops_claiming_iterations() {
+        let fake = Fake::new(&[(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("up", &[])];
+        // Two workers over eight iterations. However the two interleave, the
+        // stop has to end the loop well short of all eight — the point being
+        // that a worker reads the switch before claiming, not that any exact
+        // number of rows comes back.
+        let res = stop_run(
+            "PARALLEL(2) FOR X IN [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\"]\n    \
+             REPORT REQUEST up\nEND\n",
+            &entries,
+            &fake,
+            2,
+        );
+        assert!(
+            (2..=4).contains(&res.rows.len()),
+            "expected the two in flight (and at most one more claimed in the race) \
+             to finish, got {} rows",
+            res.rows.len()
+        );
+        assert_eq!(
+            res.rows.len(),
+            fake.call_count(),
+            "every row that came back was really run"
+        );
+    }
+
+    #[test]
+    fn a_stopped_run_still_runs_its_cleanups() {
+        // The one that would actually bite: CLEANUP exists to delete sessions
+        // and release locks, so a stop that skipped it would leak them against
+        // a real service — worse than not being able to stop at all.
+        let entries = [
+            graph_entry("open", &["sid"], &[]),
+            graph_entry("purge", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[ok_capturing("open", &[("sid", "S1")])]);
+        let res = stop_run(
+            "FOR X IN [\"a\", \"b\", \"c\"]\n    REQUEST open AS open\n    REPORT REQUEST open\n\
+             END\nCLEANUP purge\n",
+            &entries,
+            &fake,
+            1,
+        );
+        assert!(
+            fake.call_order().contains(&"purge".to_string()),
+            "the teardown must still run after a stop: {:?}",
+            fake.call_order()
+        );
+        assert!(
+            res.rows.len() < 3,
+            "the loop really was cut short: {} rows",
+            res.rows.len()
+        );
     }
 
     #[test]
@@ -6534,6 +6739,7 @@ mod tests {
             params: Default::default(),
             sink: Some(&sink),
             shuffle: None,
+            cancel: None,
         };
         let result = run_flow_raw(&flow, &ctx);
         let streamed = streamed.into_inner().unwrap();
@@ -6610,6 +6816,7 @@ mod tests {
             params: Default::default(),
             sink: Some(&sink),
             shuffle: None,
+            cancel: None,
         };
         let result = run_flow_raw(&flow, &ctx);
         let events = events.into_inner().unwrap();
@@ -6734,6 +6941,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -6875,6 +7083,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 2, "one row per matched jpg");
@@ -6923,6 +7132,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 2, "one row per case folder: {:?}", res.rows);
@@ -6969,6 +7179,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.rows.is_empty());
@@ -7109,6 +7320,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -7194,6 +7406,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let first = run_flow(&flow, &ctx);
         let snap_path = dir.join("proc.baseline");
@@ -7215,6 +7428,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let second = run_flow(&flow2, &ctx2);
 
@@ -7303,6 +7517,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let first = run_flow(&base_flow, &base_ctx);
         let snap_path = dir.join("prod.baseline");
@@ -7332,6 +7547,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let cmp = run_flow(&cmp_flow, &cmp_ctx);
 
@@ -7416,6 +7632,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let first = run_flow(&flow, &ctx);
         let snap_path = dir.join("proc.baseline");
@@ -7454,6 +7671,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 1, "rows still produced");
@@ -8182,6 +8400,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -8252,6 +8471,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -8359,6 +8579,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         std::fs::remove_dir_all(&dir).ok();
@@ -8424,6 +8645,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         // The snapshot answers `yes` everywhere: right on row a, wrong on row b.
         let first = run_flow(&parse_flow(body).expect("flow parses"), &ctx);
@@ -8464,6 +8686,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(
@@ -8494,6 +8717,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(
@@ -8530,6 +8754,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.errors.is_empty(), "{:?}", res.errors);
@@ -8566,6 +8791,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(
@@ -8595,6 +8821,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(
@@ -8620,6 +8847,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.verdicts.is_empty() && res.truths.is_empty());
@@ -8647,6 +8875,7 @@ mod tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.images.is_empty());
@@ -8895,6 +9124,7 @@ mod helper_collection_tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         let result = run_flow(&flow, &ctx);
         assert_eq!(
@@ -8981,6 +9211,7 @@ mod timing_column_tests {
             params: Default::default(),
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         run_flow(&flow, &ctx)
     }

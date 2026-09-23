@@ -8,6 +8,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.6.3] - 2026-09-23
+
+### Added
+
+- **A headless run can be stopped without losing it.** `Ctrl-C` (or `SIGTERM`)
+  during a report run no longer kills PaperBoy where it stands. It winds the
+  run down instead: no new rows are started, the rows already in flight finish,
+  `CLEANUP` runs, and the `-o` outputs you asked for are written and marked
+  partial. The principle is the one the part-written output set already
+  followed — the files are faithful renderings of a run that really happened,
+  one level up.
+
+  The order matters more than any single piece of it:
+
+  | Step | Why |
+  |------|-----|
+  | Stop claiming rows | The switch is read where a row is *claimed*, so up to five live HTTP calls under `PARALLEL(5)` finish whole rather than being abandoned mid-upload. Work already paid for is kept. |
+  | Run `CLEANUP` | The one that would actually bite. `CLEANUP` deletes sessions and releases locks; an interrupt that skipped teardown would leak them against a real service — worse than no interrupt handling at all. Every block returns on its ordinary path, so teardown is not a special case. |
+  | Write the outputs, marked partial | A report that silently looks complete while covering 60% of the corpus is a trap. |
+  | Exit `4` | "I was told to stop" is not "your API is broken" (`1`) and not "steps were skipped" (`3`). |
+
+- **Partial reports say so in every format.** `ReportResult` now carries
+  `partial` with `rows_completed` and `rows_planned`: a `PARTIAL` banner above
+  the HTML (before the toolbar and the metric cards, so it is read before the
+  numbers are), `"partial": true` plus both counts at the top level of the
+  JSON, a final `PARTIAL,37 of 120 rows ran` record in the CSV (a row, not a
+  comment — `#` is data in CSV, and a spreadsheet shows the last row as readily
+  as the first), a bold amber row under the XLSX summary, and the PDF title.
+  `partial` is *always* present in the JSON, so a consumer can test for it
+  without knowing which build wrote the file.
+
+- **`--grace SECONDS`** (default `30`) bounds the wind-down. If rows are still
+  in flight when it expires, PaperBoy gives up on them and writes the report
+  from the rows that did finish — a degraded rendering, without the metrics and
+  ground-truth scoring that can only be computed over a complete run, and
+  carrying a warning that `CLEANUP` may not have run. A **second** interrupt
+  skips even that and exits `130`: the escape hatch for a `CLEANUP` hanging on
+  the very service that stopped responding.
+
+- **`--stop-on-stdin`** adds an explicit, cross-platform stop channel: a line
+  reading `stop` on stdin begins the same wind-down, and so does EOF. Signals
+  are awkward on Windows, where there is no `SIGTERM` to send a child process,
+  and a caller already reading `--progress-json` from stderr gets a
+  bidirectional protocol by adding one flag. Opt-in precisely because EOF
+  counts, and most CI runners start processes with stdin already closed.
+
+### Changed
+
+- **`--progress-json` reports interruption rather than ending in silence.** A
+  new `run_stopping` event names the trigger and the grace period, and
+  `run_finished` gained `interrupted`, `partial`, `rows_completed` and
+  `rows_planned`. The terminal-event promise stays unconditional: a stopped run
+  ends with `run_finished` carrying `exit_code: 4`, never a silent EOF.
+- Exit codes, a documented caller contract, gained `4` (stopped) and `130`
+  (stop repeated, so forced).
+
+
 ## [0.6.2] - 2026-09-23
 
 ### Added

@@ -762,8 +762,10 @@ a `--param`, since there is nothing to fall back on.
 
 Exit codes are a contract for callers: `0` ran clean, `1` a setup error or a
 run with per-row errors, `3` some steps were skipped because something they
-depended on failed, and `2` (clap's) means the command line itself was wrong.
-Progress goes to stderr, so `-o -` leaves stdout clean for a pipe.
+depended on failed, `4` the run was stopped before it finished (see [Stopping a
+run](#stopping-a-run-ctrl-c---grace---stop-on-stdin)), `130` a stop that was
+repeated and so forced, and `2` (clap's) means the command line itself was
+wrong. Progress goes to stderr, so `-o -` leaves stdout clean for a pipe.
 
 #### Watching a run from another program (`--progress-json`)
 
@@ -781,7 +783,7 @@ paperboy -r nightly.trail -o out.json --progress-json 2>events.ndjson
 {"event":"row_started","schema":1,"path":"0.0","row_index":0}
 {"event":"row_completed","schema":1,"path":"0.0","row_index":0,"ok":true,"target":null,"cells":{"Case":"a","Status":"200"},"errors":[],"withheld":[]}
 {"event":"output_written","schema":1,"path":"out.json","format":"json","ok":true,"error":null}
-{"event":"run_finished","schema":1,"ok":true,"exit_code":0,"rows":2,"warnings":[],"skipped":[],"errors":[]}
+{"event":"run_finished","schema":1,"ok":true,"exit_code":0,"rows":2,"interrupted":false,"partial":null,"rows_completed":null,"rows_planned":null,"warnings":[],"skipped":[],"errors":[]}
 ```
 
 `plan` arrives once, after the projection pass and before a single request is
@@ -821,6 +823,52 @@ runs at all.)
 `row_started`/`row_completed` pair per projected row, cells and all — without
 sending a request. It is the cheap way for a consumer to draw the grid, or to
 check its own parsing, before committing to a real run.
+
+#### Stopping a run (Ctrl-C, `--grace`, `--stop-on-stdin`)
+
+An interrupted run still writes what it has. Press `Ctrl-C` (or send `SIGTERM`)
+during a report run and PaperBoy winds down rather than dying:
+
+1. **No new rows start.** The switch is read where a row is *claimed*, so the
+   rows already in flight — up to five live HTTP calls under `PARALLEL(5)` —
+   finish whole rather than being abandoned mid-upload.
+2. **`CLEANUP` still runs.** This is the one that would otherwise bite:
+   `CLEANUP` exists to delete sessions and release locks, and an interrupt that
+   skipped teardown would leak them against a real service. Every block returns
+   on its ordinary path, so teardown happens exactly as it would have.
+3. **The requested outputs are written, marked partial.** Not "nothing to
+   report" — a four-hour run stopped at three hours is still three hours of
+   answers. Every format says so in its own idiom: a `PARTIAL` banner above the
+   HTML, `"partial": true` with `rows_completed`/`rows_planned` at the top level
+   of the JSON, a final `PARTIAL,37 of 120 rows ran` record in the CSV, a bold
+   row under the XLSX summary, and the PDF title. A report that silently looked
+   complete while covering 60% of the corpus would be a trap.
+4. **Exit `4`.** "I was told to stop" is not "your API is broken" (`1`) and not
+   "steps were skipped" (`3`).
+5. **`--progress-json` still ends with `run_finished`**, carrying
+   `interrupted: true`, `partial: true` and the two counts, preceded by a
+   `run_stopping` event naming the `source` of the stop and the
+   `grace_seconds` it allows. An interrupt
+   never reduces to a silent EOF.
+
+```sh
+paperboy -r nightly.trail -o out.html -o out.json --grace 60
+```
+
+`--grace SECONDS` (default `30`) bounds the wind-down. If rows are still in
+flight when it expires, PaperBoy gives up on them and writes the report from
+the rows that *did* finish — a degraded rendering, without the metrics and
+ground-truth scoring that can only be computed over a complete run, and
+carrying a warning that `CLEANUP` may not have run. A **second** `Ctrl-C` skips
+even that and exits `130` immediately: the escape hatch for a `CLEANUP` hanging
+on the very service that stopped responding.
+
+`--stop-on-stdin` adds an explicit, cross-platform stop channel: a line reading
+`stop` on stdin begins the same wind-down, and so does EOF. Signals are awkward
+on Windows, where there is no `SIGTERM` to send a child process, and a caller
+that already reads `--progress-json` from stderr gets a bidirectional protocol
+by adding one flag. It is opt-in precisely because EOF counts: most CI runners
+start processes with stdin already closed.
 
 #### Dependency graphs
 

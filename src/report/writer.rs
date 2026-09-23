@@ -126,6 +126,28 @@ impl ReportWriter for CsvWriter {
             push_record(&mut out, cells.iter().map(String::as_str));
         }
 
+        // A stopped run says so in the only place a CSV has to say anything:
+        // one more row. It is deliberately not a comment (`#` is data in CSV,
+        // not syntax) and deliberately last, so a reader that stops at the
+        // table still gets the table — but a spreadsheet, which shows the final
+        // row as readily as the first, cannot show this file without it.
+        if let Some(partial) = &result.partial {
+            push_record(
+                &mut out,
+                [
+                    "PARTIAL",
+                    &format!(
+                        "{} of {} rows ran",
+                        partial.rows_completed, partial.rows_planned
+                    ),
+                ]
+                .into_iter()
+                // Padded to the table's width so the row parses as a record of
+                // the same shape rather than a short one.
+                .chain(std::iter::repeat_n("", columns.len().saturating_sub(2))),
+            );
+        }
+
         Ok(out.into_bytes())
     }
 }
@@ -157,6 +179,18 @@ impl ReportWriter for JsonWriter {
             .collect();
         let doc = serde_json::json!({ "columns": headers, "rows": rows });
         let mut doc = doc;
+        // Whether the run this file reports on actually finished. Always
+        // present, so a consumer can read one key rather than infer a
+        // shortfall from a row count it has no planned total to compare
+        // against; the counts come with it when there is one to state.
+        doc.as_object_mut()
+            .unwrap()
+            .insert("partial".to_string(), result.partial.is_some().into());
+        if let Some(partial) = &result.partial {
+            let obj = doc.as_object_mut().unwrap();
+            obj.insert("rows_completed".to_string(), partial.rows_completed.into());
+            obj.insert("rows_planned".to_string(), partial.rows_planned.into());
+        }
         // Appended statistics summary rows, keyed like the data rows (the row's
         // label lands in the first column). Omitted entirely when none exist.
         let summary: Vec<serde_json::Value> = result
@@ -343,6 +377,12 @@ border-radius:5px;background:var(--panel-bg);color:var(--fg);cursor:pointer}
 .toolbar input{font:inherit;font-size:13px;padding:.25rem .5rem;border:1px solid var(--btn-line);
 border-radius:5px;background:var(--pre-bg);color:var(--fg)}
 .toolbar .count{font-size:12px;color:var(--muted)}
+/* The stopped-run banner. Uses the warning tint rather than the failure one:
+   an interrupted run is not a failed run, and painting it red would say the
+   API misbehaved when what happened is that someone pressed the stop button. */
+.partial{margin:0 0 .8rem;padding:.55rem .9rem;border:1px solid var(--warn-bg);
+border-left:5px solid var(--warn-bg);border-radius:5px;background:var(--panel-bg);
+font-size:14px}
 tfoot td{font-weight:bold;background:var(--foot-bg);border-top:2px solid var(--foot-line)}
 td.pass{background:var(--pass-bg);color:var(--tint-fg)}
 td.fail{background:var(--fail-bg);color:var(--tint-fg)}
@@ -390,6 +430,19 @@ impl ReportWriter for HtmlWriter {
         let labels = super::labels::LabelMap::parse(&header.labels());
         let mut out = String::new();
         out.push_str(HTML_HEAD);
+        // A stopped run announces itself before anything else in the document.
+        // It goes above the toolbar and the metric cards on purpose: those
+        // figures are computed over the rows that *ran*, so a reader who meets
+        // "96% correct" first has already drawn the wrong conclusion about the
+        // corpus by the time they learn a third of it was never tried.
+        if let Some(partial) = &result.partial {
+            out.push_str(&format!(
+                "<div class=\"partial\"><strong>PARTIAL</strong> — this run was \
+                 stopped before it finished: {} of {} rows ran. Everything below \
+                 describes those rows only.</div>\n",
+                partial.rows_completed, partial.rows_planned
+            ));
+        }
         // Ground-truth metrics go *above* the table, as cards and a matrix:
         // HTML has a header block, and a reader who wants to know whether the
         // run was any good should not have to scroll 500 rows to find out. The
@@ -1225,6 +1278,34 @@ impl ReportWriter for XlsxWriter {
             }
         }
 
+        // A stopped run says so in a final row, as the CSV does — the header
+        // row is row 0 and everything below it (the freeze pane, the
+        // autofilter range, every image anchor) is addressed by absolute row
+        // number, so announcing it at the top would mean re-numbering the
+        // whole sheet to say one thing.
+        if let Some(partial) = &result.partial {
+            let partial_fmt = Format::new()
+                .set_bold()
+                .set_background_color(Color::RGB(0xFF_EB9C));
+            let excel_row = (result.rows.len() + 1 + result.summary_rows(&columns).len()) as u32;
+            sheet
+                .write_string_with_format(excel_row, 0, "PARTIAL", &partial_fmt)
+                .map_err(|e| e.to_string())?;
+            if columns.len() > 1 {
+                sheet
+                    .write_string_with_format(
+                        excel_row,
+                        1,
+                        format!(
+                            "{} of {} rows ran",
+                            partial.rows_completed, partial.rows_planned
+                        ),
+                        &partial_fmt,
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
         // Ground-truth metrics get a sheet of their own rather than more footer
         // rows: a confusion matrix is a second table with its own axes, and
         // pasting it under a filtered data table would put it inside the
@@ -1944,6 +2025,84 @@ mod tests {
 
     fn csv(result: &ReportResult) -> String {
         String::from_utf8(CsvWriter.write(result, &Header::default()).unwrap()).unwrap()
+    }
+
+    /// A stopped run's CSV has to carry the caveat, because a spreadsheet of
+    /// 37 rows where 120 were asked for looks exactly like a complete one.
+    #[test]
+    fn a_partial_csv_ends_with_a_row_that_says_so() {
+        let res = ReportResult {
+            column_order: vec!["p.HttpStatus".into(), "p.status".into()],
+            rows: vec![row(&[("p.HttpStatus", "200"), ("p.status", "ok")])],
+            partial: Some(crate::report::model::Partial {
+                rows_completed: 1,
+                rows_planned: 4,
+            }),
+            ..Default::default()
+        };
+        let text = csv(&res);
+        assert_eq!(
+            text.lines().last(),
+            Some("PARTIAL,1 of 4 rows ran"),
+            "last, and of the table's width: {text:?}"
+        );
+        assert!(
+            text.starts_with("p.HttpStatus,p.status\r\n200,ok\r\n"),
+            "the rows that did run are untouched: {text:?}"
+        );
+    }
+
+    /// The same claim in the machine-readable format, as top-level keys rather
+    /// than a row — and `partial` is always present, so a consumer can test it
+    /// without knowing whether this build emits it.
+    #[test]
+    fn a_partial_json_carries_the_counts_at_the_top_level() {
+        let res = ReportResult {
+            column_order: vec!["p.status".into()],
+            rows: vec![row(&[("p.status", "ok")])],
+            partial: Some(crate::report::model::Partial {
+                rows_completed: 1,
+                rows_planned: 9,
+            }),
+            ..Default::default()
+        };
+        let out = JsonWriter.write(&res, &Header::default()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["partial"], serde_json::json!(true));
+        assert_eq!(v["rows_completed"], serde_json::json!(1));
+        assert_eq!(v["rows_planned"], serde_json::json!(9));
+
+        let whole = ReportResult {
+            rows: vec![row(&[("p.status", "ok")])],
+            ..Default::default()
+        };
+        let v: serde_json::Value =
+            serde_json::from_slice(&JsonWriter.write(&whole, &Header::default()).unwrap()).unwrap();
+        assert_eq!(v["partial"], serde_json::json!(false), "always stated");
+        assert!(
+            v.get("rows_completed").is_none(),
+            "but only counted when it means something"
+        );
+    }
+
+    /// In HTML the caveat goes above everything a reader would otherwise start
+    /// with — before the toolbar and the metric cards, not below the table.
+    #[test]
+    fn a_partial_html_banner_comes_before_the_report_itself() {
+        let res = ReportResult {
+            column_order: vec!["p.status".into()],
+            rows: vec![row(&[("p.status", "ok")])],
+            partial: Some(crate::report::model::Partial {
+                rows_completed: 2,
+                rows_planned: 5,
+            }),
+            ..Default::default()
+        };
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        let banner = html.find("class=\"partial\"").expect("a banner: {html}");
+        assert!(html[banner..].contains("2 of 5"), "with the counts");
+        let table = html.find("<table").expect("a table");
+        assert!(banner < table, "the caveat is read before the numbers are");
     }
 
     #[test]

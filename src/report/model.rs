@@ -94,12 +94,38 @@ pub struct ReportRow {
     pub comparison: Option<String>,
 }
 
+/// How much of a planned run a stopped run actually covered (see
+/// [`ReportResult::partial`]).
+///
+/// The counts are of *rows produced by the run*, taken from the same row
+/// stream `--progress-json` reports, not from `rows.len()`: an `ENVS`
+/// comparison collapses a baseline row and a candidate row into one result
+/// row, so the rendered table can legitimately be shorter than the run that
+/// filled it, and a count derived from the table would read as a shortfall
+/// that never happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Partial {
+    /// Rows that finished before the run was stopped.
+    pub rows_completed: usize,
+    /// Rows the projection pass said the run would produce.
+    pub rows_planned: usize,
+}
+
 /// A whole run's output: the rows plus the first-seen order of produced column
 /// keys (the default column order when there is no `columns:` directive), the
 /// effective no-match marker, and any diagnostics collected while running.
 #[derive(Debug, Clone, Default)]
 pub struct ReportResult {
     pub rows: Vec<ReportRow>,
+    /// Set when the run was stopped before it had produced every row it
+    /// planned to — how many of the planned rows this report actually covers.
+    ///
+    /// `None` is the ordinary case: the run finished, so the rows below *are*
+    /// the report. `Some` makes the shortfall part of the artefact rather than
+    /// something a reader has to know: a report covering 37 of 120 cases that
+    /// looks exactly like a complete one is a trap, and the file usually
+    /// outlives the terminal that would have said so.
+    pub partial: Option<Partial>,
     /// What each `ENVS` role's written target resolved to when the run actually
     /// visited it, keyed by the text as written.
     ///

@@ -1090,6 +1090,7 @@ impl TuiApp {
             params: inputs.params,
             sink: None,
             shuffle: None,
+            cancel: None,
         };
         Ok(run_flow(&inputs.flow, &ctx))
     }
@@ -1365,6 +1366,7 @@ impl TuiApp {
                     params: params.clone(),
                     sink: None,
                     shuffle: None,
+                    cancel: None,
                 };
                 run_flow_raw(&flow, &dry_ctx)
             };
@@ -1416,6 +1418,7 @@ impl TuiApp {
                 params: params.clone(),
                 sink: Some(&sink),
                 shuffle: None,
+                cancel: None,
             };
             let mut result = run_flow_raw(&flow, &ctx);
             // 3. Finalize (comparison/baseline collapse) off the raw rows, then

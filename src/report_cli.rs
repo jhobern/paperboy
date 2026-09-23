@@ -15,16 +15,17 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::environment::{looks_like_env, parse_vars};
 use crate::postman::{looks_like_postman, parse_collection};
 use crate::report::flow::Header;
-use crate::report::model::{OutputColumn, ReportRow};
+use crate::report::model::{OutputColumn, Partial, ReportRow};
 use crate::report::params::{ParamValues, undeclared};
 use crate::report::producers::resolve_path;
 use crate::report::report::{expand_output_tokens, name_has_output_token};
 use crate::report::run::{
-    DryRunner, LiveRunner, RowEvent, RowSink, RunContext, finalize, run_flow_raw,
+    Cancel, DryRunner, LiveRunner, RowEvent, RowSink, RunContext, finalize, run_flow_raw,
 };
 use crate::report::validate::{Context, Severity, validate};
 use crate::report::writer::{OUTPUT_EXTENSIONS, writer_for_extension};
@@ -64,6 +65,13 @@ fn random_seed() -> u64 {
 /// supplied falls back to the default written in the report. `progress_json`
 /// replaces the human `done/total` counter with a newline-delimited JSON event
 /// stream on stderr (see [`Progress`]).
+///
+/// A run can be **stopped**: on a signal, or — with `stop_on_stdin` — on a
+/// `stop` line (or EOF) on stdin, which is the channel a parent process can
+/// use on any platform. A stopped run starts no further rows, lets the ones in
+/// flight finish, runs `CLEANUP`, writes the outputs it was asked for marked
+/// as partial, and exits [`EXIT_INTERRUPTED`]; `grace_secs` bounds how long it
+/// will wait for that (see [`Control`]).
 pub fn run(
     collection_path: Option<String>,
     env_paths: Vec<String>,
@@ -74,7 +82,11 @@ pub fn run(
     shuffle: Option<Option<u64>>,
     params: ParamValues,
     progress_json: bool,
+    grace_secs: Option<u64>,
+    stop_on_stdin: bool,
 ) -> i32 {
+    let control = Control::new(grace_secs);
+    control.listen(stop_on_stdin);
     run_with_progress(
         collection_path,
         env_paths,
@@ -85,6 +97,7 @@ pub fn run(
         shuffle,
         params,
         Progress::new(progress_json),
+        control,
     )
 }
 
@@ -106,6 +119,7 @@ fn run_with_progress(
     shuffle: Option<Option<u64>>,
     params: ParamValues,
     progress: Progress,
+    control: Control,
 ) -> i32 {
     let progress_json = progress.on();
     // stdout stays clean for a piped CSV (`-o -`); everything human goes to the
@@ -496,6 +510,8 @@ fn run_with_progress(
             params: params.clone(),
             sink: None,
             shuffle,
+            // A projection sends nothing and takes no time worth stopping.
+            cancel: None,
         };
         run_flow_raw(&flow, &ctx)
     });
@@ -516,10 +532,28 @@ fn run_with_progress(
         .map(|p| p.no_match_marker.clone())
         .unwrap_or_default();
     let slots = RowSlots::new(projection.as_ref().map_or(&[], |p| p.rows.as_slice()));
-    drop(projection);
+    // Kept rather than dropped, because it is the *shape* of the report —
+    // column order, statistics, ground truths, the no-match marker — and a run
+    // that is given up on never returns the assembled result those would
+    // otherwise come from. An abandoned run's report is this shape with the
+    // rows that actually finished poured into it.
+    let shape = projection;
 
     let done = std::sync::atomic::AtomicUsize::new(0);
+    // What a stopped run has to show for itself. The rows are copied out as
+    // they land because a run that is given up on never hands its own result
+    // back: the only rows reachable from outside the run thread are the ones
+    // the sink has already seen. That costs a second copy of every row on a run
+    // nobody interrupts — the price of not having a four-hour run leave nothing
+    // behind when it is stopped in its fifth.
+    let harvest = Mutex::new(Harvest::default());
     let sink = |ev: RowEvent| {
+        if !dry_run && let RowEvent::Completed { row, errors } = &ev {
+            let mut held = harvest.lock().unwrap_or_else(|e| e.into_inner());
+            held.completed += 1;
+            held.rows.push((*row).clone());
+            held.errors.extend(errors.iter().cloned());
+        }
         // The two progress modes are exclusive: interleaving a redrawn human
         // line with the NDJSON stream would corrupt both (the counter uses a
         // bare `\r` and no newline, so it would land *inside* an event line).
@@ -543,9 +577,10 @@ fn run_with_progress(
         eprint!("\r  running {n}/{total}   ");
         let _ = std::io::stderr().flush();
     };
-    // A dry run sends nothing, so there is no counter to draw and no reason to
-    // pay for the hook — but it does *produce* rows, and a consumer previewing
-    // a big run wants to watch the grid fill exactly as a live one would.
+    // A dry run sends nothing, so there is no counter to draw — but it does
+    // *produce* rows, and a consumer previewing a big run wants to watch the
+    // grid fill exactly as a live one would. A live run always takes the hook:
+    // it is also how a stop gets its rows.
     let sink: Option<&RowSink> = match (dry_run, progress_json) {
         (true, false) => None,
         _ => Some(&sink),
@@ -570,6 +605,10 @@ fn run_with_progress(
             params: params.clone(),
             sink,
             shuffle,
+            // Likewise a dry run: there is no request in flight to wind down,
+            // and a stop that arrives during one is served by the process
+            // ending, not by a partial report of requests never sent.
+            cancel: None,
         };
         let mut r = run_flow_raw(&flow, &ctx);
         finalize(&mut r, &flow, &ctx);
@@ -595,15 +634,130 @@ fn run_with_progress(
             params,
             sink,
             shuffle,
+            cancel: Some(control.cancel.as_ref()),
         };
-        let mut r = run_flow_raw(&flow, &ctx);
-        finalize(&mut r, &flow, &ctx);
-        if !progress_json {
-            eprintln!("\r  running {total}/{total}   done");
+        // The run gets a thread of its own so this one is free to watch for a
+        // stop request while it happens. Nothing else here is concurrent: the
+        // run is a single call that returns a whole report, and there is no
+        // point in the middle of it at which it could ask "has anyone asked me
+        // to stop?" on this thread's behalf.
+        // Whether the stream has already been told the run is winding down. A
+        // run can be stopped and finish before the watcher's next poll — two
+        // fast rows and a stop between them — and a consumer that learns a run
+        // was interrupted only from its terminal event has to work that out
+        // backwards. Announced once, from whichever side notices first.
+        let mut announced_stop = false;
+        let ending = std::thread::scope(|s| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (flow_ref, ctx_ref) = (&flow, &ctx);
+            s.spawn(move || {
+                let mut r = run_flow_raw(flow_ref, ctx_ref);
+                finalize(&mut r, flow_ref, ctx_ref);
+                let _ = tx.send(r);
+            });
+            let mut deadline: Option<std::time::Instant> = None;
+            loop {
+                match rx.recv_timeout(STOP_POLL) {
+                    Ok(r) => return Ending::Ran(r),
+                    // The run thread panicked, taking its sender with it.
+                    // Stop waiting and let the scope's join re-raise that panic
+                    // rather than inventing a result out of half a run.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ending::Lost,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                if control.cancel.stopped() && deadline.is_none() {
+                    deadline = Some(std::time::Instant::now() + control.grace);
+                    announced_stop = true;
+                    progress.run_stopping(control.source(), control.grace);
+                    if !progress_json {
+                        eprintln!(
+                            "\r  stopping   : no new rows; up to {}s for the rows in flight and CLEANUP",
+                            control.grace.as_secs()
+                        );
+                    }
+                }
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    // The grace period is up and rows are still in flight. What
+                    // finished is all there will ever be, so write that and go:
+                    // waiting any longer is the thing the caller just refused.
+                    let mut r = abandoned_result(shape.as_ref(), &harvest, total, control.grace);
+                    finalize(&mut r, &flow, &ctx);
+                    let code = deliver(
+                        &r,
+                        &flow.header,
+                        &report,
+                        &outputs,
+                        &mut decor,
+                        &progress,
+                        &setup_warnings,
+                    );
+                    (control.abandon)(code);
+                    return Ending::Delivered(code);
+                }
+            }
+        });
+        match ending {
+            Ending::Ran(mut r) => {
+                if control.cancel.stopped() {
+                    if !announced_stop {
+                        progress.run_stopping(control.source(), control.grace);
+                    }
+                    // Stopped, but it wound down on its own terms: the rows in
+                    // flight finished and `CLEANUP` ran. The report is short,
+                    // and says so.
+                    r.partial = Some(Partial {
+                        rows_completed: harvest.lock().unwrap_or_else(|e| e.into_inner()).completed,
+                        rows_planned: total,
+                    });
+                }
+                if !progress_json {
+                    match &r.partial {
+                        Some(p) => eprintln!(
+                            "\r  stopped    : {} of {} rows ran   ",
+                            p.rows_completed, p.rows_planned
+                        ),
+                        None => eprintln!("\r  running {total}/{total}   done"),
+                    }
+                }
+                r
+            }
+            // Already written and announced inside the scope above; in a real
+            // run `Control::abandon` ended the process before this was reached.
+            Ending::Delivered(code) => return code,
+            Ending::Lost => unreachable!("the scope re-raises the run thread's panic"),
         }
-        r
     };
 
+    deliver(
+        &result,
+        &flow.header,
+        &report,
+        &outputs,
+        &mut decor,
+        &progress,
+        &setup_warnings,
+    )
+}
+
+/// Say what happened and hand the report over: the human summary, one rendering
+/// per requested `-o`, the exit code, and the stream's terminal event.
+///
+/// A function rather than the tail of [`run_with_progress`] because a run that
+/// is given up on has to do all of this from *inside* the scope holding its
+/// straggling threads (see [`Control::abandon`]) — and a partial report that
+/// went out by a different path than a whole one would be exactly the kind of
+/// second implementation that drifts.
+#[allow(clippy::too_many_arguments)]
+fn deliver(
+    result: &ReportResult,
+    header: &Header,
+    report: &Report,
+    outputs: &[String],
+    decor: &mut Decor,
+    progress: &Progress,
+    setup_warnings: &[String],
+) -> i32 {
+    let progress_json = progress.on();
     // --- warnings, skips, errors -----------------------------------------
     if !result.warnings.is_empty() {
         decor.line(&format!("  Warnings   : {}", result.warnings.len()));
@@ -624,6 +778,14 @@ fn run_with_progress(
             decor.line(&format!("    ! {e}"));
         }
     }
+    // Said in the summary as well as in the file, because the person who
+    // pressed the button is looking at this and not at the report yet.
+    if let Some(partial) = &result.partial {
+        decor.line(&format!(
+            "  Stopped    : PARTIAL — {} of {} rows ran",
+            partial.rows_completed, partial.rows_planned
+        ));
+    }
 
     // --- output ----------------------------------------------------------
     // One run, one result, rendered once per requested format — never re-run.
@@ -638,7 +800,7 @@ fn run_with_progress(
     };
     let mut write_failed = false;
     for target in requested {
-        match write_output(&result, &flow.header, target, &report) {
+        match write_output(&result, header, target, &report) {
             Ok(OutputTarget::Stdout(format)) => {
                 // The report already went to stdout; nothing more to print there.
                 progress.output_written("-", format, None);
@@ -671,8 +833,15 @@ fn run_with_progress(
     // condition while adding the fact that part of the run never happened at
     // all. (2 is left alone: clap uses it for argument errors, and a caller
     // must be able to tell "you invoked me wrongly" from "your API is broken".)
+    //
+    // 4 beats both, because it explains them: a stopped run's skips and errors
+    // are as likely to be *of* the stop as of the API, and a caller that reads
+    // 1 or 3 here would go looking for a fault that isn't there. A failed write
+    // still wins, since then there is no report to have stopped short.
     let exit = if write_failed {
         1
+    } else if result.partial.is_some() {
+        EXIT_INTERRUPTED
     } else {
         match (result.skipped.is_empty(), result.errors.is_empty()) {
             (false, _) => EXIT_SKIPPED,
@@ -680,7 +849,7 @@ fn run_with_progress(
             (true, true) => 0,
         }
     };
-    progress.run_finished(&result, exit, &setup_warnings);
+    progress.run_finished(result, exit, setup_warnings);
     exit
 }
 
@@ -688,6 +857,191 @@ fn run_with_progress(
 /// on failed. Documented in the README; changing it is a breaking change for
 /// anyone scripting a release check.
 pub const EXIT_SKIPPED: i32 = 3;
+
+/// The run was stopped on request and wrote the rows it had.
+///
+/// Distinct from 1 and 3 because it answers a different question. 1 says the
+/// API under test misbehaved; 3 says the report's own dependencies pruned part
+/// of it; 4 says nothing was wrong at all — someone pressed stop. A caller that
+/// retries on 1 must not retry on 4, and a dashboard that paints 1 red should
+/// not paint this red.
+pub const EXIT_INTERRUPTED: i32 = 4;
+
+/// A second stop request, which gives up on the wind-down itself.
+///
+/// 128 + SIGINT, the shell's convention for "killed by an interrupt", and
+/// deliberately *not* [`EXIT_INTERRUPTED`]: this path may have skipped
+/// `CLEANUP` and may have written nothing, so a caller that treats 4 as "I have
+/// a partial report" would be wrong to treat this the same way.
+pub const EXIT_FORCED: i32 = 130;
+
+/// How long a stopped run waits for the rows already in flight, unless
+/// `--grace` says otherwise.
+///
+/// Thirty seconds because the wait is for work already paid for — an upload
+/// half-sent, a slow report endpoint — and, after it, for `CLEANUP` to release
+/// what the run took. Too short and a stop routinely abandons both; too long
+/// and the stop button feels broken. A second stop is the escape hatch either
+/// way, so this only has to be a sensible default rather than a bound anyone
+/// has to live with.
+pub const DEFAULT_GRACE_SECS: u64 = 30;
+
+/// How often the waiting loop looks up from the run to see whether a stop has
+/// been asked for. Short enough to feel immediate, long enough not to spin.
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The stop channel of a headless run: the switch the flow reads, how long a
+/// stop will wait for the work already under way, and how the process ends if
+/// that wait runs out.
+///
+/// Two things can flip the switch, and both are opt-in from the caller's side
+/// rather than PaperBoy's business:
+///
+/// * a **signal** — `SIGINT` (Ctrl-C) or, on Unix, `SIGTERM`/`SIGHUP`, which is
+///   what a CI job cancel sends;
+/// * a **`stop` line on stdin**, with `--stop-on-stdin`. Signals are awkward to
+///   send from a parent process on Windows (there is no `SIGTERM`; a parent can
+///   only `TerminateProcess`, which is ungraceful, or arrange a console group
+///   to send `CTRL_BREAK_EVENT`), so a program driving PaperBoy gets a channel
+///   that works identically everywhere and needs no signal handling at all.
+///   With `--progress-json` it completes the pair: events out on stderr,
+///   control in on stdin. EOF counts as a stop, so a run also winds down when
+///   the parent that started it goes away.
+pub struct Control {
+    cancel: std::sync::Arc<Cancel>,
+    grace: std::time::Duration,
+    /// What asked for the stop, for the `run_stopping` event: `"signal"`,
+    /// `"stdin"` or `"eof"`. A consumer that started the run itself already
+    /// knows it sent a signal; one watching a run it did not start does not,
+    /// and "the parent went away" reads very differently from "an operator
+    /// pressed Ctrl-C". Written once by whichever watcher fires first.
+    source: std::sync::Arc<std::sync::Mutex<&'static str>>,
+    /// Called when the grace period expires with rows still in flight, *after*
+    /// the partial report has been written.
+    ///
+    /// In a real run this ends the process. The stragglers are inside a
+    /// `std::thread::scope`, which joins on the way out, so there is no way to
+    /// stop waiting for them and still return normally — "give up on the
+    /// stragglers" and "exit" are the same act. A test passes a hook that
+    /// returns instead, and simply waits them out.
+    abandon: fn(i32),
+}
+
+impl Control {
+    /// A control plane for a real run: `grace` seconds (or the default), ending
+    /// the process if the wind-down overruns.
+    pub fn new(grace_secs: Option<u64>) -> Self {
+        Control {
+            cancel: std::sync::Arc::new(Cancel::new()),
+            grace: std::time::Duration::from_secs(grace_secs.unwrap_or(DEFAULT_GRACE_SECS)),
+            source: std::sync::Arc::new(std::sync::Mutex::new("stop")),
+            abandon: |code| std::process::exit(code),
+        }
+    }
+
+    /// A control plane for a test: no signal handler and no stdin watcher
+    /// (a test process must not have its Ctrl-C redefined, and its stdin is not
+    /// a control channel), and a grace expiry that *returns* instead of ending
+    /// the process — so a test of the abandoned path asserts on the report that
+    /// was written and then simply waits the stragglers out.
+    ///
+    /// The switch itself is reachable through [`Control::switch`], which is how
+    /// a test stops a run: from inside a fake runner, at a row of its choosing,
+    /// with no timing to get wrong.
+    #[cfg(test)]
+    fn for_test() -> Self {
+        Control {
+            cancel: std::sync::Arc::new(Cancel::new()),
+            grace: std::time::Duration::from_secs(DEFAULT_GRACE_SECS),
+            source: std::sync::Arc::new(std::sync::Mutex::new("stop")),
+            abandon: |_| {},
+        }
+    }
+
+    /// The stop switch, for a caller that needs to flip it itself.
+    #[cfg(test)]
+    fn switch(&self) -> std::sync::Arc<Cancel> {
+        self.cancel.clone()
+    }
+
+    /// How long this run will wait, once stopped, before giving up on the rows
+    /// still in flight.
+    #[cfg(test)]
+    fn with_grace(mut self, grace: std::time::Duration) -> Self {
+        self.grace = grace;
+        self
+    }
+
+    /// What asked for the stop, as of now.
+    fn source(&self) -> &'static str {
+        *self.source.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Start listening for stop requests: always for signals, and for `stop`
+    /// lines on stdin when the caller asked for that channel.
+    ///
+    /// The second request from either source is the hard kill: it exits at
+    /// once, on the assumption that a caller repeating itself has decided the
+    /// wind-down is not going to happen (a `CLEANUP` hanging on the very
+    /// service that has stopped responding is the case this exists for).
+    fn listen(&self, stop_on_stdin: bool) {
+        let cancel = self.cancel.clone();
+        let source = self.source.clone();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let signal_hits = hits.clone();
+        // Best effort: a handler can only be installed once per process, and a
+        // failure here costs the graceful path, not the run. (It also keeps the
+        // tests, which call the runner many times over, from tripping on the
+        // second install.)
+        let _ = ctrlc::set_handler(move || {
+            if signal_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                std::process::exit(EXIT_FORCED);
+            }
+            *source.lock().unwrap_or_else(|e| e.into_inner()) = "signal";
+            cancel.stop();
+        });
+        if !stop_on_stdin {
+            return;
+        }
+        let cancel = self.cancel.clone();
+        let source = self.source.clone();
+        // Detached on purpose: a blocking read on stdin cannot be cancelled,
+        // and there is nothing to join it for — the thread's only job is to
+        // outlive its own `read_line` or the process, whichever comes first.
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match std::io::stdin().read_line(&mut line) {
+                    // EOF: the parent closed the pipe or died, and a run nobody
+                    // is listening to any more should wind down rather than
+                    // carry on sending requests for an hour. A `stop` line is
+                    // usually followed by exactly this, though, and the reason
+                    // the caller gave is worth more than the one it implies —
+                    // so an already-stopped run keeps the source it has.
+                    Ok(0) => {
+                        if !cancel.stopped() {
+                            *source.lock().unwrap_or_else(|e| e.into_inner()) = "eof";
+                        }
+                        cancel.stop();
+                        return;
+                    }
+                    Ok(_) => {
+                        if !line.trim().eq_ignore_ascii_case("stop") {
+                            continue;
+                        }
+                        if hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                            std::process::exit(EXIT_FORCED);
+                        }
+                        *source.lock().unwrap_or_else(|e| e.into_inner()) = "stdin";
+                        cancel.stop();
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+    }
+}
 
 /// The one format stdout takes: a pipe is for text, and a binary `.xlsx` down
 /// it would be useless. Named so the value written and the value *announced*
@@ -967,6 +1321,12 @@ impl Progress {
                 // No row ever ran, which is itself the fact a consumer needs to
                 // tell a setup failure from a run in which everything failed.
                 "rows": 0,
+                // Carried even here, so every `run_finished` has one shape and
+                // a consumer can read the same keys whatever ended the run.
+                "interrupted": false,
+                "partial": false,
+                "rows_completed": serde_json::Value::Null,
+                "rows_planned": serde_json::Value::Null,
                 "warnings": warnings,
                 "skipped": [],
                 "errors": errors,
@@ -1111,12 +1471,117 @@ impl Progress {
                 "ok": exit_code == 0,
                 "exit_code": exit_code,
                 "rows": result.rows.len(),
+                // A stop is not a silent EOF. `interrupted` says the run was
+                // told to stop; `partial` says the report it produced is
+                // therefore short, with the counts to say by how much.
+                "interrupted": exit_code == EXIT_INTERRUPTED,
+                "partial": result.partial.is_some(),
+                "rows_completed": result.partial.map(|p| p.rows_completed),
+                "rows_planned": result.partial.map(|p| p.rows_planned),
                 "warnings": warnings,
                 "skipped": result.skipped,
                 "errors": result.errors,
             }),
         );
     }
+
+    /// The stop was heard and the run is winding down: no new rows will start,
+    /// and the rows in flight have `grace` to finish before they are given up
+    /// on.
+    ///
+    /// Emitted because a dashboard that sent `stop` and then saw nothing for
+    /// forty seconds has no way to tell "winding down" from "ignored me" —
+    /// and the answer decides whether a user presses the button again (which
+    /// is the hard kill).
+    fn run_stopping(&self, source: &str, grace: std::time::Duration) {
+        self.emit(
+            "run_stopping",
+            serde_json::json!({
+                "source": source,
+                "grace_seconds": grace.as_secs(),
+            }),
+        );
+    }
+}
+
+/// What a run has produced so far, copied out of the row stream as it goes.
+///
+/// The insurance policy behind a stopped run: the fully assembled result only
+/// exists when the run *returns*, so a run abandoned mid-flight would otherwise
+/// have nothing to show. See [`abandoned_result`].
+#[derive(Default)]
+struct Harvest {
+    /// Every completed row, in the order the run finished them (not report
+    /// order — the writer sorts nothing, so these are laid back into the
+    /// projected shape as they came).
+    rows: Vec<ReportRow>,
+    /// The per-row errors those rows raised.
+    errors: Vec<String>,
+    /// How many rows completed — counted rather than taken from `rows.len()`
+    /// so it keeps meaning the same thing if the rows are ever pruned.
+    completed: usize,
+}
+
+/// How the waiting loop around a live run ended.
+enum Ending {
+    /// The run returned — on its own, or because a stop request wound it down
+    /// inside the grace period.
+    Ran(ReportResult),
+    /// The grace period expired, and the partial report has already been
+    /// written and announced from inside the run's scope (which is the only
+    /// place it can be, since the scope joins the stragglers on the way out).
+    Delivered(i32),
+    /// The run thread died without sending. Only reachable if it panicked, and
+    /// the scope re-raises that panic as it joins.
+    Lost,
+}
+
+/// The report an abandoned run leaves behind: the projection's *shape* —
+/// columns, statistics, ground truths, the no-match marker — filled with the
+/// rows that actually finished.
+///
+/// Rebuilt from the outside like this because the run that would have assembled
+/// it is still running and will never be heard from again. What is lost with it
+/// is everything computed at the end from the whole run: images, ground-truth
+/// verdicts, and so the metrics over them. That is the real difference between
+/// a wind-down inside the grace period and one that overran it, and it is why
+/// the grace period is worth having rather than stopping dead on the first
+/// request for it.
+fn abandoned_result(
+    shape: Option<&ReportResult>,
+    harvest: &Mutex<Harvest>,
+    planned: usize,
+    grace: std::time::Duration,
+) -> ReportResult {
+    let held = harvest.lock().unwrap_or_else(|e| e.into_inner());
+    let mut result = shape.cloned().unwrap_or_default();
+    result.partial = Some(Partial {
+        rows_completed: held.completed,
+        rows_planned: planned,
+    });
+    result.rows = held.rows.clone();
+    result.errors = held.errors.clone();
+    // A warning rather than an error: nothing about the API under test went
+    // wrong. It is here because "CLEANUP may not have run" is the one
+    // consequence of this path that outlives the run — a leaked session or an
+    // unreleased lock is someone else's problem in ten minutes' time.
+    result.warnings = vec![format!(
+        "the run was stopped and did not wind down within {}s: rows still in flight were \
+         abandoned, and CLEANUP may not have run (check for leftover sessions or locks)",
+        grace.as_secs()
+    )];
+    result.skipped = Vec::new();
+    // Ground truths and images are assembled at the end of a run, so this
+    // report has none: leaving the *configuration* for them in place would
+    // render a scoring column with nothing scored and metric cards reading 0%,
+    // which is a lie about the rows that did run.
+    result.column_truths.clear();
+    result.column_images.clear();
+    result.truths.clear();
+    result.verdicts.clear();
+    result.images.clear();
+    result.pending.clear();
+    result
 }
 
 /// The projected grid: every row's structural path in canonical (sorted) order,
@@ -1263,6 +1728,8 @@ mod tests {
             None,
             ParamValues::new(),
             false,
+            None,
+            false,
         );
         assert_eq!(code, 0, "dry run should succeed");
 
@@ -1310,6 +1777,8 @@ mod tests {
                 Vec::new(),
                 None,
                 params,
+                false,
+                None,
                 false,
             )
         };
@@ -1367,6 +1836,8 @@ mod tests {
             None,
             params,
             false,
+            None,
+            false,
         );
         assert_eq!(code, 1, "an undeclared parameter is a setup error");
         assert!(!out.exists(), "nothing should be written for a refused run");
@@ -1407,6 +1878,8 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            false,
+            None,
             false,
         );
         assert_eq!(code, 0, "a multi-output dry run should succeed");
@@ -1452,6 +1925,8 @@ mod tests {
                 Vec::new(),
                 None,
                 ParamValues::new(),
+                false,
+                None,
                 false,
             )
         };
@@ -1510,6 +1985,8 @@ mod tests {
             None,
             ParamValues::new(),
             false,
+            None,
+            false,
         );
         assert_eq!(code, 0);
         assert!(json.exists(), "the file output still lands");
@@ -1547,6 +2024,8 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            false,
+            None,
             false,
         );
         assert_eq!(code, 0, "a multi-env dry run should succeed");
@@ -1593,6 +2072,8 @@ mod tests {
             None,
             ParamValues::new(),
             false,
+            None,
+            false,
         );
         assert_eq!(code, 1, "a duplicate env stem is a fatal setup error");
 
@@ -1618,6 +2099,8 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            false,
+            None,
             false,
         );
         assert_eq!(code, 1, "a missing collection is a fatal setup error");
@@ -1646,6 +2129,8 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            false,
+            None,
             false,
         );
         assert_eq!(code, 1, "an unsupported extension should fail");
@@ -1694,6 +2179,8 @@ mod tests {
                 None,
                 ParamValues::new(),
                 false,
+                None,
+                false,
             );
             assert_eq!(code, 0, ".{ext} output should succeed");
             let bytes = fs::read(&out).unwrap();
@@ -1738,6 +2225,8 @@ mod tests {
             None,
             ParamValues::new(),
             false,
+            None,
+            false,
         );
         assert_eq!(code, 0, "header-resolved run should succeed");
 
@@ -1765,6 +2254,8 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            false,
+            None,
             false,
         );
         assert_eq!(
@@ -2008,6 +2499,8 @@ mod tests {
             None,
             ParamValues::new(),
             true, // --progress-json
+            None,
+            false,
         );
         assert_eq!(code, 0);
         let csv = fs::read_to_string(&out).unwrap();
@@ -2058,6 +2551,7 @@ mod tests {
             None,
             ParamValues::new(),
             progress,
+            Control::for_test(),
         );
         assert_eq!(code, 0);
 
@@ -2130,6 +2624,7 @@ mod tests {
             None,
             params,
             progress,
+            Control::for_test(),
         );
         assert_eq!(code, 1, "an undeclared parameter is a setup error");
 
@@ -2183,6 +2678,7 @@ mod tests {
             None,
             ParamValues::new(),
             progress,
+            Control::for_test(),
         );
         assert_eq!(code, 1);
 
@@ -2199,6 +2695,203 @@ mod tests {
                 .any(|e| e.as_str().unwrap().contains("validation errors")),
             "{errors:?}"
         );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- stopping a run ---------------------------------------------------
+
+    /// A local server that flips `cancel` once it is about to answer request
+    /// number `stop_after`, and holds every later request for `straggler_ms`.
+    ///
+    /// The switch is thrown *before* the response goes out, which is what makes
+    /// the sequential case exact: the run cannot finish row `stop_after` — let
+    /// alone claim the next one — until it has read a response the server only
+    /// writes after stopping it.
+    fn stopping_server(
+        cancel: std::sync::Arc<Cancel>,
+        stop_after: usize,
+        straggler_ms: u64,
+    ) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::spawn(move || {
+            // One thread per connection: under PARALLEL there is more than one
+            // in flight at a time, and serialising them here would hide exactly
+            // the case these tests are about.
+            while let Ok((mut sock, _)) = listener.accept() {
+                let (cancel, seen) = (cancel.clone(), seen.clone());
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf);
+                    let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if n >= stop_after {
+                        cancel.stop();
+                    }
+                    if n > stop_after && straggler_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(straggler_ms));
+                    }
+                    let body = "{\"ok\":true}";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                    let _ = sock.flush();
+                });
+            }
+        });
+        port
+    }
+
+    /// Write a collection and a report that loops `rows` times over one request
+    /// against `port`, and return the two paths.
+    fn stop_fixture(
+        dir: &Path,
+        port: u16,
+        rows: usize,
+        parallel: Option<usize>,
+    ) -> (PathBuf, PathBuf) {
+        let coll = dir.join("api.hurl");
+        fs::write(
+            &coll,
+            format!("# Ping\nGET http://127.0.0.1:{port}/ping/{{{{X}}}}\nHTTP *\n"),
+        )
+        .unwrap();
+        let items: Vec<String> = (0..rows).map(|i| format!("\"r{i}\"")).collect();
+        let head = match parallel {
+            Some(n) => format!("PARALLEL({n}) FOR"),
+            None => "FOR".to_string(),
+        };
+        let report = dir.join("r.trail");
+        fs::write(
+            &report,
+            format!(
+                "# name: r\n# collection: api.hurl\n# columns: X, Ping.HttpStatus as Status\n\
+                 {head} X IN [{}]\n    REPORT REQUEST Ping\nEND\n",
+                items.join(", ")
+            ),
+        )
+        .unwrap();
+        (coll, report)
+    }
+
+    /// The whole promise of a stop: the rows that finished are written, the
+    /// report says it is short and by how much, and the exit code says the run
+    /// was told to stop rather than that the API is broken.
+    #[test]
+    fn a_stopped_run_writes_the_rows_that_finished_and_says_it_is_partial() {
+        let dir = temp_dir("stop");
+        let control = Control::for_test();
+        let port = stopping_server(control.switch(), 2, 0);
+        let (coll, report) = stop_fixture(&dir, port, 6, None);
+        let out = dir.join("out.json");
+
+        let (progress, log) = capturing();
+        let code = run_with_progress(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            vec![out.to_string_lossy().into_owned()],
+            false,
+            Vec::new(),
+            None,
+            ParamValues::new(),
+            progress,
+            control,
+        );
+        assert_eq!(
+            code, EXIT_INTERRUPTED,
+            "\"I was told to stop\" has a code of its own"
+        );
+
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(written["partial"], serde_json::json!(true));
+        assert_eq!(written["rows_completed"], serde_json::json!(2));
+        assert_eq!(written["rows_planned"], serde_json::json!(6));
+        assert_eq!(
+            written["rows"].as_array().unwrap().len(),
+            2,
+            "only the rows that really ran: {written}"
+        );
+
+        let events = events(&log);
+        let stopping = events.iter().find(|e| e["event"] == "run_stopping");
+        assert!(
+            stopping.is_some(),
+            "the stream says it is winding down: {events:?}"
+        );
+        let finished = events
+            .iter()
+            .find(|e| e["event"] == "run_finished")
+            .expect("a terminal event, always");
+        assert_eq!(finished["interrupted"], serde_json::json!(true));
+        assert_eq!(finished["partial"], serde_json::json!(true));
+        assert_eq!(finished["rows_completed"], serde_json::json!(2));
+        assert_eq!(finished["rows_planned"], serde_json::json!(6));
+        assert_eq!(finished["exit_code"], serde_json::json!(EXIT_INTERRUPTED));
+        assert!(
+            events.iter().any(|e| e["event"] == "output_written"),
+            "and the output it announced was written before it: {events:?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The grace period expiring is not an excuse to produce nothing: what the
+    /// stream saw is written, marked partial, with the caveat that the rows
+    /// still in flight — and `CLEANUP` — were left behind.
+    #[test]
+    fn a_run_given_up_on_still_writes_what_it_had() {
+        let dir = temp_dir("abandon");
+        // Zero grace: the first straggler is given up on immediately, which is
+        // the same code path as a 30-second wait, minus the wait.
+        let control = Control::for_test().with_grace(std::time::Duration::ZERO);
+        let port = stopping_server(control.switch(), 1, 600);
+        let (coll, report) = stop_fixture(&dir, port, 6, Some(2));
+        let out = dir.join("out.json");
+
+        let (progress, log) = capturing();
+        let code = run_with_progress(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            vec![out.to_string_lossy().into_owned()],
+            false,
+            Vec::new(),
+            None,
+            ParamValues::new(),
+            progress,
+            control,
+        );
+        assert_eq!(code, EXIT_INTERRUPTED);
+
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(written["partial"], serde_json::json!(true));
+        assert_eq!(written["rows_planned"], serde_json::json!(6));
+        assert!(
+            written["rows"].as_array().unwrap().len() < 6,
+            "the run was abandoned: {written}"
+        );
+        let events = events(&log);
+        let finished = events
+            .iter()
+            .find(|e| e["event"] == "run_finished")
+            .expect("still one terminal event");
+        assert_eq!(finished["interrupted"], serde_json::json!(true));
+        let warnings = finished["warnings"].as_array().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or_default().contains("CLEANUP")),
+            "a report written over a run that never wound down has to say so: {warnings:?}"
+        );
+        assert_eq!(finished["exit_code"], serde_json::json!(EXIT_INTERRUPTED));
 
         fs::remove_dir_all(&dir).ok();
     }
