@@ -37,6 +37,25 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   steady. Like the gates, they describe the run rather than the table, so a
   `# columns:` directive cannot change them.
 
+### Fixed
+
+- **A broken loop no longer blames the loop that follows it.** An error raised
+  in the scope around a loop is inherited by the rows the loop produces —
+  a request that failed before the loop is the reason every one of its rows is
+  wrong. But a finished loop's errors are merged into the block's flat list so
+  the run reports them exactly once, and that list was also what a *later*
+  sibling loop inherited: a broken request in the first loop wrote itself onto
+  every row of the second, which had run perfectly. Errors travel down into a
+  loop, never sideways from the loop before it.
+
+- **A request that reports its time twice no longer appears to have taken twice
+  as long in JUnit.** Nothing stops a flow naming the `Time` intrinsic more than
+  once for the same request — under its own name and under a `[Reports]` alias,
+  or under two aliases — and every one of those columns holds the same
+  milliseconds. The writer added them up. Totals are now collected per step, so
+  a request spends its duration once; two *different* requests in a row still
+  each spend their own.
+
 ### Changed
 
 - **A row that hasn't run yet no longer shows zeros as if they were results.**

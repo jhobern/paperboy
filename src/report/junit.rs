@@ -236,25 +236,45 @@ impl Case {
         // the user's name and says nothing about what it holds). Adding the
         // setup/wait/download slices as well would count the same milliseconds
         // two or three times over.
-        let mut seen: Vec<&String> = Vec::new();
-        let mut ms = 0.0;
+        //
+        // And a request is only allowed to spend its total once, which is why
+        // the totals are collected per *step* before they are added up. Nothing
+        // stops a flow naming the same intrinsic twice — `[Reports]` with both
+        // `took = Time` and `elapsed = Time`, or an alias beside the plain
+        // `Time` column — and every one of those columns holds the very same
+        // milliseconds. Summing the columns made a case that reported its
+        // duration twice appear to have taken twice as long, which is worse
+        // than not reporting it at all: it is a plausible number.
+        let mut totals: Vec<(&str, f64)> = Vec::new();
         for (k, v) in &row.cells {
             let is_total =
                 k.as_str() == "Time" || k.ends_with(".Time") || result.duration_columns.contains(k);
-            if !is_total || seen.contains(&k) {
+            if !is_total {
                 continue;
             }
-            seen.push(k);
             // A duration that is negative, infinite or NaN is not a duration;
             // JUnit's `time` is a plain non-negative number and some consumers
             // reject the document outright over one.
-            if let Ok(n) = v.trim().parse::<f64>()
-                && n.is_finite()
-                && n >= 0.0
-            {
-                ms += n;
+            let Ok(n) = v.trim().parse::<f64>() else {
+                continue;
+            };
+            if !n.is_finite() || n < 0.0 {
+                continue;
+            }
+            // Cells are keyed `<step>.<field>`; a bare `Time` belongs to no
+            // named step and stands alone.
+            let step = k.rsplit_once('.').map(|(s, _)| s).unwrap_or("");
+            match totals.iter_mut().find(|(s, _)| *s == step) {
+                // Equal in every case the interpreter can produce — they are
+                // the same `duration_ms` read twice. The larger is taken rather
+                // than the first so a hand-built or imported result, where they
+                // might not be, still reports a duration no shorter than the
+                // longest thing the step is known to have done.
+                Some((_, seen)) => *seen = seen.max(n),
+                None => totals.push((step, n)),
             }
         }
+        let ms: f64 = totals.iter().map(|(_, n)| n).sum();
 
         let context = columns
             .iter()
@@ -1072,6 +1092,54 @@ mod tests {
         };
         let out = xml(&res);
         assert!(out.contains("time=\"2.500\""), "{out}");
+    }
+
+    /// A step can only spend its total once. Nothing stops a flow naming the
+    /// `Time` intrinsic twice for the same request — under its own name and
+    /// under an alias, or under two aliases — and every one of those columns
+    /// holds the same milliseconds. Adding them made a case appear to have
+    /// taken as many times as long as it was reported, which is a worse failure
+    /// than a missing duration because the number looks plausible.
+    #[test]
+    fn a_request_whose_time_is_reported_twice_did_not_take_twice_as_long() {
+        let res = ReportResult {
+            column_order: vec![
+                "Ping.Time".into(),
+                "Ping.took".into(),
+                "Ping.elapsed".into(),
+            ],
+            rows: vec![row(
+                &["a"],
+                &[
+                    ("Ping.Time", "2500"),
+                    ("Ping.took", "2500"),
+                    ("Ping.elapsed", "2500"),
+                ],
+            )],
+            duration_columns: ["Ping.took".to_string(), "Ping.elapsed".to_string()]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let out = xml(&res);
+        assert!(
+            out.contains("time=\"2.500\""),
+            "one request, one duration: {out}"
+        );
+    }
+
+    /// The other half of the same rule: two *different* requests each spend
+    /// their own time, and a row that made two calls took as long as both.
+    #[test]
+    fn two_requests_in_a_row_each_spend_their_own_time() {
+        let res = ReportResult {
+            column_order: vec!["Ping.Time".into(), "Pong.took".into()],
+            rows: vec![row(&["a"], &[("Ping.Time", "1500"), ("Pong.took", "500")])],
+            duration_columns: ["Pong.took".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let out = xml(&res);
+        assert!(out.contains("time=\"2.000\""), "{out}");
     }
 
     /// `time` is a plain non-negative number in the format, and some consumers

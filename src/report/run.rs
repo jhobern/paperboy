@@ -728,6 +728,12 @@ struct Exec<'a> {
     /// request that failed was written outside its loop. Never re-raised:
     /// the run's own flat error list keeps each error exactly once.
     inherited_errors: Vec<String>,
+    /// The spans of [`errors`](Self::errors) that were merged *up* from a
+    /// finished loop's iterations rather than raised in this scope. They belong
+    /// to the rows that loop produced and are already attributed there, so they
+    /// must not be inherited a second time by whatever the block does next —
+    /// see [`to_state`](Self::to_state).
+    borrowed_errors: Vec<(usize, usize)>,
 }
 
 /// A cloneable snapshot of an [`Exec`]'s scope/capture/target state (no output
@@ -1306,6 +1312,7 @@ impl<'a> Exec<'a> {
             role_targets: HashMap::new(),
             baseline_show: Vec::new(),
             inherited_errors: Vec::new(),
+            borrowed_errors: Vec::new(),
         }
     }
 
@@ -1337,13 +1344,35 @@ impl<'a> Exec<'a> {
             // used to tell. It is context, not ownership — the errors stay
             // where they were raised in the run's own flat list, and only the
             // rows' attribution is widened.
+            //
+            // A *sibling* loop's errors are the exception, which is why this
+            // reads `scope_errors` rather than the flat list. Two loops one
+            // after the other are two independent sets of rows; the first
+            // loop's failures were merged up into this scope's list only so the
+            // run reports them once, and widening them to the second loop's
+            // rows would blame every row of the second for what happened in the
+            // first.
             inherited_errors: self
                 .inherited_errors
                 .iter()
-                .chain(self.errors.iter())
+                .chain(self.scope_errors())
                 .cloned()
                 .collect(),
         }
+    }
+
+    /// The errors this scope raised itself: the flat list minus the spans a
+    /// finished loop's iterations contributed (see
+    /// [`borrowed_errors`](Self::borrowed_errors)). Order is preserved, because
+    /// an error list a reader scans is in the order the run raised them.
+    fn scope_errors(&self) -> impl Iterator<Item = &String> {
+        self.errors.iter().enumerate().filter_map(|(i, e)| {
+            (!self
+                .borrowed_errors
+                .iter()
+                .any(|&(from, to)| i >= from && i < to))
+            .then_some(e)
+        })
     }
 
     /// Build a fresh [`Exec`] from a snapshot (with empty output accumulators) —
@@ -1367,6 +1396,7 @@ impl<'a> Exec<'a> {
             target_env: state.target_env,
             broadcast: state.broadcast,
             inherited_errors: state.inherited_errors,
+            borrowed_errors: Vec::new(),
             column_order: Vec::new(),
             timing_columns: Vec::new(),
             duration_columns: Vec::new(),
@@ -2928,6 +2958,12 @@ impl<'a> Exec<'a> {
         };
 
         let mut rows = Vec::new();
+        // An iteration's errors are merged into the run's flat list so the run
+        // reports them (and fails) exactly once, but they are the *rows'*
+        // errors and are already attributed to them. Marking the span keeps a
+        // later sibling loop from inheriting them as though they were this
+        // scope's own.
+        let borrowed_from = self.errors.len();
         for out in outs {
             for c in &out.columns {
                 self.note_column(c);
@@ -2947,6 +2983,10 @@ impl<'a> Exec<'a> {
                 }
             }
             rows.extend(out.rows);
+        }
+        if self.errors.len() > borrowed_from {
+            self.borrowed_errors
+                .push((borrowed_from, self.errors.len()));
         }
         rows
     }
@@ -3688,6 +3728,97 @@ mod tests {
             cancel: None,
         };
         run_flow(&flow, &ctx)
+    }
+
+    /// Two loops one after the other are two independent sets of rows. The
+    /// first loop's failures are merged into the run's flat error list so the
+    /// run reports them once and fails, and for a while that list was also what
+    /// a later loop's rows inherited as "the reason this row is wrong" — so a
+    /// broken request in the first loop wrote itself onto every row of the
+    /// second, which had run perfectly. An error travels *down* into a loop
+    /// from the scope around it, never *sideways* from the loop before it.
+    #[test]
+    fn a_broken_loop_does_not_blame_the_loop_that_follows_it() {
+        let fake = Fake::new(&[
+            (
+                "boom",
+                Canned {
+                    error: Some("connection refused".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "fine",
+                Canned {
+                    status: 200,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let entries = [entry("boom", &[]), entry("fine", &[])];
+        let src = "FOR A IN [\"x\"]\n    REPORT REQUEST boom AS b\nEND\n\
+                   FOR C IN [\"y\"]\n    REPORT REQUEST fine AS f\nEND\n";
+
+        let res = run(src, &entries, &[], &[], &fake);
+        assert_eq!(res.rows.len(), 2, "one row per loop");
+        assert_eq!(
+            res.errors.len(),
+            1,
+            "the run still reports the failure exactly once: {:?}",
+            res.errors
+        );
+
+        let first = &res.rows[0];
+        let second = &res.rows[1];
+        assert!(
+            first
+                .errors
+                .iter()
+                .any(|e| e.contains("connection refused")),
+            "the row whose request failed owns the error: {:?}",
+            first.errors
+        );
+        assert!(
+            second.errors.is_empty(),
+            "the second loop ran clean and must not inherit the first's failure: {:?}",
+            second.errors
+        );
+    }
+
+    /// The other half of the same rule: an error raised in the scope *around* a
+    /// loop is inherited by every row the loop produces, because it really is
+    /// the reason they are wrong.
+    #[test]
+    fn a_failure_before_a_loop_is_still_the_reason_its_rows_are_wrong() {
+        let fake = Fake::new(&[
+            (
+                "boom",
+                Canned {
+                    error: Some("connection refused".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "fine",
+                Canned {
+                    status: 200,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let entries = [entry("boom", &[]), entry("fine", &[])];
+        let src = "REQUEST boom AS b\n\
+                   FOR C IN [\"y\", \"z\"]\n    REPORT REQUEST fine AS f\nEND\n";
+
+        let res = run(src, &entries, &[], &[], &fake);
+        assert_eq!(res.rows.len(), 2);
+        for row in &res.rows {
+            assert!(
+                row.errors.iter().any(|e| e.contains("connection refused")),
+                "an enclosing-scope failure reaches the rows below it: {:?}",
+                row.errors
+            );
+        }
     }
 
     /// Which two stacks a comparison runs against is the thing most worth
