@@ -10,6 +10,33 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ## [0.7.1] - 2026-09-29
 
+### Added
+
+- **`--require-net-gain N`: a CI gate on whether the answers got *worse*.**
+  `--fail-under` is an absolute floor, and a suite that has climbed well above
+  it can break rows for months without ever reaching it — a run at 98% that
+  breaks three rows in a hundred still clears `--fail-under 95` comfortably,
+  and the only evidence is a number nobody is comparing with last week's. This
+  gates on the change instead: rows fixed minus rows regressed, counted exactly
+  as the `Trend` column counts them, over the rows scored on both sides of the
+  report's baseline. `--require-net-gain 0` is "do not go backwards", which
+  needs no maintenance as a suite improves; a positive number demands progress
+  and a negative one is a tolerance. It fails the run with exit `5`, the code
+  `--fail-under` already uses, and is refused before anything is sent when the
+  report has no `TRUTH` or no baseline to measure against.
+
+- **`run_finished` carries the run's own figures.** A caller gating on quality
+  itself had to parse the report the run had just written — or re-derive the
+  numbers and risk disagreeing with the gate. The terminal `--progress-json`
+  event now carries `rows_ok`/`rows_failed` beside `rows`, a `scored` object
+  (`compared`, `correct`, `incorrect`, `accuracy`) and a `movement` object
+  (`fixed`, `regressed`, `still_wrong`, `unchanged`), with
+  `--require-net-gain`'s verdict alongside the counts it was drawn from. Both
+  objects are `null` rather than zeroed when there is nothing to report: a run
+  with no ground truth has not scored 0%, and one with no baseline has not held
+  steady. Like the gates, they describe the run rather than the table, so a
+  `# columns:` directive cannot change them.
+
 ### Changed
 
 - **A row that hasn't run yet no longer shows zeros as if they were results.**

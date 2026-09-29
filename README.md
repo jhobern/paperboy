@@ -765,12 +765,12 @@ Exit codes are a contract for callers: `0` ran clean, `1` a setup error or a
 run in which something failed — a request that did not come back, an assertion
 that did not hold — `3` some steps were skipped because something they depended
 on failed, `4` the run was stopped before it finished (see [Stopping a
-run](#stopping-a-run-ctrl-c---grace---stop-on-stdin)), `5` a `--fail-under`
-gate was not met, `130` a stop that was repeated and so forced, and `2`
+run](#stopping-a-run-ctrl-c---grace---stop-on-stdin)), `5` a `--fail-under` or
+`--require-net-gain` gate was not met, `130` a stop that was repeated and so forced, and `2`
 (clap's) means the command line itself was wrong. Progress goes to stderr, so
 `-o -` leaves stdout clean for a pipe.
 
-#### In a pipeline (`--fail-under`, JUnit)
+#### In a pipeline (`--fail-under`, `--require-net-gain`, JUnit)
 
 A report is a deploy check as much as it is a document, and a pipeline reads
 one thing: the exit code. Two failures are worth telling apart.
@@ -806,6 +806,33 @@ not given a gate verdict at all — the figure would be drawn from whichever row
 happened to finish. `5` is its own code because the two failures call for
 different responses: `1` is worth retrying, `5` never is.
 
+*The answers got worse.* An accuracy floor is an absolute line, and a suite
+that has climbed well above it can break rows for months without ever reaching
+it — a run at 98% that breaks three rows in a hundred still clears
+`--fail-under 95` comfortably. `--require-net-gain` gates on the *change*
+instead, against the baseline the report already compares with:
+
+```sh
+paperboy -r nightly.trail -e prod.vars -e staging.vars --require-net-gain 0
+```
+
+It counts rows the way the `Trend` column does — rows fixed minus rows
+regressed, over the rows scored on **both** sides — and fails the run with exit
+`5` when that comes out below the number given. `0` is "do not go backwards",
+which is the usual one and needs no maintenance as the suite improves; a
+positive number demands progress, and a negative one is a tolerance
+(`--require-net-gain -2` lets two net regressions through). Trading a fix for a
+regression passes at `0`; a run that wants to hear about churn asks for `1`.
+
+The two gates can be used together and share exit `5`: either one failing is
+enough. `--require-net-gain` needs both halves of the comparison it is named
+after — something to be right or wrong about (a `TRUTH`) and something to have
+been right or wrong about last time (an `ENVS BASELINE(…)/COMPARISON(…)` clause
+or a `# baseline:` snapshot) — and a report missing either is refused before
+anything is sent, exactly as `--fail-under` is. A run that was stopped, or one
+where no row reached a baseline with a truth on both sides, gets no verdict:
+that is a broken run (exit `1`), not a quality miss.
+
 `-o results.xml` writes **JUnit XML**, which is what makes a run show up as
 test results in a CI UI rather than as a file nobody opens: one `<testcase>` per
 row, named by the row's key so a case keeps its identity between runs, with a
@@ -839,7 +866,7 @@ paperboy -r nightly.trail -o out.json --progress-json 2>events.ndjson
 {"event":"row_started","schema":1,"path":"0.0","row_index":0}
 {"event":"row_completed","schema":1,"path":"0.0","row_index":0,"ok":true,"target":null,"cells":{"Case":"a","Status":"200"},"errors":[],"withheld":[]}
 {"event":"output_written","schema":1,"path":"out.json","format":"json","ok":true,"error":null}
-{"event":"run_finished","schema":1,"ok":true,"exit_code":0,"rows":2,"interrupted":false,"dry_run":false,"partial":null,"rows_completed":null,"rows_planned":null,"warnings":[],"skipped":[],"errors":[],"gate":null}
+{"event":"run_finished","schema":1,"ok":true,"exit_code":0,"rows":2,"interrupted":false,"dry_run":false,"partial":null,"rows_completed":null,"rows_planned":null,"rows_ok":2,"rows_failed":0,"warnings":[],"skipped":[],"errors":[],"scored":{"compared":2,"correct":2,"incorrect":0,"accuracy":100.0},"movement":null,"gate":null}
 ```
 
 `plan` arrives once, after the projection pass and before a single request is
@@ -857,6 +884,21 @@ is about to use. With `--fail-under` it also carries a `gate` object
 (`{"metric":"accuracy","required":95.0,"actual":92.4,"compared":250,
 "passed":false,"note":"…"}`), and `null` without one — so a consumer can tell a
 gate that passed from a deploy nobody checked.
+
+It also carries the run's own arithmetic, so a caller gating on quality itself
+does not have to parse the report it just wrote: `rows_ok`/`rows_failed` beside
+`rows` (counted over the rows that actually ran — a projected or never-reached
+row is neither), a `scored` object (`{"compared":250,"correct":231,
+"incorrect":19,"accuracy":92.4}`, the same unrounded percentage `gate.actual`
+reports), and a `movement` object (`{"fixed":3,"regressed":1,"still_wrong":2,
+"unchanged":244}`) against the report's baseline. Both are deliberately `null`
+rather than zeroed when there is nothing to report: a run with no ground truth
+has not scored 0%, and one with no baseline has not held steady. These read the
+run rather than the table, so a `# columns:` directive that hides a column
+cannot change them. With `--require-net-gain`, `movement` also carries that
+gate's verdict — `required_net_gain`, `net_gain`, `passed` and `note` — beside
+the counts it was drawn from, rather than in a second place that could drift
+from them.
 
 The stream stays cheap deliberately: `DETAIL` and `IMAGE` columns — the ones the
 report itself marks as drill-down content, a raw response body among them — are
@@ -1149,7 +1191,7 @@ collection file, not a fixture directory that `FOR … IN FILES` reads.
 | `1`  | Something failed: a request, an assertion, or the report itself. |
 | `3`  | Steps were skipped because something they depended on failed. |
 | `4`  | The run was stopped before it finished. |
-| `5`  | A `--fail-under` gate was not met: the run was clean, the answers were not good enough. |
+| `5`  | A `--fail-under` or `--require-net-gain` gate was not met: the run was clean, the answers were not good enough. |
 
 `3` implies `1` — a skip only ever follows a failure — and says the run is
 additionally incomplete, so a pipeline that only cares about pass/fail can

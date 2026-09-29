@@ -196,6 +196,27 @@ struct Cli {
     )]
     fail_under: Option<f64>,
 
+    /// With `-r`: fail the run when its comparison has not improved on its
+    /// baseline by at least this many rows (`--require-net-gain 0` — "fix at
+    /// least as much as you break"), exiting 5. Counted the way the `Trend`
+    /// column is: rows fixed minus rows regressed, over the rows scored on
+    /// both sides. `--fail-under` cannot see this — two runs that both score
+    /// 98% are not the same run if one of them fixed three rows and broke
+    /// three others — and a threshold nobody has to raise by hand is the one
+    /// that keeps being enforced. A negative value is a tolerance: `-2` lets
+    /// two net regressions through. A report with no baseline, or no `TRUTH`
+    /// to compare against, has nothing to measure and is refused.
+    #[arg(
+        long,
+        value_name = "ROWS",
+        requires = "report",
+        // Same reasoning as `--fail-under`: a gate that can be quietly skipped
+        // is worse than one that refuses the command line.
+        conflicts_with_all = ["dry_run", "postman_import"],
+        allow_negative_numbers = true
+    )]
+    require_net_gain: Option<i64>,
+
     /// With `-r`: run only these steps and whatever they depend on
     /// (comma-separated step names). Every named step must be inside a `GRAPH`
     /// region — only a region declares the complete graph that a closure needs,
@@ -414,7 +435,10 @@ fn main() {
             cli.targets,
             cli.shuffle,
             cli.params.into_iter().collect(),
-            cli.fail_under,
+            report_cli::Gates {
+                fail_under: cli.fail_under,
+                net_gain: cli.require_net_gain,
+            },
             cli.progress_json,
             cli.grace,
             cli.stop_on_stdin,

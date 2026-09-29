@@ -296,6 +296,27 @@ impl Metrics {
         Some(row_rollup(result, result.rows.len() - result.pending.len()))
     }
 
+    /// How the run moved against its baseline, independently of what the report
+    /// shows.
+    ///
+    /// The same relation to [`Metrics::movement`] as [`Metrics::gate_rollup`]
+    /// has to [`Metrics::overall`]: that one describes the table in front of
+    /// the reader, and a `# columns:` directive that hides the `Trend` column
+    /// rightly hides the summary with it. This one answers a question nobody is
+    /// reading a table to ask — a gate on regressions, and the figures on the
+    /// `run_finished` event a caller may be gating on itself — and that answer
+    /// cannot depend on which columns somebody chose to print.
+    ///
+    /// `None` when there was no baseline, or no row was scored on both sides:
+    /// a run with nothing to compare against has not "stayed still", and four
+    /// zeroes would say that it had.
+    pub fn gate_movement(result: &ReportResult) -> Option<Movement> {
+        if result.dry_run {
+            return None;
+        }
+        movement(result)
+    }
+
     /// The metric rows appended to the table's footer, one cell per column.
     ///
     /// This is the flat-format rendering — CSV has one table and no room for a
