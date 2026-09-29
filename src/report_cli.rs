@@ -947,14 +947,7 @@ impl Gate {
                 // The number shown is still the rounded one, except where that
                 // would contradict the verdict: see [`Gate::phrase`].
                 let actual = m.accuracy().unwrap_or(0.0) * 100.0;
-                let passed = if required >= 100.0 {
-                    // Said in whole rows rather than in floating point, because
-                    // "every scored row was right" is what the caller meant and
-                    // `correct as f64 / compared as f64` is not exact.
-                    m.correct == m.compared
-                } else {
-                    actual >= required
-                };
+                let passed = meets(m.correct, m.compared, required);
                 let (shown, demanded) = Gate::phrase(actual, required, passed);
                 Gate {
                     required,
@@ -1032,6 +1025,69 @@ impl Gate {
         // panicked on the arithmetic would be worse than one that over-prints.
         (format!("{actual:.6}"), format!("{required:.6}"))
     }
+}
+
+/// Did `correct` out of `compared` meet the threshold?
+///
+/// Decided in integers, because neither side of the question is a float. The
+/// run's score is a ratio of two counts, and the threshold is a decimal
+/// somebody typed — but `(23 / 40) * 100.0` is `57.49999999999999`, so a run
+/// that got exactly the 57.5% it was asked for failed the gate, and
+/// [`Gate::phrase`] then printed the only sentence it could: "57.500000% —
+/// UNDER the required 57.500000%". Blocking a release over the last bit of a
+/// `f64` is the one failure mode a gate cannot have.
+///
+/// So the threshold is put back into the decimal it was written as — `57.5`
+/// becomes 575 hundredths of a percent — and the comparison is a
+/// cross-multiplication of exact integers:
+///
+/// ```text
+/// correct / compared >= significand / (100 * 10^scale)
+/// ```
+///
+/// This also subsumes the whole-row special case that used to guard
+/// `--fail-under 100`: with a significand of 100 and no decimals it reduces to
+/// `correct >= compared`, which is "every scored row was right" said exactly.
+///
+/// The `f64` is kept for *display* only, where being out by 10^-14 cannot
+/// mislead anyone.
+fn meets(correct: usize, compared: usize, required: f64) -> bool {
+    let exact = decimal(required)
+        .and_then(|(sig, scale)| Some((sig, 10u128.checked_pow(scale)?)))
+        .and_then(|(sig, pow)| {
+            let lhs = (correct as u128).checked_mul(100)?.checked_mul(pow)?;
+            let rhs = sig.checked_mul(compared as u128)?;
+            Some(lhs >= rhs)
+        });
+    // A threshold no decimal can describe (an infinity, a NaN) never reaches
+    // here — `percentage` rejects those on the command line — and the integers
+    // cannot overflow `u128` for any run that fits in memory. The float
+    // comparison is kept as the answer of last resort rather than a panic:
+    // whatever else is wrong, the gate still returns a verdict.
+    exact.unwrap_or_else(|| {
+        let actual = if compared == 0 {
+            0.0
+        } else {
+            correct as f64 / compared as f64 * 100.0
+        };
+        actual >= required
+    })
+}
+
+/// A threshold as the decimal it was written as: an integer significand and
+/// the number of decimal places, so `57.5` is `(575, 1)`.
+///
+/// Recovered from the `f64` rather than carried alongside it from the command
+/// line. Rust prints a float as the *shortest* decimal that round-trips to the
+/// same value, which — for anything a person types as a percentage — is the
+/// decimal they typed: `57.5` prints as `57.5`, never as
+/// `57.499999999999996`. Display never uses exponent notation, and a threshold
+/// is range-checked to 0–100 at the point of parsing, so the text here is
+/// always plain digits with at most one point.
+fn decimal(percent: f64) -> Option<(u128, u32)> {
+    let text = format!("{percent}");
+    let (whole, frac) = text.split_once('.').unwrap_or((text.as_str(), ""));
+    Some((format!("{whole}{frac}").parse().ok()?, frac.len() as u32))
 }
 
 /// A threshold as it is written in the summary: the shared percentage
@@ -3220,6 +3276,63 @@ mod tests {
             "both figures are printed at the precision that separates them: {}",
             just_under.note
         );
+    }
+
+    /// A run that scored exactly what was asked of it passes. `23 / 40` is
+    /// 57.5% in arithmetic and `57.49999999999999` in `f64`, so comparing the
+    /// computed percentage blocked a release for getting precisely the number
+    /// it was told to get -- and said so in the only words it had: "57.500000%
+    /// -- UNDER the required 57.500000%".
+    #[test]
+    fn a_run_that_exactly_meets_its_threshold_is_not_failed_by_the_last_bit() {
+        let g = Gate::measure(&scored(23, 17), 57.5);
+        assert!(g.passed, "23 of 40 is exactly 57.5%: {}", g.note);
+        assert!(g.note.contains("at or above"), "{}", g.note);
+        // The sentence is readable, not the six-decimal shape the contradiction
+        // used to force.
+        assert!(!g.note.contains("57.500000"), "{}", g.note);
+
+        // The exactness has to cut both ways, or it is just a looser gate.
+        let under = Gate::measure(&scored(22, 18), 57.5);
+        assert!(!under.passed, "22 of 40 is 55%: {}", under.note);
+    }
+
+    /// The same question asked of every threshold shape there is: a tie must
+    /// pass, and one row fewer must not. Each of these has a different
+    /// floating-point accident behind it -- some decimals round up when they
+    /// become a `f64` and some round down, so a cross-multiplication done in
+    /// floats fails one direction or the other depending on the number typed.
+    #[test]
+    fn a_threshold_is_held_to_the_decimal_it_was_written_as() {
+        // (threshold, rows scored, rows right for an exact tie)
+        let cases = [
+            (57.5, 40usize, 23usize),
+            (2.6, 500, 13),
+            (95.1, 1000, 951),
+            (33.0, 300, 99),
+            (0.1, 1000, 1),
+            (8.2, 500, 41),
+            (57.35, 2000, 1147),
+            (100.0, 2000, 2000),
+            (0.0, 10, 0),
+        ];
+        for (required, compared, tie) in cases {
+            let g = Gate::measure(&scored(tie, compared - tie), required);
+            assert!(
+                g.passed,
+                "{tie} of {compared} meets {required}%: {}",
+                g.note
+            );
+            if tie > 0 {
+                let g = Gate::measure(&scored(tie - 1, compared - tie + 1), required);
+                assert!(
+                    !g.passed,
+                    "{} of {compared} does not meet {required}%: {}",
+                    tie - 1,
+                    g.note
+                );
+            }
+        }
     }
 
     /// A run that was stopped is not given a verdict at all: the figure would

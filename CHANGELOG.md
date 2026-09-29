@@ -44,6 +44,56 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A request written `repeat` *and* `retry` could hide a failure entirely.**
+  Hurl reports every attempt at a request, and PaperBoy keeps only the one that
+  counts: a poll that answered "pending" twice and then succeeded is one
+  request that passed. The attempts to throw away were identified as "another
+  result for this entry follows, and the entry is retried" — which is also true
+  of the last attempt of a *repetition*, so with `repeat: 3, retry: 2` a
+  repetition that exhausted its retries was quietly replaced by the next
+  repetition's opening attempt. The failure vanished from the run, the report
+  and the exit code, under exactly the options someone chose in order to be
+  thorough. Attempts are now told apart by what the runner announces as it
+  makes them, so a retry is a retry and a repetition stands on its own. Where a
+  repetition did fail, the row is now built from *that* attempt rather than
+  from whichever one passed, so the cells no longer show a `200` beside an
+  error reporting a `500`.
+
+- **`--fail-under` no longer fails a run that scored exactly what it asked
+  for.** The comparison was made on the computed percentage, and `23 / 40` is
+  `57.49999999999999` in floating point — so `--fail-under 57.5` blocked a
+  release for hitting its target precisely, and said so in the only words it
+  had: "accuracy 57.500000% — UNDER the required 57.500000%". The threshold is
+  now held to the decimal it was written as, and the comparison is done in
+  whole numbers on both sides.
+
+- **A dry run of a broken report no longer produces a clean JUnit document.**
+  Resolving a request happens before one would be sent, so `--dry-run` really
+  can fail — and because every projected case is written as `<skipped>`, which
+  carries no error, the failure was attributed to a row that then said nothing
+  about it. `-o report.xml` reported `errors="0"` for a report that could not
+  run at all. A dry run's errors are now carried by the run's own case, and the
+  skipped case says which row they belong to.
+
+- **Two report rows with the same name can no longer hide each other in JUnit
+  output.** Colliding case names were already renamed `#1`, `#2` — but the name
+  that renaming invents is one a row can already have (a suite holding `same`,
+  `same` and `same #1` produced `same #1` twice), the run's own case was named
+  after the suite *after* the rows had been made unique, and names that differ
+  only by a tab or a control character are the same name to an XML parser.
+  Since CI systems key a case on its name and keep the first of a pair,
+  each of those hid a result. Names are now made unique as the consumer finally
+  reads them, the run's case is named alongside the rows, and where the rows
+  themselves say why there are two of them — two comparison clauses, two `ENVS`
+  targets — the case is named for that rather than counted off, so it keeps its
+  identity in a CI history.
+
+- **A request that never sent is now named by its alias in the errors list.**
+  A `REPORT REQUEST Ping AS ping` that failed before any attempt was made was
+  reported under the request's name rather than the alias, so a request invoked
+  twice under two aliases produced two identical error lines and left the
+  reader to guess which step each came from.
+
 - **A blank answer no longer adds an untitled row and column to the confusion
   matrix.** A scored row whose answer cell came back empty was labelled with
   the empty string, so the matrix grew an axis entry with no name — which reads

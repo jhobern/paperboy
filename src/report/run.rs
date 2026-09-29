@@ -2344,18 +2344,34 @@ impl<'a> Exec<'a> {
         // rule (a `repeat`'s several outcomes all survive, and all count).
         // Taken before the entries are consumed below.
         let surviving_error = out.error.clone();
-        // The outcome the row is built from is likewise the first attempt that
-        // was not thrown away. Taking `next()` would report the first failed
-        // attempt of a request that was retried until it worked — the response,
-        // the status, the timing and (before this) the run's exit code would
-        // all describe an attempt Hurl had already superseded.
-        let eo = match out.entries.into_iter().find(|e| !e.superseded) {
+        // The outcome the row is built from is likewise one that was not
+        // thrown away. Taking the first attempt outright would report the first
+        // failed attempt of a request that was retried until it worked — the
+        // response, the status, the timing and (before this) the run's exit
+        // code would all describe an attempt Hurl had already superseded.
+        //
+        // Where a `repeat` left several attempts standing, it is the first that
+        // *failed*: `surviving_error` above is already the first surviving
+        // failure, so building the row from the repetition that happened to
+        // pass would print `HttpStatus: 200` in the cells beside an error
+        // saying the request returned 500.
+        let surviving: Vec<_> = out.entries.into_iter().filter(|e| !e.superseded).collect();
+        let representative = surviving.iter().position(|e| !e.ok).unwrap_or(0);
+        let eo = match surviving.into_iter().nth(representative) {
             Some(eo) => eo,
             None => {
                 let err = out
                     .error
                     .unwrap_or_else(|| "request produced no response".into());
-                self.errors.push(format!("{name}: {err}"));
+                // By alias, exactly as the sent-and-failed branch below: a
+                // request invoked twice under two aliases is two steps of the
+                // flow, and an error that names only the request leaves the
+                // reader to guess which of them it came from. Pre-send
+                // failures (an unreadable request, a `[Gen]` block that threw,
+                // a form file that would not expand) reach *this* branch
+                // rather than that one, so wording them differently would mean
+                // the two halves of the same flow disagreed.
+                self.errors.push(format!("{alias}: {err}"));
                 cells.push((format!("{alias}.Error"), err));
                 self.note_step(&alias, name, false);
                 return cells;
@@ -7151,6 +7167,52 @@ mod tests {
         assert_eq!(res.rows.len(), 1);
         assert!(res.errors.iter().any(|e| e.contains("ghost")));
         assert!(res.rows[0].cells.contains_key("ghost.Error"));
+    }
+
+    /// A request that never left records its failure through a different
+    /// branch from one that was sent and came back wrong: there is no outcome
+    /// to build a row from, only an error. Both are steps of the same flow, so
+    /// both have to name the step the way the flow does -- by alias. Wording
+    /// one of them by the *request* leaves a reader who invoked the same
+    /// request twice unable to tell which of the two failed, which is exactly
+    /// the confusion aliases exist to remove.
+    #[test]
+    fn a_request_that_never_sent_is_still_named_by_its_alias() {
+        struct NoEntries;
+        impl EntryRunner for NoEntries {
+            fn run(&self, _base: &HurlEntry, _vars: &HashMap<String, String>) -> RunOutput {
+                RunOutput {
+                    entries: Vec::new(),
+                    error: Some("the request could not be read".into()),
+                    generated: HashMap::new(),
+                }
+            }
+        }
+        let entries = [entry("r", &[])];
+        let runner = NoEntries;
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &runner,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+            shuffle: None,
+            cancel: None,
+        };
+        let flow = parse_flow("REPORT REQUEST r AS first\nREPORT REQUEST r AS second\n")
+            .expect("flow parses");
+        let res = run_flow(&flow, &ctx);
+        assert_eq!(
+            res.errors,
+            vec![
+                "first: the request could not be read".to_string(),
+                "second: the request could not be read".to_string(),
+            ]
+        );
     }
 
     #[test]

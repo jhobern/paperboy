@@ -34,7 +34,7 @@ use super::compare::CORRECT_COLUMN;
 use super::flow::Header;
 use super::model::{OutputColumn, ReportResult, ReportRow, Verdict};
 use super::writer::ReportWriter;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// How much of a cell's text goes into `<system-out>`. A report can carry a
 /// whole response body per row; a CI viewer that has to page through a megabyte
@@ -55,7 +55,6 @@ impl ReportWriter for JunitWriter {
             .enumerate()
             .map(|(r, row)| Case::of(r, row, result, &columns))
             .collect();
-        disambiguate(&mut cases);
 
         // Run errors that no row is responsible for: an empty glob, a producer
         // that failed before any row existed, a `CLEANUP` that broke after the
@@ -69,11 +68,18 @@ impl ReportWriter for JunitWriter {
         // are worded differently, so matching on the sentence reported every
         // failed row twice — once as itself and once as an unexplained run
         // error.
-        let unexplained: Vec<&String> = result
-            .errors
-            .iter()
-            .filter(|e| !result.rows.iter().any(|row| row.errors.contains(e)))
-            .collect();
+        //
+        // A dry run owns nothing, whatever its rows hold. Every projected case
+        // is emitted `<skipped>`, and a skipped case carries no `<error>` — so
+        // an error a row "explains" is an error the document never states. A
+        // preview really can fail: resolution, `USING` and producer expansion
+        // all happen before a request would be sent, so `REPORT REQUEST ghost`
+        // records a row error on a run that sends nothing. Letting the row
+        // claim it filed the one fault a preview exists to find under a green
+        // skip, which is the worst shape a CI result can take.
+        let explained =
+            |e: &String| !result.dry_run && result.rows.iter().any(|row| row.errors.contains(e));
+        let unexplained: Vec<&String> = result.errors.iter().filter(|e| !explained(e)).collect();
 
         // What a reader needs to know about the run that isn't about any one
         // case: the caveats the other formats carry as banners, plus the
@@ -102,23 +108,31 @@ impl ReportWriter for JunitWriter {
             failures: Vec::new(),
             context: notes.iter().map(|n| (String::new(), n.clone())).collect(),
             seconds: 0.0,
+            disc: String::new(),
         });
+
+        // Named alongside the rows, not after them. The run case takes the
+        // suite's own name, which a row keyed the same way collides with — and
+        // a first-wins consumer then keeps whichever came first and drops the
+        // other, hiding either that row's failure or the run-level error that
+        // explains an empty suite.
+        let run_index = run_case.is_some().then_some(cases.len());
+        cases.extend(run_case);
+        disambiguate(&mut cases);
+
+        // The run case is never a projection: it is *about* the run rather
+        // than a case the run would have produced, so a dry run must not count
+        // it among the skipped, and its note is the thing it exists to carry.
+        let projected = |i: usize| result.dry_run && Some(i) != run_index;
 
         // Counted off the status each case is actually *emitted* with, so the
         // totals can never describe a document other than this one: a dry run
         // writes `<skipped>` and nothing else, and a case demoted from failure
         // to error is counted once, as an error.
-        // The run case is counted with `dry_run = false` because it is emitted
-        // that way: it is *about* the run rather than a projected case, so a
-        // dry run must not count it among the skipped.
-        let all = cases
-            .iter()
-            .map(|c| (c, result.dry_run))
-            .chain(run_case.iter().map(|c| (c, false)));
-        let tests = cases.len() + usize::from(run_case.is_some());
+        let tests = cases.len();
         let (mut failures, mut errors, mut skipped) = (0, 0, 0);
-        for (c, dry) in all {
-            match c.status(dry) {
+        for (i, c) in cases.iter().enumerate() {
+            match c.status(projected(i)) {
                 Status::Skipped => skipped += 1,
                 Status::Error => errors += 1,
                 Status::Failure => failures += 1,
@@ -139,13 +153,8 @@ impl ReportWriter for JunitWriter {
             esc(&suite)
         ));
 
-        for case in &cases {
-            push_case(&mut out, case, &suite, result.dry_run);
-        }
-        if let Some(case) = &run_case {
-            // Never skipped, whatever the run was: this case is *about* the
-            // run, and a dry run's own note is the thing it exists to carry.
-            push_case(&mut out, case, &suite, false);
+        for (i, case) in cases.iter().enumerate() {
+            push_case(&mut out, case, &suite, projected(i));
         }
 
         // Kept as well as on the run case, for the consumers that do read it.
@@ -187,6 +196,10 @@ struct Case {
     context: Vec<(String, String)>,
     /// Wall time for the row, in seconds.
     seconds: f64,
+    /// What tells this case apart from another of the same name, where
+    /// anything does. Empty otherwise, and only ever read when there is a
+    /// collision to resolve.
+    disc: String,
 }
 
 impl Case {
@@ -260,6 +273,7 @@ impl Case {
             failures,
             context,
             seconds: positive(ms / 1000.0),
+            disc: discriminator(row),
         }
     }
 
@@ -280,37 +294,102 @@ impl Case {
     }
 }
 
-/// Make every case name unique within the suite.
+/// What distinguishes a row from another with the same key.
+///
+/// The two ways a key legitimately repeats are the two things read here: the
+/// same key under two comparison clauses (both clauses drop their environment
+/// axis from the key, which is what lets a baseline and its candidate meet),
+/// and the same key against two `ENVS` targets. Naming the case after the one
+/// that differs says *why* there are two, and keeps the case's identity across
+/// runs — an ordinal moves the moment a row is added above it, which breaks
+/// every CI history that tracks a case over time.
+///
+/// Empty when the row offers nothing, leaving [`disambiguate`] its ordinal.
+/// The path is deliberately not used: it is a run-time coordinate of loop node
+/// and iteration indices, which reads as noise and is empty for snapshot rows
+/// anyway.
+fn discriminator(row: &ReportRow) -> String {
+    let parts: Vec<&str> = [row.target.as_deref(), row.comparison.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|p| !p.is_empty())
+        .collect();
+    parts.join(" ")
+}
+
+/// Make every case name unique within the suite — as the *consumer* sees it.
 ///
 /// A row *key* can legitimately repeat — two manifest lines with the same
 /// values, the same key under two comparison clauses — while `row.path` is
 /// guaranteed unique. CI consumers key a case on `(classname, name)` and
 /// GitLab, for one, keeps only the first of a duplicated pair: a colliding name
 /// does not merely read badly, it silently *hides* the second row's failure.
-/// The path is appended only where there is a collision, so ordinary reports
-/// keep the readable names that make a history worth having.
+///
+/// Two names collide when they *arrive* the same way, not when they are the
+/// same Rust string. The name goes out as an XML attribute, and every parser
+/// normalises one before anyone compares it: a tab or a newline inside becomes
+/// a space (XML 1.0 §3.3.3), and `esc` has already mapped the characters XML
+/// cannot carry at all to a space too. So the decision is made on [`seen_as`],
+/// the form that reaches the reader.
+///
+/// The discriminator is the row's path where it has one, since that keeps a
+/// case's identity stable across runs and so keeps a CI history joined up; a
+/// plain ordinal otherwise. Either way the result is checked against every
+/// other final name and retried until it is free — `#1` is itself a name a row
+/// can already carry, and appending to a duplicate must not manufacture a
+/// fresh one.
 fn disambiguate(cases: &mut [Case]) {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
     for c in cases.iter() {
-        *counts.entry(c.name.as_str()).or_default() += 1;
+        *counts.entry(seen_as(&c.name)).or_default() += 1;
     }
-    let dupes: Vec<String> = counts
-        .into_iter()
-        .filter(|(_, n)| *n > 1)
-        .map(|(k, _)| k.to_string())
+    // The names that keep what they have, and are therefore spoken for.
+    let mut taken: HashSet<String> = counts
+        .iter()
+        .filter(|(_, n)| **n == 1)
+        .map(|(name, _)| name.clone())
         .collect();
-    if dupes.is_empty() {
+    if taken.len() == cases.len() {
         return;
     }
     let mut nth: HashMap<String, usize> = HashMap::new();
     for c in cases.iter_mut() {
-        if !dupes.contains(&c.name) {
+        let canon = seen_as(&c.name);
+        if counts[&canon] == 1 {
             continue;
         }
-        let n = nth.entry(c.name.clone()).or_default();
-        *n += 1;
-        c.name = format!("{} #{}", c.name, *n);
+        let n = nth.entry(canon).or_default();
+        let mut candidate = if c.disc.is_empty() {
+            *n += 1;
+            format!("{} #{n}", c.name)
+        } else {
+            format!("{} #{}", c.name, c.disc)
+        };
+        while !taken.insert(seen_as(&candidate)) {
+            *n += 1;
+            candidate = format!("{} #{n}", c.name);
+        }
+        c.name = candidate;
     }
+}
+
+/// A name as a consumer finally sees it.
+///
+/// Uniqueness has to be judged on this rather than on the original string:
+/// `"a\tb"` and `"a b"` are different names here and the same name in every
+/// parser, and so are a name carrying a NUL and the one carrying a space that
+/// `esc` turns it into.
+fn seen_as(name: &str) -> String {
+    esc(name)
+        .chars()
+        .map(|c| {
+            if matches!(c, '\t' | '\n' | '\r') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Turn a negative zero into a plain one.
@@ -365,6 +444,13 @@ fn push_case(out: &mut String, case: &Case, suite: &str, dry_run: bool) {
     let mut out_lines: Vec<String> = Vec::new();
     if status == Status::Error {
         out_lines.extend(case.failures.iter().cloned());
+    }
+    // A skipped case still says what went wrong with it. The run case carries
+    // these errors as the suite's `<error>`s (see the writer's `explained`),
+    // so this is attribution rather than duplication: it is the only place the
+    // document says *which row* a dry run's resolution failure belongs to.
+    if status == Status::Skipped {
+        out_lines.extend(case.errors.iter().cloned());
     }
     out_lines.extend(case.context.iter().map(|(k, v)| {
         if k.is_empty() {
@@ -578,6 +664,46 @@ mod tests {
         assert!(out.contains("DRY RUN"), "the suite says why: {out}");
     }
 
+    /// A preview can fail. Resolution, `USING` and producer expansion all
+    /// happen before a request would be sent, so `REPORT REQUEST ghost` records
+    /// an error on a run that sent nothing -- and the row that owns it is
+    /// emitted `<skipped>`, which carries no `<error>` at all. Left to the row,
+    /// the fault the preview exists to find would appear nowhere in the
+    /// document: a clean green dry run of a broken report.
+    #[test]
+    fn a_dry_run_that_could_not_resolve_a_request_is_not_a_clean_skip() {
+        let err = "request 'ghost' could not be resolved";
+        let res = ReportResult {
+            column_order: vec!["ghost.Error".into()],
+            rows: vec![failed_row(
+                &["a"],
+                &[("ghost.Error", "unresolved request 'ghost'")],
+                &[err],
+            )],
+            errors: vec![err.to_string()],
+            dry_run: true,
+            ..Default::default()
+        };
+        let out = xml(&res);
+        assert!(out.contains("errors=\"1\""), "the suite reports it: {out}");
+        assert!(out.contains("<error"), "as an error element: {out}");
+        // Compared escaped: the wording carries an apostrophe, and the
+        // document is XML before it is prose.
+        let quoted = esc(err);
+        assert!(
+            out.contains(&quoted),
+            "quoting the run's own wording: {out}"
+        );
+        // The projected row is still a projection, and still says which row the
+        // failure belongs to.
+        assert!(out.contains("<skipped"), "{out}");
+        assert!(out.contains("skipped=\"1\""), "{out}");
+        assert!(
+            out.matches(quoted.as_str()).count() >= 2,
+            "the skipped case attributes it too: {out}"
+        );
+    }
+
     /// The dangerous shape: a run that produced no rows *because* something was
     /// wrong. An empty suite is a green suite in every CI system there is, so
     /// the run's own errors become a case of their own.
@@ -743,6 +869,121 @@ mod tests {
         // case history worth having.
         assert!(out.contains("name=\"other\""), "{out}");
         assert!(out.contains("errors=\"1\""), "{out}");
+    }
+
+    /// Every name in the document, as a consumer finally reads it: the
+    /// attribute values, after the escaping and the attribute-value
+    /// normalisation a parser applies. Uniqueness is only meaningful here.
+    fn names(out: &str) -> Vec<String> {
+        out.match_indices("<testcase name=\"")
+            .map(|(i, m)| {
+                let rest = &out[i + m.len()..];
+                rest[..rest.find('"').unwrap()]
+                    .chars()
+                    .map(|c| {
+                        if matches!(c, '\t' | '\n' | '\r') {
+                            ' '
+                        } else {
+                            c
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn all_unique(out: &str) -> bool {
+        let n = names(out);
+        let mut sorted = n.clone();
+        sorted.sort();
+        sorted.dedup();
+        sorted.len() == n.len()
+    }
+
+    /// Resolving a collision creates a name, and the name it creates is one a
+    /// row can already be using: a manifest holding `same`, `same` and
+    /// `same #1` produced `same #1` *twice*, which is the collision the
+    /// renaming exists to prevent — now with the appearance of having been
+    /// dealt with.
+    #[test]
+    fn a_name_invented_to_resolve_a_collision_cannot_make_another() {
+        let res = ReportResult {
+            column_order: vec!["Body".into()],
+            rows: vec![
+                row(&["same"], &[("Body", "first")]),
+                row(&["same"], &[("Body", "second")]),
+                row(&["same #1"], &[("Body", "third")]),
+            ],
+            ..Default::default()
+        };
+        let out = xml(&res);
+        assert!(all_unique(&out), "{out}");
+        assert_eq!(names(&out).len(), 3, "{out}");
+    }
+
+    /// The run case is named after the suite, so a row keyed the same way
+    /// collides with it — and a first-wins consumer then keeps one and drops
+    /// the other, losing either that row's failure or the run-level error that
+    /// explains why the suite is short. It is named with the rows for that
+    /// reason, rather than appended once they are already unique among
+    /// themselves.
+    #[test]
+    fn a_row_named_like_the_suite_cannot_swallow_the_runs_own_case() {
+        let res = ReportResult {
+            column_order: vec!["Body".into()],
+            rows: vec![row(&[&suite_name(&Header::default())], &[("Body", "a")])],
+            errors: vec!["FILES \"cases/*.json\" matched nothing".into()],
+            ..Default::default()
+        };
+        let out = xml(&res);
+        assert!(all_unique(&out), "{out}");
+        assert!(out.contains("<error"), "the run error survives: {out}");
+    }
+
+    /// Two names that differ only in whitespace a parser erases are one name to
+    /// the consumer: XML normalises a tab or a newline inside an attribute to a
+    /// space, and `esc` has already turned the characters XML cannot carry at
+    /// all into spaces. Comparing the Rust strings called these distinct and
+    /// shipped a document in which they are not.
+    #[test]
+    fn names_that_only_a_parser_would_flatten_together_are_still_told_apart() {
+        let res = ReportResult {
+            column_order: vec!["Body".into()],
+            rows: vec![
+                row(&["a\tb"], &[("Body", "tab")]),
+                row(&["a b"], &[("Body", "space")]),
+                row(&["a\u{0}c"], &[("Body", "nul")]),
+                row(&["a c"], &[("Body", "space too")]),
+            ],
+            ..Default::default()
+        };
+        let out = xml(&res);
+        assert!(all_unique(&out), "{out}");
+    }
+
+    /// Where the rows themselves say why there are two of them, the case is
+    /// named for that rather than counted off. An ordinal moves as soon as a
+    /// row is added above it, so a CI history that tracks a case over time
+    /// follows the wrong one; the clause a row belongs to does not move.
+    #[test]
+    fn a_collision_is_named_for_what_actually_differs() {
+        let res = ReportResult {
+            column_order: vec!["Body".into()],
+            rows: vec![
+                ReportRow {
+                    comparison: Some("nightly".into()),
+                    ..row(&["same"], &[("Body", "a")])
+                },
+                ReportRow {
+                    comparison: Some("release".into()),
+                    ..row(&["same"], &[("Body", "b")])
+                },
+            ],
+            ..Default::default()
+        };
+        let out = xml(&res);
+        assert!(out.contains("name=\"same #nightly\""), "{out}");
+        assert!(out.contains("name=\"same #release\""), "{out}");
     }
 
     /// A failed request is an error even when the report does not *show* the
