@@ -110,14 +110,20 @@ impl ReportWriter for PdfWriter {
         // wherever the document's first page does. ASCII only: the built-in
         // Helvetica metrics this module wraps against cover 32..=126, so an
         // em-dash here would be measured as a missing glyph.
-        let title = match &result.partial {
-            Some(partial) => format!(
+        let title = match (result.dry_run, &result.partial) {
+            // ASCII only here as well, and the dry-run note wins: a document
+            // of rows that were never sent has nothing to be partial about.
+            (true, _) => format!(
+                "{} - DRY RUN: no requests sent, rows are projected",
+                title_of(header)
+            ),
+            (false, Some(partial)) => format!(
                 "{} - PARTIAL: {} of {} rows ran",
                 title_of(header),
                 partial.rows_completed,
                 partial.rows_planned
             ),
-            None => title_of(header),
+            (false, None) => title_of(header),
         };
         let doc = Layout {
             title,
@@ -923,6 +929,7 @@ mod tests {
 
     fn row(cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {
+            errors: Vec::new(),
             role: crate::report::model::RowRole::default(),
             cells: cells
                 .iter()

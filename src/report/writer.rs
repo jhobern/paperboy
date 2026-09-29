@@ -27,8 +27,8 @@ pub trait ReportWriter {
 }
 
 /// The set of output formats PaperTrail can write, keyed by lower-case file
-/// extension (`csv`/`json`/`html`/`xlsx`/`pdf`). Returns `None` for anything else so
-/// callers can report an unsupported-format error naming the extension.
+/// extension (`csv`/`json`/`html`/`xlsx`/`pdf`/`xml`). Returns `None` for anything
+/// else so callers can report an unsupported-format error naming the extension.
 pub fn writer_for_extension(ext: &str) -> Option<Box<dyn ReportWriter>> {
     match ext.to_ascii_lowercase().as_str() {
         "csv" => Some(Box::new(CsvWriter)),
@@ -36,12 +36,16 @@ pub fn writer_for_extension(ext: &str) -> Option<Box<dyn ReportWriter>> {
         "html" | "htm" => Some(Box::new(HtmlWriter)),
         "xlsx" => Some(Box::new(XlsxWriter)),
         "pdf" => Some(Box::new(super::pdf::PdfWriter)),
+        // JUnit is the one output whose consumer is a machine that already
+        // knows the format — `-o results.xml` is what makes a run show up as
+        // test results in CI rather than as a file nobody opens.
+        "xml" => Some(Box::new(super::junit::JunitWriter)),
         _ => None,
     }
 }
 
 /// The list of supported output extensions, for help/error text.
-pub const OUTPUT_EXTENSIONS: [&str; 5] = ["csv", "json", "html", "xlsx", "pdf"];
+pub const OUTPUT_EXTENSIONS: [&str; 6] = ["csv", "json", "html", "xlsx", "pdf", "xml"];
 
 /// The preferred output extension for `report`: its `# output:` header format
 /// when that names a supported writer, else `csv`.
@@ -126,6 +130,23 @@ impl ReportWriter for CsvWriter {
             push_record(&mut out, cells.iter().map(String::as_str));
         }
 
+        // A dry run says so in the only place a CSV has to say anything: one
+        // more row, for the same reasons the `PARTIAL` row below is one. It
+        // comes first of the two because it is the stronger claim — a file
+        // whose rows were never run is not a short report, it is a plan — and
+        // because a reader who learns it stops asking the other question.
+        if result.dry_run {
+            push_record(
+                &mut out,
+                [
+                    "DRY RUN",
+                    "no requests were sent - these rows are projected rather than measured",
+                ]
+                .into_iter()
+                .chain(std::iter::repeat_n("", columns.len().saturating_sub(2))),
+            );
+        }
+
         // A stopped run says so in the only place a CSV has to say anything:
         // one more row. It is deliberately not a comment (`#` is data in CSV,
         // not syntax) and deliberately last, so a reader that stops at the
@@ -186,6 +207,14 @@ impl ReportWriter for JsonWriter {
         doc.as_object_mut()
             .unwrap()
             .insert("partial".to_string(), result.partial.is_some().into());
+        // Likewise always present, and for a blunter reason: JSON is what a
+        // dashboard or a CI gate reads, and one of those deciding a release on
+        // a file of rows that were never sent is the failure this key exists to
+        // prevent. A consumer tests one boolean rather than inferring it from
+        // absent metrics.
+        doc.as_object_mut()
+            .unwrap()
+            .insert("dry_run".to_string(), result.dry_run.into());
         if let Some(partial) = &result.partial {
             let obj = doc.as_object_mut().unwrap();
             obj.insert("rows_completed".to_string(), partial.rows_completed.into());
@@ -383,6 +412,12 @@ border-radius:5px;background:var(--pre-bg);color:var(--fg)}
 .partial{margin:0 0 .8rem;padding:.55rem .9rem;border:1px solid var(--warn-bg);
 border-left:5px solid var(--warn-bg);border-radius:5px;background:var(--panel-bg);
 font-size:14px}
+/* The dry-run banner, sharing the stopped-run tint for the same reason: a
+   preview is not a failure either, and the point is that it is not a result
+   at all. */
+.dry{margin:0 0 .8rem;padding:.55rem .9rem;border:1px solid var(--warn-bg);
+border-left:5px solid var(--warn-bg);border-radius:5px;background:var(--panel-bg);
+font-size:14px}
 tfoot td{font-weight:bold;background:var(--foot-bg);border-top:2px solid var(--foot-line)}
 td.pass{background:var(--pass-bg);color:var(--tint-fg)}
 td.fail{background:var(--fail-bg);color:var(--tint-fg)}
@@ -430,6 +465,17 @@ impl ReportWriter for HtmlWriter {
         let labels = super::labels::LabelMap::parse(&header.labels());
         let mut out = String::new();
         out.push_str(HTML_HEAD);
+        // A dry run announces itself before everything, including the stopped-
+        // run banner: "these rows were never sent" is the first thing a reader
+        // has to know about this document, and every figure and verdict below
+        // it is to be read as a plan rather than as a result.
+        if result.dry_run {
+            out.push_str(
+                "<div class=\"dry\"><strong>DRY RUN</strong> — no requests were sent. \
+                 The rows below are the ones this report <em>would</em> produce; the \
+                 response columns are blank, and nothing has been scored.</div>\n",
+            );
+        }
         // A stopped run announces itself before anything else in the document.
         // It goes above the toolbar and the metric cards on purpose: those
         // figures are computed over the rows that *ran*, so a reader who meets
@@ -1278,32 +1324,46 @@ impl ReportWriter for XlsxWriter {
             }
         }
 
-        // A stopped run says so in a final row, as the CSV does — the header
-        // row is row 0 and everything below it (the freeze pane, the
-        // autofilter range, every image anchor) is addressed by absolute row
-        // number, so announcing it at the top would mean re-numbering the
-        // whole sheet to say one thing.
-        if let Some(partial) = &result.partial {
-            let partial_fmt = Format::new()
+        // A dry run and a stopped run each say so in a final row, as the CSV
+        // does — the header row is row 0 and everything below it (the freeze
+        // pane, the autofilter range, every image anchor) is addressed by
+        // absolute row number, so announcing either at the top would mean
+        // re-numbering the whole sheet to say one thing.
+        let mut excel_row = (result.rows.len() + 1 + result.summary_rows(&columns).len()) as u32;
+        let mut banner = |sheet: &mut rust_xlsxwriter::Worksheet,
+                          tag: &str,
+                          text: String|
+         -> Result<(), String> {
+            let fmt = Format::new()
                 .set_bold()
                 .set_background_color(Color::RGB(0xFF_EB9C));
-            let excel_row = (result.rows.len() + 1 + result.summary_rows(&columns).len()) as u32;
             sheet
-                .write_string_with_format(excel_row, 0, "PARTIAL", &partial_fmt)
+                .write_string_with_format(excel_row, 0, tag, &fmt)
                 .map_err(|e| e.to_string())?;
             if columns.len() > 1 {
                 sheet
-                    .write_string_with_format(
-                        excel_row,
-                        1,
-                        format!(
-                            "{} of {} rows ran",
-                            partial.rows_completed, partial.rows_planned
-                        ),
-                        &partial_fmt,
-                    )
+                    .write_string_with_format(excel_row, 1, text, &fmt)
                     .map_err(|e| e.to_string())?;
             }
+            excel_row += 1;
+            Ok(())
+        };
+        if result.dry_run {
+            banner(
+                &mut *sheet,
+                "DRY RUN",
+                "no requests were sent — these rows are projected, not measured".to_string(),
+            )?;
+        }
+        if let Some(partial) = &result.partial {
+            banner(
+                &mut *sheet,
+                "PARTIAL",
+                format!(
+                    "{} of {} rows ran",
+                    partial.rows_completed, partial.rows_planned
+                ),
+            )?;
         }
 
         // Ground-truth metrics get a sheet of their own rather than more footer
@@ -2010,6 +2070,7 @@ mod tests {
 
     fn row(cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {
+            errors: Vec::new(),
             role: crate::report::model::RowRole::default(),
             cells: cells
                 .iter()
@@ -2103,6 +2164,71 @@ mod tests {
         assert!(html[banner..].contains("2 of 5"), "with the counts");
         let table = html.find("<table").expect("a table");
         assert!(banner < table, "the caveat is read before the numbers are");
+    }
+
+    /// A dry run's file says so in the same place a stopped run's does: a
+    /// spreadsheet of projected rows is indistinguishable from a run where
+    /// every request came back empty, and that is the reading this row exists
+    /// to prevent.
+    #[test]
+    fn a_dry_run_csv_ends_with_a_row_that_says_nothing_was_sent() {
+        let res = ReportResult {
+            column_order: vec!["p.HttpStatus".into(), "p.status".into()],
+            rows: vec![row(&[("p.HttpStatus", ""), ("p.status", "")])],
+            dry_run: true,
+            ..Default::default()
+        };
+        let text = csv(&res);
+        assert_eq!(
+            text.lines().last(),
+            Some("DRY RUN,no requests were sent - these rows are projected rather than measured"),
+            "last, and of the table's width: {text:?}"
+        );
+    }
+
+    /// The machine-readable claim, always present: a CI gate reads one boolean
+    /// rather than inferring a preview from the blanks in it.
+    #[test]
+    fn a_dry_run_json_says_so_at_the_top_level() {
+        let res = ReportResult {
+            column_order: vec!["p.status".into()],
+            rows: vec![row(&[("p.status", "")])],
+            dry_run: true,
+            ..Default::default()
+        };
+        let out = JsonWriter.write(&res, &Header::default()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["dry_run"], serde_json::json!(true));
+
+        let real = ReportResult {
+            rows: vec![row(&[("p.status", "ok")])],
+            ..Default::default()
+        };
+        let v: serde_json::Value =
+            serde_json::from_slice(&JsonWriter.write(&real, &Header::default()).unwrap()).unwrap();
+        assert_eq!(v["dry_run"], serde_json::json!(false), "always stated");
+    }
+
+    /// And in HTML above everything, ahead of the stopped-run banner: "these
+    /// rows were never sent" is the first thing a reader has to know.
+    #[test]
+    fn a_dry_run_html_banner_comes_first_of_all() {
+        let res = ReportResult {
+            column_order: vec!["p.status".into()],
+            rows: vec![row(&[("p.status", "")])],
+            dry_run: true,
+            partial: Some(crate::report::model::Partial {
+                rows_completed: 1,
+                rows_planned: 2,
+            }),
+            ..Default::default()
+        };
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        let dry = html.find("class=\"dry\"").expect("a dry-run banner");
+        assert!(html[dry..].contains("DRY RUN"));
+        let partial = html.find("class=\"partial\"").expect("the stopped banner");
+        let table = html.find("<table").expect("a table");
+        assert!(dry < partial && dry < table, "first of everything");
     }
 
     #[test]

@@ -74,6 +74,10 @@ impl BaselineRow {
             // about to stand in for, and is matched leniently for that reason.
             comparison: None,
             target: self.target.clone(),
+            // A snapshot records what a past run *produced*, not how it went:
+            // the errors of a run that finished days ago are not this run's to
+            // report, and would be indistinguishable from live ones.
+            errors: Vec::new(),
         }
     }
 }
@@ -189,6 +193,7 @@ mod tests {
 
     fn row(key: &[&str], cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {
+            errors: Vec::new(),
             role: RowRole::Unknown,
             cells: cells
                 .iter()

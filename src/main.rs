@@ -174,6 +174,28 @@ struct Cli {
     #[arg(long, requires = "report")]
     dry_run: bool,
 
+    /// With `-r`: fail the run when ground-truth accuracy comes out below this
+    /// percentage (`--fail-under 95`), exiting 5. This is the CI gate: without
+    /// it a run that answered every question wrong still exits 0, because the
+    /// report was produced successfully. The figure judged is the one printed
+    /// in the summary — the whole run's `Correct` roll-up, over the rows that
+    /// had a truth to compare against. A report that declares no `TRUTH` has
+    /// nothing to gate on and is refused; so is `--dry-run`, which measures
+    /// nothing.
+    #[arg(
+        long,
+        value_name = "PERCENT",
+        requires = "report",
+        // `requires` is not exclusion: `--postman-import -r x.trail
+        // --fail-under 95` satisfied it and then took the import path, where
+        // nothing is ever scored — so the gate was silently ignored and the
+        // command exited 0. A gate that can be quietly skipped is worse than
+        // one that refuses the command line.
+        conflicts_with_all = ["dry_run", "postman_import"],
+        value_parser = percentage
+    )]
+    fail_under: Option<f64>,
+
     /// With `-r`: run only these steps and whatever they depend on
     /// (comma-separated step names). Every named step must be inside a `GRAPH`
     /// region — only a region declares the complete graph that a closure needs,
@@ -195,7 +217,8 @@ struct Cli {
     /// report.html -o report.json` yields a rendering to show and a structure
     /// to parse without running the requests twice. `-` writes CSV to stdout
     /// (for piping) and may be given at most once; a path's extension selects
-    /// the format (`.csv`, `.json`, `.html`, `.xlsx` or `.pdf`); omitted
+    /// the format (`.csv`, `.json`, `.html`, `.xlsx`, `.pdf` or `.xml`
+    /// for JUnit); omitted
     /// derives a single file from the report's `# output:`/`# name:` headers
     /// (next to the report file, honouring the `{time}` token). With
     /// `--postman-import` it is instead the download directory, and takes one
@@ -311,6 +334,32 @@ struct Cli {
     overwrite: bool,
 }
 
+/// Parse a `--fail-under` threshold, as a percentage.
+///
+/// Rejected out of range rather than clamped: `--fail-under 200` is a typo (or
+/// a fraction written as `0.95` where `95` was meant), and a gate that can
+/// never pass is worse than no gate — it would fail every deploy for a reason
+/// nobody would look for in the arguments.
+fn percentage(raw: &str) -> Result<f64, String> {
+    let trimmed = raw.trim();
+    // At most one `%`, stripped rather than required: `--fail-under 95%` is the
+    // natural thing to type (and in a shell it needs no quoting), while `95%%`
+    // is a typo — most likely a `printf` format string that was never expanded,
+    // which is precisely the case a lenient parser would turn into a threshold
+    // nobody chose.
+    let digits = trimmed.strip_suffix('%').unwrap_or(trimmed);
+    let v: f64 = digits
+        .parse()
+        .map_err(|_| format!("'{raw}' is not a number"))?;
+    // NaN fails every comparison, including the range check below, so it is
+    // rejected there; infinities are out of range. Both would otherwise make a
+    // gate that can never pass.
+    if !(0.0..=100.0).contains(&v) {
+        return Err(format!("'{raw}' is not a percentage between 0 and 100"));
+    }
+    Ok(v)
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -365,6 +414,7 @@ fn main() {
             cli.targets,
             cli.shuffle,
             cli.params.into_iter().collect(),
+            cli.fail_under,
             cli.progress_json,
             cli.grace,
             cli.stop_on_stdin,
@@ -451,4 +501,35 @@ fn run_gui() -> i32 {
          \x20   cargo install paperboy --locked --features gui"
     );
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--fail-under` is the one argument that decides whether a deploy is
+    /// blocked, so its parser is held to what a caller can plausibly type —
+    /// and no further. A lenient reading of a malformed threshold is a gate
+    /// set to a number nobody chose.
+    #[test]
+    fn a_threshold_is_a_percentage_with_at_most_one_sign() {
+        assert_eq!(percentage("95"), Ok(95.0));
+        assert_eq!(percentage("95%"), Ok(95.0));
+        assert_eq!(percentage(" 99.5 "), Ok(99.5));
+        assert_eq!(percentage("0"), Ok(0.0));
+        assert_eq!(percentage("100"), Ok(100.0));
+
+        // A doubled sign is a `printf` format that was never expanded.
+        assert!(percentage("95%%").is_err());
+        assert!(percentage("%95").is_err());
+        assert!(percentage("").is_err());
+        assert!(percentage("high").is_err());
+        // Out of range rather than clamped: `0.95` is a fraction where a
+        // percentage was meant, and would silently gate on nothing.
+        assert!(percentage("101").is_err());
+        assert!(percentage("-1").is_err());
+        // Neither of these can ever be met.
+        assert!(percentage("nan").is_err());
+        assert!(percentage("inf").is_err());
+    }
 }

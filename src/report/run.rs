@@ -378,6 +378,7 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         skipped: ex.skipped,
         warnings: ex.warnings,
         timing_columns: ex.timing_columns.into_iter().collect(),
+        duration_columns: ex.duration_columns.into_iter().collect(),
         column_stats: flow.column_stats(),
         column_images: flow.column_images(),
         column_truths: flow.column_truths(),
@@ -391,6 +392,12 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         baseline_rows: HashMap::new(),
         track_baseline: false,
         trends: HashMap::new(),
+        // Decided by `finalize`, not here: the emit phase runs against an
+        // offline runner for a *live* run too (the skeleton both front-ends
+        // expand to pre-build their grid), and that skeleton goes on to hold
+        // real rows. Finalize is where a result becomes an artefact, so that
+        // is where it is asked what kind of one it is.
+        dry_run: false,
     }
 }
 
@@ -399,6 +406,12 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
 /// snapshot (a no-op otherwise). Done off the row model so the CSV writer and
 /// the TUI grid both pick it up unchanged. Applied once, after the emit phase.
 pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
+    // What kind of result this is, decided before anything reads it: an
+    // offline runner sent nothing, so every response-shaped cell below is
+    // blank by construction, and the collapse and the scoring must say
+    // "not run" rather than judge a run that never happened (see
+    // `ReportResult::dry_run`).
+    result.dry_run = ctx.runner.offline();
     // Decided *before* the collapse, because the collapse is the only moment at
     // which both sides of a comparison exist: a truth-bearing report needs the
     // baseline row kept so `Trend` can ask what the baseline itself answered.
@@ -471,7 +484,12 @@ fn resolve_truths(result: &mut ReportResult, flow: &ReportFlow) {
                 continue;
             };
             let expected = substitute(template, &scope);
-            let untested = expected.trim().is_empty() || expected.contains("{{");
+            // A dry run has no answer to score: the cell a response would have
+            // filled is blank, and blank matches almost no ground truth, so
+            // scoring it would mark every planned row wrong for the crime of
+            // not having been run. `Untested` is exactly the verdict for "this
+            // report has no result for that row".
+            let untested = result.dry_run || expected.trim().is_empty() || expected.contains("{{");
             let score = |answer: &str| {
                 if untested {
                     Verdict::Untested
@@ -658,6 +676,12 @@ struct Exec<'a> {
     /// Produced column keys whose value came from a *timing* intrinsic, however
     /// the column is named — see [`ReportResult::timing_columns`].
     timing_columns: Vec<String>,
+    /// The subset of [`Self::timing_columns`] that measures a request's *whole*
+    /// duration, under whatever name a field aliased it to. `TimeSetup` and its
+    /// siblings are timings too, but they are parts of the same elapsed time —
+    /// a writer that reports "how long did this row take" has to add up the
+    /// totals only, or it counts the same milliseconds several times over.
+    duration_columns: Vec<String>,
     /// Non-fatal problems (unresolved request, transport failure, …). Every
     /// issue still leaves a row.
     errors: Vec<String>,
@@ -699,6 +723,11 @@ struct Exec<'a> {
     /// all. It is a flow-wide property, so it is seeded once and inherited by
     /// every forked iteration.
     baseline_show: Vec<String>,
+    /// Errors raised by the scopes this execution was forked from, kept so
+    /// a row can be attributed the failure that made it wrong even when the
+    /// request that failed was written outside its loop. Never re-raised:
+    /// the run's own flat error list keeps each error exactly once.
+    inherited_errors: Vec<String>,
 }
 
 /// A cloneable snapshot of an [`Exec`]'s scope/capture/target state (no output
@@ -724,6 +753,7 @@ struct ExecState {
     target_env: Option<HashMap<String, String>>,
     broadcast: HashMap<String, String>,
     baseline_show: Vec<String>,
+    inherited_errors: Vec<String>,
 }
 
 /// The per-iteration output collected from a forked [`Exec`], reassembled in
@@ -736,6 +766,7 @@ struct IterOut {
     role_targets: HashMap<String, Vec<String>>,
     columns: Vec<String>,
     timing_columns: Vec<String>,
+    duration_columns: Vec<String>,
     errors: Vec<String>,
     skipped: Vec<String>,
     warnings: Vec<String>,
@@ -764,6 +795,7 @@ struct StepOut {
     cells: HashMap<String, String>,
     columns: Vec<String>,
     timing_columns: Vec<String>,
+    duration_columns: Vec<String>,
     errors: Vec<String>,
     warnings: Vec<String>,
 }
@@ -1176,6 +1208,7 @@ fn skip_out(
         cells: HashMap::new(),
         columns: Vec::new(),
         timing_columns: Vec::new(),
+        duration_columns: Vec::new(),
         errors: Vec::new(),
         warnings: Vec::new(),
     };
@@ -1239,6 +1272,7 @@ fn run_step(
         cells,
         columns: ex.column_order,
         timing_columns: ex.timing_columns,
+        duration_columns: ex.duration_columns,
         errors: ex.errors,
         warnings: ex.warnings,
     }
@@ -1265,11 +1299,13 @@ impl<'a> Exec<'a> {
             broadcast: HashMap::new(),
             column_order: Vec::new(),
             timing_columns: Vec::new(),
+            duration_columns: Vec::new(),
             errors: Vec::new(),
             skipped: Vec::new(),
             warnings: Vec::new(),
             role_targets: HashMap::new(),
             baseline_show: Vec::new(),
+            inherited_errors: Vec::new(),
         }
     }
 
@@ -1294,6 +1330,19 @@ impl<'a> Exec<'a> {
             target_env: self.target_env.clone(),
             broadcast: self.broadcast.clone(),
             baseline_show: self.baseline_show.clone(),
+            // Everything this scope has already raised travels *into* the fork
+            // as context: an error raised before a loop is the reason every row
+            // the loop produces is wrong, and a row that streamed clean while
+            // the request feeding it had failed is the same lie the exit code
+            // used to tell. It is context, not ownership — the errors stay
+            // where they were raised in the run's own flat list, and only the
+            // rows' attribution is widened.
+            inherited_errors: self
+                .inherited_errors
+                .iter()
+                .chain(self.errors.iter())
+                .cloned()
+                .collect(),
         }
     }
 
@@ -1317,8 +1366,10 @@ impl<'a> Exec<'a> {
             comparison: state.comparison,
             target_env: state.target_env,
             broadcast: state.broadcast,
+            inherited_errors: state.inherited_errors,
             column_order: Vec::new(),
             timing_columns: Vec::new(),
+            duration_columns: Vec::new(),
             errors: Vec::new(),
             skipped: Vec::new(),
             warnings: Vec::new(),
@@ -1525,6 +1576,15 @@ impl<'a> Exec<'a> {
     fn note_timing_column(&mut self, key: &str) {
         if !self.timing_columns.iter().any(|c| c == key) {
             self.timing_columns.push(key.to_string());
+        }
+    }
+
+    /// Record that `key` holds a request's *total* elapsed time, so a writer
+    /// asking how long a row took can add up the totals without also adding
+    /// the setup/wait/download slices of the same request.
+    fn note_duration_column(&mut self, key: &str) {
+        if !self.duration_columns.iter().any(|c| c == key) {
+            self.duration_columns.push(key.to_string());
         }
     }
 
@@ -2044,6 +2104,15 @@ impl<'a> Exec<'a> {
         for (k, v) in &self.broadcast {
             cells.entry(k.clone()).or_insert_with(|| v.clone());
         }
+        // `run_cleanups` *drains* the errors a teardown raised (they become
+        // warnings), so the list can be shorter than the mark taken when the
+        // block started — clamp rather than slice past the end.
+        let errors: Vec<String> = self
+            .inherited_errors
+            .iter()
+            .chain(self.errors[err_mark.min(self.errors.len())..].iter())
+            .cloned()
+            .collect();
         let row = ReportRow {
             cells,
             vars: self.visible_vars(),
@@ -2052,13 +2121,13 @@ impl<'a> Exec<'a> {
             target: self.target.clone(),
             role: self.role,
             comparison: self.comparison.clone(),
+            errors,
         };
         if let Some(sink) = self.ctx.sink {
-            // `run_cleanups` *drains* the errors a teardown raised (they become
-            // warnings), so the list can be shorter than the mark taken when the
-            // block started — clamp rather than slice past the end.
-            let errors = &self.errors[err_mark.min(self.errors.len())..];
-            sink(RowEvent::Completed { row: &row, errors });
+            sink(RowEvent::Completed {
+                row: &row,
+                errors: &row.errors,
+            });
         }
         row
     }
@@ -2269,7 +2338,18 @@ impl<'a> Exec<'a> {
         };
         let out = self.ctx.runner.run(&base, &self.vars_for());
         self.record_generated(&alias, &out.generated);
-        let eo = match out.entries.into_iter().next() {
+        // The run's verdict, decided over the *surviving* attempts only: with
+        // `[Options] retry`, a poll that answered twice and then succeeded is
+        // one request that passed, and `RunOutput::error` already applies that
+        // rule (a `repeat`'s several outcomes all survive, and all count).
+        // Taken before the entries are consumed below.
+        let surviving_error = out.error.clone();
+        // The outcome the row is built from is likewise the first attempt that
+        // was not thrown away. Taking `next()` would report the first failed
+        // attempt of a request that was retried until it worked — the response,
+        // the status, the timing and (before this) the run's exit code would
+        // all describe an attempt Hurl had already superseded.
+        let eo = match out.entries.into_iter().find(|e| !e.superseded) {
             Some(eo) => eo,
             None => {
                 let err = out
@@ -2286,7 +2366,31 @@ impl<'a> Exec<'a> {
         // and never touch the capture chain). The alias doubles as the step
         // name, so `{{alias.var}}` reaches exactly this statement's captures.
         self.record_captures(&alias, &eo.captures);
-        self.note_step(&alias, name, eo.ok);
+        // `eo.ok` is this outcome's; `surviving_error` catches a *later*
+        // surviving attempt that failed, which only a `repeat` can produce (its
+        // runs are N real requests, every one of which counts).
+        let ok = eo.ok && surviving_error.is_none();
+        self.note_step(&alias, name, ok);
+        // A request that was *sent* and came back failed — a transport error, a
+        // status the request didn't expect, a failed assertion — is a run
+        // error, not just a cell.
+        //
+        // It used to be only the cell: the `{alias}.Error` column below carried
+        // the reason, and nothing else knew. That made the row look clean to
+        // everything downstream (`RowEvent::Completed` reported no errors, so a
+        // streaming grid never painted the slot red) and, worse, made the
+        // failure invisible to the exit code — a headless smoke test against a
+        // service that was refusing connections exited 0. The same request
+        // sent by a plain `REQUEST` statement has always raised an error here,
+        // so which spelling was used decided whether a broken API failed the
+        // run, which is indefensible either way round.
+        if !ok {
+            let err = surviving_error
+                .clone()
+                .or_else(|| eo.error.clone())
+                .unwrap_or_else(|| "request failed".to_string());
+            self.errors.push(format!("{alias}: {err}"));
+        }
 
         // Resolve the response format: per-statement / WITH override, else the
         // prelude default.
@@ -2309,9 +2413,16 @@ impl<'a> Exec<'a> {
         cells.push((format!("{alias}.TimeWait"), eo.wait_ms.to_string()));
         cells.push((format!("{alias}.TimeDownload"), eo.download_ms.to_string()));
         cells.push((format!("{alias}.Asserts"), asserts_summary(&eo)));
+        // The cell carries the same failure the run error does, surviving
+        // attempts included: a `repeat` whose second run failed leaves this
+        // outcome's own `error` empty while the request as a whole did not
+        // hold, and a blank `Error` cell beside a failed run reads as a bug.
         cells.push((
             format!("{alias}.Error"),
-            eo.error.clone().unwrap_or_default(),
+            eo.error
+                .clone()
+                .or_else(|| surviving_error.clone())
+                .unwrap_or_default(),
         ));
         cells.push((format!("{alias}.Response"), response.clone()));
 
@@ -2352,6 +2463,9 @@ impl<'a> Exec<'a> {
             // [`ReportResult::timing_columns`].
             if TIMING_INTRINSIC_FIELDS.contains(&query) {
                 self.note_timing_column(&key);
+                if query == "Time" {
+                    self.note_duration_column(&key);
+                }
             }
             cells.push((key, value));
         }
@@ -2462,6 +2576,7 @@ impl<'a> Exec<'a> {
                 role_targets: sub.role_targets,
                 columns: sub.column_order,
                 timing_columns: sub.timing_columns,
+                duration_columns: sub.duration_columns,
                 errors: sub.errors,
                 skipped: sub.skipped,
                 warnings: sub.warnings,
@@ -2529,6 +2644,9 @@ impl<'a> Exec<'a> {
             }
             for c in &out.timing_columns {
                 self.note_timing_column(c);
+            }
+            for c in &out.duration_columns {
+                self.note_duration_column(c);
             }
             self.errors.extend(out.errors.iter().cloned());
             self.warnings.extend(out.warnings.iter().cloned());
@@ -2682,6 +2800,7 @@ impl<'a> Exec<'a> {
                 role_targets: sub.role_targets,
                 columns: sub.column_order,
                 timing_columns: sub.timing_columns,
+                duration_columns: sub.duration_columns,
                 errors: sub.errors,
                 skipped: sub.skipped,
                 warnings: sub.warnings,
@@ -2799,6 +2918,9 @@ impl<'a> Exec<'a> {
             }
             for c in &out.timing_columns {
                 self.note_timing_column(c);
+            }
+            for c in &out.duration_columns {
+                self.note_duration_column(c);
             }
             self.errors.extend(out.errors);
             self.skipped.extend(out.skipped);
@@ -8695,6 +8817,133 @@ mod tests {
             res.column_order
         );
         assert!(res.trends.is_empty());
+    }
+
+    /// A dry run sent nothing, so it has no answers to be right or wrong
+    /// about: every ground-truth verdict is `untested`, whatever the cell
+    /// happens to hold. Blanket, and deliberately so — scoring the handful of
+    /// columns that don't need a response would produce an accuracy figure
+    /// computed over an arbitrary subset of the report, which reads like a
+    /// verdict on the whole of it.
+    #[test]
+    fn a_dry_run_scores_nothing_and_says_it_is_a_dry_run() {
+        let flow =
+            parse_flow("REPORT \"yes\" AS A TRUTH \"yes\"\nREPORT \"no\" AS B TRUTH \"yes\"\n")
+                .expect("flow parses");
+        let dry = DryRunner;
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &dry,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+            shuffle: None,
+            cancel: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert!(res.dry_run, "the result carries what kind of run made it");
+        assert!(
+            res.verdicts.values().all(|v| *v == Verdict::Untested),
+            "nothing was run, so nothing was wrong: {:?}",
+            res.verdicts
+        );
+        assert_eq!(
+            res.rows[0].cells.get(CORRECT_COLUMN).map(String::as_str),
+            Some("untested"),
+            "and the roll-up says so rather than 'incorrect'"
+        );
+        let columns = res.resolved_columns(&flow.header);
+        assert!(
+            res.metrics(&columns, &flow.header).is_none(),
+            "a preview has no accuracy, not an accuracy of zero"
+        );
+    }
+
+    /// The bug this guards: a `REPORT REQUEST` whose send came back failed used
+    /// to put the reason in its `.Error` *cell* and nowhere else, so the row
+    /// looked clean to the streaming sink and the failure never reached the
+    /// exit code. A headless smoke test against a service refusing connections
+    /// exited 0. The identical request under a plain `REQUEST` statement has
+    /// always raised a run error, so the spelling decided whether a broken API
+    /// failed the run.
+    #[test]
+    fn a_reported_request_that_came_back_failed_raises_a_run_error() {
+        let entries = [entry("Ping", &[])];
+        let fake = Fake::new(&[(
+            "Ping",
+            Canned {
+                status: 500,
+                error: Some("Expected status 200 but got 500".into()),
+                ..Default::default()
+            },
+        )]);
+        let res = run("REPORT REQUEST Ping\n", &entries, &[], &[], &fake);
+        assert_eq!(res.errors.len(), 1, "{:?}", res.errors);
+        assert!(
+            res.errors[0].contains("Ping") && res.errors[0].contains("500"),
+            "the error names the request and the reason: {:?}",
+            res.errors
+        );
+        assert_eq!(
+            res.rows[0].cells.get("Ping.Error").map(String::as_str),
+            Some("Expected status 200 but got 500"),
+            "and the cell it always had is unchanged"
+        );
+
+        // A request that answered normally still raises nothing: the error is
+        // the runner's verdict on the entry, not a reaction to any status.
+        let fine = Fake::new(&[ok("Ping")]);
+        let res = run("REPORT REQUEST Ping\n", &entries, &[], &[], &fine);
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+    }
+
+    /// And the row carries it, so a streaming front-end can paint that slot red
+    /// while the run is still going — the result-level list says *that*
+    /// something failed, never *which row*.
+    #[test]
+    fn a_failed_reported_request_blames_its_own_row() {
+        let entries = [entry("Ping", &[])];
+        let fake = Fake::new(&[(
+            "Ping",
+            Canned {
+                status: 0,
+                error: Some("HTTP connection".into()),
+                ..Default::default()
+            },
+        )]);
+        let flow = parse_flow("FOR X IN [\"a\"]\n    REPORT REQUEST Ping\nEND\n").expect("flow");
+        let seen = std::sync::Mutex::new(Vec::new());
+        let sink = |ev: RowEvent| {
+            if let RowEvent::Completed { row, errors } = ev {
+                seen.lock()
+                    .unwrap()
+                    .push((row.path.clone(), errors.to_vec()));
+            }
+        };
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: Some(&sink),
+            shuffle: None,
+            cancel: None,
+        };
+        run_flow(&flow, &ctx);
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].1.iter().any(|e| e.contains("HTTP connection")),
+            "the row that failed says so: {seen:?}"
+        );
     }
 
     /// The reserved `Correct` column summarises the row, so a ground-truthed

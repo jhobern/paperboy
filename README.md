@@ -731,7 +731,8 @@ apply, resolved relative to the report. `-e` is repeatable: each file is named
 by its stem and becomes selectable in an `ENVS` loop, so `-e prod.vars -e
 staging.vars` satisfies `FOR … IN ENVS BASELINE("prod"), COMPARISON("staging")`;
 the first is also the base variable layer. `-o`'s extension picks the format
-(`.csv`, `.json`, `.html`, `.xlsx`, `.pdf`), `-` writes CSV to stdout, and
+(`.csv`, `.json`, `.html`, `.xlsx`, `.pdf`, or `.xml` for JUnit), `-` writes CSV
+to stdout, and
 omitting it derives the filename from the report's own headers.
 
 `-o` is repeatable, and every file comes from **one** run of the requests — the
@@ -761,11 +762,66 @@ than a value that silently does nothing. A `PARAM` with no default *requires*
 a `--param`, since there is nothing to fall back on.
 
 Exit codes are a contract for callers: `0` ran clean, `1` a setup error or a
-run with per-row errors, `3` some steps were skipped because something they
-depended on failed, `4` the run was stopped before it finished (see [Stopping a
-run](#stopping-a-run-ctrl-c---grace---stop-on-stdin)), `130` a stop that was
-repeated and so forced, and `2` (clap's) means the command line itself was
-wrong. Progress goes to stderr, so `-o -` leaves stdout clean for a pipe.
+run in which something failed — a request that did not come back, an assertion
+that did not hold — `3` some steps were skipped because something they depended
+on failed, `4` the run was stopped before it finished (see [Stopping a
+run](#stopping-a-run-ctrl-c---grace---stop-on-stdin)), `5` a `--fail-under`
+gate was not met, `130` a stop that was repeated and so forced, and `2`
+(clap's) means the command line itself was wrong. Progress goes to stderr, so
+`-o -` leaves stdout clean for a pipe.
+
+#### In a pipeline (`--fail-under`, JUnit)
+
+A report is a deploy check as much as it is a document, and a pipeline reads
+one thing: the exit code. Two failures are worth telling apart.
+
+*The run broke.* A request that never came back, or that failed its
+assertions, fails the run — exit `1`, the same as `paperboy -c`. The row still
+appears in the report with its error in the cell, because the point of a report
+is to show every case rather than stop at the first, but the process does not
+claim success.
+
+*The answers were wrong.* Everything was sent and read, and the API's answers
+did not match the ground truth. That run is faultless by every measure above,
+and `--fail-under` is what turns it into a failed pipeline step:
+
+```sh
+paperboy -r post-deploy.trail --fail-under 95 -o results.xml
+```
+
+The gate is measured on the whole run's `Correct` roll-up — the per-row verdict,
+over the rows that had a `TRUTH` to compare against — and fails the run with
+exit `5` when it comes out below the threshold. Rows with no ground truth are
+not counted as wrong: they were never asked. The comparison is made on the
+unrounded figure, so `--fail-under 100` means *every scored row was right*
+rather than "right to one decimal place"; where the rounded figure would
+contradict the verdict, the summary prints both numbers to the precision that
+separates them (`accuracy 94.96% — UNDER the required 95.00%`). A report that
+scores no column at all has nothing to gate on and is refused *before* anything
+is sent, rather than passing every deploy on no evidence; `--dry-run` and
+`--postman-import` are refused for the same reason. If a run that declared a
+`TRUTH` nevertheless scores nothing, that is a broken run and exits `1`: there
+is no accuracy to hold to a threshold. A run that was **stopped** (exit `4`) is
+not given a gate verdict at all — the figure would be drawn from whichever rows
+happened to finish. `5` is its own code because the two failures call for
+different responses: `1` is worth retrying, `5` never is.
+
+`-o results.xml` writes **JUnit XML**, which is what makes a run show up as
+test results in a CI UI rather than as a file nobody opens: one `<testcase>` per
+row, named by the row's key so a case keeps its identity between runs, with a
+failed request as `<error>`, a wrong answer as `<failure>` carrying both sides
+of the comparison, and a dry run's cases as `<skipped>`. Each case gets exactly
+one of those, in that order of seniority — a row whose request failed is an
+`<error>` even if its answer was also wrong, because the stricter JUnit schemas
+allow a case one outcome and a case counted twice makes every consumer's
+arithmetic disagree; the demoted verdict is written into the case's
+`<system-out>` rather than lost. Run errors that belong to no row (an empty
+glob, a producer that failed before any row existed) and the run's caveats
+become one extra case, so a run that produced nothing *because* something was
+wrong is never a green suite of zero tests — and so the caveats are visible in
+the CI systems that only read output attached to a case. It is an ordinary `-o`, so one run can write
+`-o results.xml -o report.html` and give the pipeline its verdict and a human
+the detail.
 
 #### Watching a run from another program (`--progress-json`)
 
@@ -783,7 +839,7 @@ paperboy -r nightly.trail -o out.json --progress-json 2>events.ndjson
 {"event":"row_started","schema":1,"path":"0.0","row_index":0}
 {"event":"row_completed","schema":1,"path":"0.0","row_index":0,"ok":true,"target":null,"cells":{"Case":"a","Status":"200"},"errors":[],"withheld":[]}
 {"event":"output_written","schema":1,"path":"out.json","format":"json","ok":true,"error":null}
-{"event":"run_finished","schema":1,"ok":true,"exit_code":0,"rows":2,"interrupted":false,"partial":null,"rows_completed":null,"rows_planned":null,"warnings":[],"skipped":[],"errors":[]}
+{"event":"run_finished","schema":1,"ok":true,"exit_code":0,"rows":2,"interrupted":false,"dry_run":false,"partial":null,"rows_completed":null,"rows_planned":null,"warnings":[],"skipped":[],"errors":[],"gate":null}
 ```
 
 `plan` arrives once, after the projection pass and before a single request is
@@ -797,7 +853,10 @@ collapse an `ENVS` comparison, the index of its row in a `-o out.json` report.
 That is what makes the live grid and the finished file explicitly linkable: a
 consumer can keep progress cheap and read the full values from the report at
 the end. `run_finished` is the last line and carries the exit code the process
-is about to use.
+is about to use. With `--fail-under` it also carries a `gate` object
+(`{"metric":"accuracy","required":95.0,"actual":92.4,"compared":250,
+"passed":false,"note":"…"}`), and `null` without one — so a consumer can tell a
+gate that passed from a deploy nobody checked.
 
 The stream stays cheap deliberately: `DETAIL` and `IMAGE` columns — the ones the
 report itself marks as drill-down content, a raw response body among them — are
@@ -823,6 +882,17 @@ runs at all.)
 `row_started`/`row_completed` pair per projected row, cells and all — without
 sending a request. It is the cheap way for a consumer to draw the grid, or to
 check its own parsing, before committing to a real run.
+
+A dry run's report file is a **plan, and says so**. Its rows are the ones the
+run would produce with the response columns blank, so every format carries the
+caveat in the same idiom a stopped run's `PARTIAL` uses: a `DRY RUN` banner
+above the HTML, `"dry_run": true` at the top level of the JSON (and on
+`run_finished`, beside the existing key on `plan`), a final `DRY RUN,…` record
+in the CSV, a bold row under the XLSX summary, the PDF title. Nothing in it is
+scored either: a ground-truth verdict reads `untested` rather than `incorrect`,
+a comparison `Result` reads `not run (dry run)` rather than claiming the
+candidate matched its baseline, and there are no metrics at all — a preview has
+no accuracy, not an accuracy of 0%.
 
 #### Stopping a run (Ctrl-C, `--grace`, `--stop-on-stdin`)
 
@@ -1078,6 +1148,8 @@ collection file, not a fixture directory that `FOR … IN FILES` reads.
 | `0`  | Everything ran and every assertion passed. |
 | `1`  | Something failed: a request, an assertion, or the report itself. |
 | `3`  | Steps were skipped because something they depended on failed. |
+| `4`  | The run was stopped before it finished. |
+| `5`  | A `--fail-under` gate was not met: the run was clean, the answers were not good enough. |
 
 `3` implies `1` — a skip only ever follows a failure — and says the run is
 additionally incomplete, so a pipeline that only cares about pass/fail can

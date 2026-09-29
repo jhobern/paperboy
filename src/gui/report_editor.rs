@@ -4964,9 +4964,9 @@ fn results_grid(
                         None => (0..result.rows.len()).collect(),
                     };
                     for i in order {
-                        let Some(row) = result.rows.get(i) else {
+                        if i >= result.rows.len() {
                             continue;
-                        };
+                        }
                         let state = states.and_then(|s| s.get(i)).copied();
                         // A click anywhere on the row opens its drill-down --
                         // including the gaps between columns, and the empty
@@ -5055,7 +5055,14 @@ fn results_grid(
                             _ => th.text,
                         };
                         for (c, col) in columns.iter().enumerate() {
-                            let full = col.value(row, &result.no_match_marker);
+                            // A row the run hasn't reached yet shows
+                            // placeholders rather than the dry pass's
+                            // fabricated intrinsics (see `display_cell`).
+                            let full = result.display_cell(
+                                i,
+                                col,
+                                matches!(state, Some(RowState::Running)),
+                            );
                             let w = widths.get(c).copied().unwrap_or(MIN_COL_W);
                             cell_slot(ui, w, row_h, |ui| {
                                 if let Some(ins) = result_cell(ui, text_col, &col.header, &full) {
@@ -5406,9 +5413,9 @@ fn natural_column_widths(
                     longest = text;
                 }
             };
-            for row in &result.rows {
+            for (r, _) in result.rows.iter().enumerate() {
                 consider(truncate_cell(&flatten_cell(
-                    &col.value(row, &result.no_match_marker),
+                    &result.display_cell(r, col, false),
                 )));
             }
             for srow in &summary {

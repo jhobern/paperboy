@@ -57,6 +57,11 @@ pub const MATCH: &str = "Comparison matched baseline";
 pub const NO_BASELINE: &str = "no baseline";
 /// `Result` value for a baseline row whose row key produced no candidate.
 pub const NO_CANDIDATE: &str = "no candidate";
+/// `Result` value in a **dry run**: both sides of the comparison are rows that
+/// were never sent, so they are identical in the way two blank pages are. A
+/// diff of them would report "matched baseline" for every row, which is the
+/// one answer a preview must not give.
+pub const NOT_RUN: &str = "not run (dry run)";
 
 /// Per-request intrinsic column suffixes. These are excluded from the compared
 /// "reported fields": `Time` (and its `TimeSetup`/`TimeWait`/`TimeDownload`
@@ -273,7 +278,11 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
         let mut emitted = false;
         for comp in &roles.comparisons {
             if let Some(mut cand) = candidate_by_key_target.remove(&(key.clone(), comp.clone())) {
-                let verdict = compute_result(baseline, &cand, &excluded);
+                let verdict = if result.dry_run {
+                    NOT_RUN.to_string()
+                } else {
+                    compute_result(baseline, &cand, &excluded)
+                };
                 cand.cells.insert(RESULT_COLUMN.to_string(), verdict);
                 // Keep the baseline row alive past this collapse when the
                 // report scores a ground truth: the `Trend` needs to know
@@ -436,6 +445,7 @@ mod tests {
 
     fn row(key: &[&str], target: &str, cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {
+            errors: Vec::new(),
             role: RowRole::default(),
             cells: cells
                 .iter()

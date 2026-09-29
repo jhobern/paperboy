@@ -25,6 +25,7 @@ pub mod graph;
 pub mod image;
 pub mod indent;
 pub mod jsondiff;
+pub mod junit;
 pub mod labels;
 pub mod metrics;
 pub mod model;
