@@ -296,7 +296,8 @@ impl Metrics {
         Some(row_rollup(result, result.rows.len() - result.pending.len()))
     }
 
-    /// The metric rows appended to the table's footer, one cell per column.    ///
+    /// The metric rows appended to the table's footer, one cell per column.
+    ///
     /// This is the flat-format rendering — CSV has one table and no room for a
     /// header block, and the live grids in both front-ends already draw summary
     /// rows. Richer formats draw the same numbers as cards above the table
