@@ -60,6 +60,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   `--fail-under` already uses, and is refused before anything is sent when the
   report has no `TRUTH` or no baseline to measure against.
 
+- **Prebuilt binaries and a container image.** Installing meant `cargo
+  install`, which meant a Rust toolchain and the whole build-prerequisite list
+  — on Windows, vcpkg, LLVM, Perl, NASM and a Visual Studio workload before a
+  single request could be sent. Tagging a release now publishes binaries for
+  Linux x86-64, macOS on Apple Silicon and Windows x86-64, with `SHA256SUMS`
+  beside them, and `ghcr.io/jhobern/paperboy` for CI images whose slim base has
+  no system libxml2. The desktop builds are one binary per platform rather than
+  a split: the same file runs `-c`, the terminal UI and `--gui`, because the
+  graphical front-end loads its display libraries only when `--gui` is passed
+  and so costs nothing to a user who never opens it. Linux builds against the
+  oldest supported runner, since glibc is backward but not forward compatible
+  and building on the newest would have excluded every distro older than it.
+
 - **Windows and macOS are now built and tested on every change.** CI ran
   entirely on Linux, so "PaperBoy runs on Windows" was a claim nothing
   enforced — the first person to test it did so by hand, one missing

@@ -28,6 +28,47 @@ all three.
 
 ## Install
 
+### Prebuilt binaries
+
+The quickest route, and the one that needs no Rust toolchain and none of the
+[build prerequisites](#build-prerequisites) below. Download from the [latest
+release](https://github.com/jhobern/paperboy/releases/latest), unpack, and put
+`paperboy` somewhere on your `PATH`.
+
+| File | Platform |
+| --- | --- |
+| `paperboy-<version>-linux-x86_64.tar.gz` | Linux x86-64 — glibc 2.35+ (Ubuntu 22.04+, Debian 12+, RHEL 9+) |
+| `paperboy-<version>-macos-arm64.tar.gz` | macOS, Apple Silicon |
+| `paperboy-<version>-windows-x86_64.zip` | Windows x86-64 |
+| `paperboy-<version>-linux-x86_64-headless.tar.gz` | Linux x86-64, headless runner only |
+
+Every file except `-headless` is the *same* binary in all three modes: it runs
+`-c` headless, the terminal UI, and `--gui`. There is no separate GUI download,
+and choosing the full build costs nothing if you never open it — the graphical
+front-end loads its display libraries only when `--gui` is passed, so the binary
+still runs on a machine that has none.
+
+Each release publishes `SHA256SUMS` beside the archives:
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+### Container
+
+For CI images and anywhere a slim base has no system libxml2 — which the Linux
+binaries above need:
+
+```sh
+docker run --rm -v "$PWD:/work" ghcr.io/jhobern/paperboy -c collection.hurl
+```
+
+The image is the headless build, so it takes the same arguments and writes the
+same reports as any other PaperBoy; `/work` is its working directory, which is
+why the mount above is all the setup there is.
+
+### From source
+
 ```sh
 cargo install paperboy --locked                       # terminal UI + headless runner
 cargo install paperboy --locked --features gui        # …and the graphical UI
@@ -52,6 +93,9 @@ arguments and writes the same reports; only the interactive front-end is
 missing, and running it with no arguments says so rather than doing nothing.
 
 ### Build prerequisites
+
+Only when building from source — the [prebuilt
+binaries](#prebuilt-binaries) and the container need none of this.
 
 Five things Cargo can't fetch for you:
 
