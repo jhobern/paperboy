@@ -8,9 +8,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
-## [0.7.1] - 2026-09-29
+## [0.7.0] - 2026-09-30
 
 ### Added
+
+- **`--fail-under PERCENT`: a quality gate for a report used as a deploy
+  check.** A run in which every request was sent and read, and every answer was
+  wrong, was a successful run — the report had been produced, so the process
+  exited `0`. That is the right answer to "did the run work" and the wrong
+  answer to the question a pipeline is actually asking. `--fail-under 95` holds
+  the run to a threshold and exits **`5`** when it falls short. The figure is
+  the whole run's `Correct` roll-up over the rows that had a `TRUTH` to compare
+  against (rows with no ground truth are not counted as wrong — they were never
+  asked). The comparison is unrounded, so `--fail-under 100` means every scored
+  row was right; where the rounded figure would contradict the verdict, the
+  summary prints both numbers to the precision that separates them. A report
+  that scores no column at all is refused before anything is sent, rather than
+  passing every deploy on no evidence, and `--dry-run` and `--postman-import`
+  are refused for the same reason; a run that declared a `TRUTH` and then
+  scored nothing exits `1` (a broken run), and a run that was stopped is not
+  given a gate verdict at all.
+  `5` is its own exit code because `1` is worth retrying and this never is. The
+  threshold is deliberately not written into the report file: it is the
+  caller's policy, not a fact about the run. With `--progress-json`,
+  `run_finished` carries a `gate` object (and `null` without a gate, so
+  "passed" and "never checked" stay distinguishable).
+
+- **JUnit XML output (`-o results.xml`).** One `<testcase>` per row, named by
+  the row's key so a case keeps its identity between runs: a failed request is
+  an `<error>`, a wrong answer a `<failure>` carrying both sides of the
+  comparison, and a dry run's cases are `<skipped>` — one status per case, an
+  error outranking a failure, with the demoted verdict kept in `<system-out>`.
+  The run's caveats (`DRY RUN`, `PARTIAL`, skips, warnings) go to
+  `<system-err>` *and* to a run-level case, since some CI systems read output
+  only from a case. Run errors that belong to no row become that same case, so a run that produced nothing
+  *because* something was wrong is never reported as a green suite of zero
+  tests. An ordinary `-o`, so `-o results.xml -o report.html` gives a pipeline
+  its verdict and a human the detail from the same single run.
+
 
 - **`--require-net-gain N`: a CI gate on whether the answers got *worse*.**
   `--fail-under` is an absolute floor, and a suite that has climbed well above
@@ -37,26 +72,21 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   steady. Like the gates, they describe the run rather than the table, so a
   `# columns:` directive cannot change them.
 
-### Fixed
-
-- **A broken loop no longer blames the loop that follows it.** An error raised
-  in the scope around a loop is inherited by the rows the loop produces —
-  a request that failed before the loop is the reason every one of its rows is
-  wrong. But a finished loop's errors are merged into the block's flat list so
-  the run reports them exactly once, and that list was also what a *later*
-  sibling loop inherited: a broken request in the first loop wrote itself onto
-  every row of the second, which had run perfectly. Errors travel down into a
-  loop, never sideways from the loop before it.
-
-- **A request that reports its time twice no longer appears to have taken twice
-  as long in JUnit.** Nothing stops a flow naming the `Time` intrinsic more than
-  once for the same request — under its own name and under a `[Reports]` alias,
-  or under two aliases — and every one of those columns holds the same
-  milliseconds. The writer added them up. Totals are now collected per step, so
-  a request spends its duration once; two *different* requests in a row still
-  each spend their own.
-
 ### Changed
+
+- **A report whose request failed now exits `1`.** It exited `0`: the failure
+  existed only as text in the row's `.Error` cell, `run_finished` said `ok:
+  true` with an empty `errors` list, and the same collection run through
+  `paperboy -c` exited `1` — so whether a broken API failed your pipeline
+  depended on which of PaperBoy's two runners you had used. A post-deploy smoke
+  test could go green against a service that was refusing connections. A
+  request that was sent and came back failed is now an error of the run, as it
+  always was for a plain `REQUEST`; the row is still written with its error in
+  the cell, because a report exists to show every case rather than stop at the
+  first. **This changes the exit code of existing runs** — a pipeline that was
+  passing on a broken API will now fail, which is the point. A failing
+  `CLEANUP` is unaffected and remains a warning.
+
 
 - **A row that hasn't run yet no longer shows zeros as if they were results.**
   While a report streams, the grid is a skeleton produced by a *dry* pass, so
@@ -89,6 +119,45 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the help overlay along with the rest of the grid.
 
 ### Fixed
+
+- **A `--dry-run` report no longer writes itself up as a scored run.** It wrote
+  an unmarked file: every projected row scored against its ground truth, all of
+  them `Correct: incorrect` because the cells a response would have filled were
+  blank, a comparison `Result` claiming each row matched its baseline (two rows
+  that were never sent are identical the way two blank pages are), and a footer
+  asserting "Accuracy 0.0%" for a run that sent nothing. Nothing in the file
+  said it was a preview, so a reader — or a CI gate — meeting it had no way to
+  tell a catastrophic release from a run nobody had performed.
+
+  A dry run now marks itself and scores nothing. The result carries the fact,
+  and each format says it in its own idiom, exactly as a stopped run's
+  `PARTIAL` does: a `DRY RUN` banner above the HTML, `"dry_run": true` at the
+  top level of the JSON (and on `run_finished`, alongside the existing key on
+  `plan`), a final `DRY RUN,…` record in the CSV, a bold row under the XLSX
+  summary, and the PDF title. Ground-truth verdicts read `untested` rather than
+  `incorrect`, the comparison `Result` reads `not run (dry run)`, and there are
+  no metrics at all — a preview has no accuracy, not an accuracy of zero. The
+  same principle a run that is given up on already followed.
+
+
+
+- **A broken loop no longer blames the loop that follows it.** An error raised
+  in the scope around a loop is inherited by the rows the loop produces —
+  a request that failed before the loop is the reason every one of its rows is
+  wrong. But a finished loop's errors are merged into the block's flat list so
+  the run reports them exactly once, and that list was also what a *later*
+  sibling loop inherited: a broken request in the first loop wrote itself onto
+  every row of the second, which had run perfectly. Errors travel down into a
+  loop, never sideways from the loop before it.
+
+- **A request that reports its time twice no longer appears to have taken twice
+  as long in JUnit.** Nothing stops a flow naming the `Time` intrinsic more than
+  once for the same request — under its own name and under a `[Reports]` alias,
+  or under two aliases — and every one of those columns holds the same
+  milliseconds. The writer added them up. Totals are now collected per step, so
+  a request spends its duration once; two *different* requests in a row still
+  each spend their own.
+
 
 - **A request written `repeat` *and* `retry` could hide a failure entirely.**
   Hurl reports every attempt at a request, and PaperBoy keeps only the one that
@@ -149,82 +218,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   matrix, the HTML/JSON/xlsx exports and the click-a-cell drill-down all agree
   on what the bucket is called and clicking it still returns exactly the rows
   it counted.
-
-
-## [0.7.0] - 2026-09-24
-
-### Added
-
-- **`--fail-under PERCENT`: a quality gate for a report used as a deploy
-  check.** A run in which every request was sent and read, and every answer was
-  wrong, was a successful run — the report had been produced, so the process
-  exited `0`. That is the right answer to "did the run work" and the wrong
-  answer to the question a pipeline is actually asking. `--fail-under 95` holds
-  the run to a threshold and exits **`5`** when it falls short. The figure is
-  the whole run's `Correct` roll-up over the rows that had a `TRUTH` to compare
-  against (rows with no ground truth are not counted as wrong — they were never
-  asked). The comparison is unrounded, so `--fail-under 100` means every scored
-  row was right; where the rounded figure would contradict the verdict, the
-  summary prints both numbers to the precision that separates them. A report
-  that scores no column at all is refused before anything is sent, rather than
-  passing every deploy on no evidence, and `--dry-run` and `--postman-import`
-  are refused for the same reason; a run that declared a `TRUTH` and then
-  scored nothing exits `1` (a broken run), and a run that was stopped is not
-  given a gate verdict at all.
-  `5` is its own exit code because `1` is worth retrying and this never is. The
-  threshold is deliberately not written into the report file: it is the
-  caller's policy, not a fact about the run. With `--progress-json`,
-  `run_finished` carries a `gate` object (and `null` without a gate, so
-  "passed" and "never checked" stay distinguishable).
-
-- **JUnit XML output (`-o results.xml`).** One `<testcase>` per row, named by
-  the row's key so a case keeps its identity between runs: a failed request is
-  an `<error>`, a wrong answer a `<failure>` carrying both sides of the
-  comparison, and a dry run's cases are `<skipped>` — one status per case, an
-  error outranking a failure, with the demoted verdict kept in `<system-out>`.
-  The run's caveats (`DRY RUN`, `PARTIAL`, skips, warnings) go to
-  `<system-err>` *and* to a run-level case, since some CI systems read output
-  only from a case. Run errors that belong to no row become that same case, so a run that produced nothing
-  *because* something was wrong is never reported as a green suite of zero
-  tests. An ordinary `-o`, so `-o results.xml -o report.html` gives a pipeline
-  its verdict and a human the detail from the same single run.
-
-### Changed
-
-- **A report whose request failed now exits `1`.** It exited `0`: the failure
-  existed only as text in the row's `.Error` cell, `run_finished` said `ok:
-  true` with an empty `errors` list, and the same collection run through
-  `paperboy -c` exited `1` — so whether a broken API failed your pipeline
-  depended on which of PaperBoy's two runners you had used. A post-deploy smoke
-  test could go green against a service that was refusing connections. A
-  request that was sent and came back failed is now an error of the run, as it
-  always was for a plain `REQUEST`; the row is still written with its error in
-  the cell, because a report exists to show every case rather than stop at the
-  first. **This changes the exit code of existing runs** — a pipeline that was
-  passing on a broken API will now fail, which is the point. A failing
-  `CLEANUP` is unaffected and remains a warning.
-
-### Fixed
-
-- **A `--dry-run` report no longer writes itself up as a scored run.** It wrote
-  an unmarked file: every projected row scored against its ground truth, all of
-  them `Correct: incorrect` because the cells a response would have filled were
-  blank, a comparison `Result` claiming each row matched its baseline (two rows
-  that were never sent are identical the way two blank pages are), and a footer
-  asserting "Accuracy 0.0%" for a run that sent nothing. Nothing in the file
-  said it was a preview, so a reader — or a CI gate — meeting it had no way to
-  tell a catastrophic release from a run nobody had performed.
-
-  A dry run now marks itself and scores nothing. The result carries the fact,
-  and each format says it in its own idiom, exactly as a stopped run's
-  `PARTIAL` does: a `DRY RUN` banner above the HTML, `"dry_run": true` at the
-  top level of the JSON (and on `run_finished`, alongside the existing key on
-  `plan`), a final `DRY RUN,…` record in the CSV, a bold row under the XLSX
-  summary, and the PDF title. Ground-truth verdicts read `untested` rather than
-  `incorrect`, the comparison `Result` reads `not run (dry run)`, and there are
-  no metrics at all — a preview has no accuracy, not an accuracy of zero. The
-  same principle a run that is given up on already followed.
-
 
 ## [0.6.5] - 2026-09-23
 
