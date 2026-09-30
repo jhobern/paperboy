@@ -216,11 +216,24 @@ fn check_libxml2_vcpkg() -> Option<Missing> {
     let triplet = vcpkg_triplet();
 
     let Some(root) = vcpkg_root() else {
-        return Some(Missing {
-            name: "libxml2 (via vcpkg)",
-            evidence: "no vcpkg installation found: VCPKG_ROOT is unset and no \
+        // Two failures that look identical from here and are nothing alike. A
+        // user who followed the advice below and simply hasn't reopened their
+        // terminal has a *working* vcpkg tree, and telling them "no vcpkg
+        // installation found" sends them off to reinstall something that is
+        // already fine -- so look for the tree that advice would have created.
+        let evidence = match stray_vcpkg_tree() {
+            Some(tree) => format!(
+                "a vcpkg tree exists at {}, but VCPKG_ROOT is not set in this \
+                 shell -- `setx` only affects shells opened after it ran",
+                tree.display()
+            ),
+            None => "no vcpkg installation found: VCPKG_ROOT is unset and no \
                 `vcpkg integrate install` has been run"
                 .to_string(),
+        };
+        return Some(Missing {
+            name: "libxml2 (via vcpkg)",
+            evidence,
         });
     };
 
@@ -282,6 +295,41 @@ fn vcpkg_root() -> Option<PathBuf> {
         }
     }
     Some(root)
+}
+
+/// A bootstrapped vcpkg tree where the advice below would have put one, found
+/// *without* consulting `VCPKG_ROOT`.
+///
+/// This exists to separate "you have no vcpkg" from "you have vcpkg and this
+/// shell doesn't know about it yet" -- the second is what a user gets when they
+/// follow the advice and don't reopen their terminal, because `setx` only
+/// affects shells started after it ran. Told the wrong one, they reinstall a
+/// tree that was already working.
+///
+/// Only the bootstrapped marker counts: an interrupted `git clone` leaves a
+/// directory behind, and calling that an installation would restore exactly the
+/// confusion this is here to remove.
+fn stray_vcpkg_tree() -> Option<PathBuf> {
+    let mut candidates = vec![PathBuf::from("C:\\vcpkg")];
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        candidates.push(PathBuf::from(profile).join("vcpkg"));
+    }
+    candidates
+        .into_iter()
+        .find(|root| root.join("vcpkg.exe").is_file())
+}
+
+/// A Windows path as a command argument, quoted only when it has to be.
+///
+/// Quoting unconditionally would be simpler but reads badly in advice meant to
+/// be copied: most users see no spaces and a quoted `"C:\vcpkg"` invites the
+/// question of whether the quotes are part of the path.
+fn quoted(path: &str) -> String {
+    if path.contains(' ') {
+        format!("\"{path}\"")
+    } else {
+        path.to_string()
+    }
 }
 
 /// The vcpkg triplet this build will ask for, mirroring vcpkg-rs's own choice.
@@ -680,8 +728,15 @@ fn install_hint() -> Hint {
         // integrate install`, which only writes the per-user pointer file that
         // `vcpkg_root` reads above). A bare `vcpkg install` is therefore a line
         // that cannot work in the shell that just ran the bootstrap.
-        let root = match vcpkg_root() {
-            Some(root) => root.display().to_string(),
+        let root = match vcpkg_root().or_else(stray_vcpkg_tree) {
+            // Already bootstrapped, so the only thing possibly missing is the
+            // variable. `setx` is harmless when it is already set correctly,
+            // and re-running it is far cheaper than a second clone.
+            Some(root) => {
+                let root = root.display().to_string();
+                hint.run(&format!("setx VCPKG_ROOT {}", quoted(&root)));
+                root
+            }
             None => {
                 hint.run("git clone https://github.com/microsoft/vcpkg C:\\vcpkg");
                 hint.run("C:\\vcpkg\\bootstrap-vcpkg.bat");

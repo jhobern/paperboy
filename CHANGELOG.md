@@ -97,6 +97,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   consumes the *next line* as its answer, which loses a command and leaves no
   sign that it happened.
 
+  Finally, a bootstrapped vcpkg tree is no longer reported as no vcpkg at all.
+  `setx` sets a variable for shells started *after* it, so following the advice
+  and building in the same window left `VCPKG_ROOT` unset and the message read
+  "no vcpkg installation found" — sending the user to reinstall something that
+  was already working. `C:\vcpkg` and `%USERPROFILE%\vcpkg` are now checked for
+  a bootstrapped `vcpkg.exe`, and if one is there the message says the variable
+  is missing from *this shell* and the advice offers `setx VCPKG_ROOT …` in
+  place of a second clone.
+
 - **A report whose request failed now exits `1`.** It exited `0`: the failure
   existed only as text in the row's `.Error` cell, `run_finished` said `ok:
   true` with an empty `errors` list, and the same collection run through
