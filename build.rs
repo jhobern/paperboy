@@ -675,17 +675,41 @@ fn install_hint() -> Hint {
         // install` is not a command this machine has yet — and the `VCPKG_ROOT`
         // line is not optional decoration: vcpkg-rs finds the tree by that
         // variable (or by `vcpkg integrate install`), never by PATH.
-        if vcpkg_root().is_none() {
-            hint.run("git clone https://github.com/microsoft/vcpkg C:\\vcpkg");
-            hint.run("C:\\vcpkg\\bootstrap-vcpkg.bat");
-            hint.run("setx VCPKG_ROOT C:\\vcpkg");
-        }
-        hint.run(&format!("vcpkg install libxml2:{}", vcpkg_triplet()));
+        // `vcpkg.exe` is called by its full path, never bare: `bootstrap-vcpkg`
+        // builds it inside the tree and puts nothing on PATH (nor does `vcpkg
+        // integrate install`, which only writes the per-user pointer file that
+        // `vcpkg_root` reads above). A bare `vcpkg install` is therefore a line
+        // that cannot work in the shell that just ran the bootstrap.
+        let root = match vcpkg_root() {
+            Some(root) => root.display().to_string(),
+            None => {
+                hint.run("git clone https://github.com/microsoft/vcpkg C:\\vcpkg");
+                hint.run("C:\\vcpkg\\bootstrap-vcpkg.bat");
+                hint.run("setx VCPKG_ROOT C:\\vcpkg");
+                "C:\\vcpkg".to_string()
+            }
+        };
+        hint.run(&format!(
+            "{}\\vcpkg install libxml2:{}",
+            root.trim_end_matches('\\'),
+            vcpkg_triplet()
+        ));
 
+        // One `winget` line per package, and every prompt pre-answered. Both
+        // matter for a list meant to be pasted in one go: `winget` takes several
+        // packages at once only since v1.5, and -- much worse -- a tool that
+        // stops to ask something reads the *next pasted line* as the answer,
+        // which silently eats a command and leaves the user with no sign of it.
         if has("winget") {
-            hint.run("winget install LLVM.LLVM StrawberryPerl.StrawberryPerl NASM.NASM");
+            for id in ["LLVM.LLVM", "StrawberryPerl.StrawberryPerl", "NASM.NASM"] {
+                hint.run(&format!(
+                    "winget install --id {id} -e \
+                     --accept-package-agreements --accept-source-agreements"
+                ));
+            }
         } else if has("choco") {
-            hint.run("choco install llvm strawberryperl nasm");
+            hint.run("choco install llvm strawberryperl nasm -y");
+            hint.step("run the `choco` line from an **Administrator** prompt");
         } else {
             hint.step("install LLVM, Strawberry Perl and NASM (https://nasm.us)");
         }

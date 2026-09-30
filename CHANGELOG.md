@@ -88,6 +88,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   per-crate rationale lives in the README and the script's own header, which is
   where someone asking "why does it need this?" is going anyway.
 
+  Two of the Windows commands were also wrong for a user pasting them. `vcpkg
+  install …` cannot work in the shell that just bootstrapped vcpkg —
+  `bootstrap-vcpkg.bat` builds `vcpkg.exe` inside the tree and adds nothing to
+  `PATH` — so it is now called by its full path, taken from `VCPKG_ROOT` when a
+  tree already exists. And the `winget` line is now one package per line with
+  the agreement prompts pre-answered: a prompt part-way through a pasted block
+  consumes the *next line* as its answer, which loses a command and leaves no
+  sign that it happened.
+
 - **A report whose request failed now exits `1`.** It exited `0`: the failure
   existed only as text in the row's `.Error` cell, `run_finished` said `ok:
   true` with an empty `errors` list, and the same collection run through

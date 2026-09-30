@@ -104,8 +104,12 @@ than it does on Unix, so in order:
    git clone https://github.com/microsoft/vcpkg C:\vcpkg
    C:\vcpkg\bootstrap-vcpkg.bat
    setx VCPKG_ROOT C:\vcpkg
-   vcpkg install libxml2:x64-windows-static-md
+   C:\vcpkg\vcpkg install libxml2:x64-windows-static-md
    ```
+
+   `vcpkg.exe` is called by its full path on purpose: bootstrapping builds it
+   inside the tree and adds nothing to `PATH`, so a bare `vcpkg install` in the
+   shell that just ran the bootstrap fails with "not recognized".
 
    The triplet is the part worth reading twice. `x64-windows-static-md` is a
    static libxml2 built against the *dynamic* CRT, which is what Rust's MSVC
@@ -118,10 +122,16 @@ than it does on Unix, so in order:
 3. **LLVM, Strawberry Perl and NASM:**
 
    ```bat
-   winget install LLVM.LLVM StrawberryPerl.StrawberryPerl NASM.NASM
+   winget install --id LLVM.LLVM -e --accept-package-agreements --accept-source-agreements
+   winget install --id StrawberryPerl.StrawberryPerl -e --accept-package-agreements --accept-source-agreements
+   winget install --id NASM.NASM -e --accept-package-agreements --accept-source-agreements
    ```
 
-   or `choco install llvm strawberryperl nasm`. LLVM supplies `libclang.dll`
+   One package per line, with the agreement prompts pre-answered, so the block
+   can be pasted in one go: a tool that stops to ask something reads the next
+   pasted line as the answer and quietly swallows a command. (`winget install
+   A B C` also works, on v1.5 and later.) Or `choco install llvm strawberryperl
+   nasm -y`, from an **Administrator** prompt. LLVM supplies `libclang.dll`
    for bindgen — if it isn't found, point at it with
    `setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"`. Perl and NASM are for the
    vendored OpenSSL build (`perl Configure`, then NASM for the crypto
