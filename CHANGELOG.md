@@ -74,6 +74,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **The missing-build-dependency message is a third shorter, and its commands
+  can be pasted.** The build-prerequisite check explained each missing piece in
+  a paragraph — how it was detected and which crate wanted it — which on
+  Windows, where four things are typically missing at once, made a wall of
+  prose nobody reads to the end. Worse, the install advice was one list mixing
+  runnable commands with manual steps ("add NASM's folder to PATH"), and the
+  commands carried trailing `#` comments that wrapped, so even the runnable
+  lines didn't survive a copy. The message now lists what's missing by name,
+  then a **Run:** block of nothing but commands, then a **Then:** block of the
+  things no command can do. The detection evidence moved to the end, kept for
+  arguing with a false negative rather than made the first thing read; the
+  per-crate rationale lives in the README and the script's own header, which is
+  where someone asking "why does it need this?" is going anyway.
+
 - **A report whose request failed now exits `1`.** It exited `0`: the failure
   existed only as text in the row's `.Error` cell, `run_finished` said `ok:
   true` with an empty `errors` list, and the same collection run through

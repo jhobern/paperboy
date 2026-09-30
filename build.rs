@@ -78,9 +78,6 @@ struct Missing {
     /// How this script knows — the specific negative result, so the user can
     /// argue with it if it's wrong.
     evidence: String,
-    /// Which part of the build wants it, and why PaperBoy can't avoid needing
-    /// it. Without this the advice reads as arbitrary.
-    needed_by: &'static str,
 }
 
 fn main() {
@@ -161,10 +158,6 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 fn check_libxml2() -> Option<Missing> {
-    const NEEDED_BY: &str = "`hurl`, which PaperBoy uses to run requests. Hurl's XPath \
-        asserts and captures are libxml2, and the `libxml` crate binds the system \
-        copy rather than vendoring it, so Cargo cannot download it for you.";
-
     // `libxml`'s build script checks LIBXML2 first and, when it is set, skips
     // pkg-config and bindgen entirely in favour of its pre-generated bindings.
     // Someone who has set it has already answered this question.
@@ -191,14 +184,12 @@ fn check_libxml2() -> Option<Missing> {
         Ok(_) => Some(Missing {
             name: "libxml2",
             evidence: format!("`{pkg_config} --exists libxml-2.0` says it isn't installed"),
-            needed_by: NEEDED_BY,
         }),
         // Any failure to *launch* pkg-config — missing, or not executable —
         // lands the user in the same place, so it gets the same advice.
         Err(_) => Some(Missing {
             name: "libxml2",
             evidence: format!("`{pkg_config}`, which finds it, is not on PATH"),
-            needed_by: NEEDED_BY,
         }),
     }
 }
@@ -214,10 +205,6 @@ fn check_libxml2() -> Option<Missing> {
 /// Both are filesystem answers about the exact tree the real probe will read,
 /// which is why this is allowed to be as fatal as the pkg-config branch.
 fn check_libxml2_vcpkg() -> Option<Missing> {
-    const NEEDED_BY: &str = "`hurl`, which PaperBoy uses to run requests. Hurl's XPath \
-        asserts and captures are libxml2, and on MSVC the `libxml` crate looks for \
-        it through vcpkg alone — there is no pkg-config fallback on this platform.";
-
     // Both of these tell vcpkg-rs to give up before it looks anywhere, so the
     // user has already been told what is wrong by something closer to it.
     if std::env::var_os("VCPKGRS_DISABLE").is_some()
@@ -234,7 +221,6 @@ fn check_libxml2_vcpkg() -> Option<Missing> {
             evidence: "no vcpkg installation found: VCPKG_ROOT is unset and no \
                 `vcpkg integrate install` has been run"
                 .to_string(),
-            needed_by: NEEDED_BY,
         });
     };
 
@@ -261,7 +247,6 @@ fn check_libxml2_vcpkg() -> Option<Missing> {
             "the vcpkg tree at {} has no libxml2 for the `{triplet}` triplet",
             root.display()
         ),
-        needed_by: NEEDED_BY,
     })
 }
 
@@ -345,9 +330,6 @@ fn check_compiler() -> Option<Missing> {
     Some(Missing {
         name: "a C compiler",
         evidence: "none of `cc`, `gcc` or `clang` is on PATH, and CC is unset".to_string(),
-        needed_by: "the vendored libcurl, OpenSSL and zlib builds. PaperBoy enables \
-            curl-sys's `static-curl`/`static-ssl` so those are compiled from source \
-            here, which is what spares you needing them as system packages.",
     })
 }
 
@@ -362,8 +344,6 @@ fn check_perl() -> Option<Missing> {
     Some(Missing {
         name: "perl",
         evidence: "`perl` is not on PATH, and neither PERL nor OPENSSL_SRC_PERL is set".to_string(),
-        needed_by: "the vendored OpenSSL build: `openssl-src` configures OpenSSL by \
-            running `perl Configure`.",
     })
 }
 
@@ -385,7 +365,6 @@ fn check_make() -> Option<Missing> {
     Some(Missing {
         name: "make",
         evidence: "neither `make` nor `gmake` is on PATH".to_string(),
-        needed_by: "the vendored OpenSSL build, which drives OpenSSL's own makefile.",
     })
 }
 
@@ -402,9 +381,6 @@ fn check_nasm() -> Option<Missing> {
     Some(Missing {
         name: "nasm",
         evidence: "`nasm` is not on PATH".to_string(),
-        needed_by: "the vendored OpenSSL build: on MSVC targets OpenSSL assembles \
-            its crypto primitives with NASM, and openssl-src expects to find it \
-            on PATH.",
     })
 }
 
@@ -476,8 +452,6 @@ fn check_libclang() -> Option<Missing> {
     Some(Missing {
         name: "libclang",
         evidence: "no libclang shared library found in the usual places".to_string(),
-        needed_by: "`bindgen`, which generates `libxml`'s bindings and loads libclang \
-            while building. Without it the build fails with \"Unable to find libclang\".",
     })
 }
 
@@ -553,87 +527,100 @@ fn target_cfg(var: &str) -> String {
 /// The warning block. Kept short and rule-delimited on purpose: Cargo schedules
 /// this script in the middle of the build, among the `Compiling …` lines, so it
 /// has to be something the eye can catch while scrolling back.
-fn report(certain: &[Missing], uncertain: &[Missing], hint: &[String]) {
+fn report(certain: &[Missing], uncertain: &[Missing], hint: &Hint) {
     warn("──────────────────────────────────────────────────────────────");
     warn("PaperBoy needs some build dependencies that aren't installed:");
     for item in certain {
-        warn(&format!("  · {} — {}", item.name, item.evidence));
+        warn(&format!("  · {}", item.name));
     }
     for item in uncertain {
-        warn(&format!("  · {} — {} (unsure)", item.name, item.evidence));
+        warn(&format!("  · {} (maybe)", item.name));
     }
-    warn("  Install them with:");
-    for line in hint {
-        warn(&format!("      {line}"));
+    if !hint.commands.is_empty() {
+        warn("  Run:");
+        for line in &hint.commands {
+            warn(&format!("    {line}"));
+        }
+    }
+    for step in &hint.steps {
+        warn(&format!("  Then: {step}"));
     }
     warn("──────────────────────────────────────────────────────────────");
 }
 
 /// The panic text. This is the *last* thing the user sees, so it repeats the
 /// command rather than referring back to a warning that has scrolled away.
-fn failure_message(certain: &[Missing], uncertain: &[Missing], hint: &[String]) -> String {
+fn failure_message(certain: &[Missing], uncertain: &[Missing], hint: &Hint) -> String {
     let subject = if certain.len() == 1 {
-        "a required build dependency is missing"
+        "a build dependency is missing"
     } else {
-        "required build dependencies are missing"
+        "build dependencies are missing"
     };
     let mut message = format!("PaperBoy can't be built here: {subject}.\n\n");
 
+    message.push_str("  Missing:\n");
     for item in certain {
-        message.push_str(&format!(
-            "  {} is a required build dependency, and it isn't installed.\n",
-            item.name
-        ));
-        message.push_str(&format!("      How we know: {}.\n", item.evidence));
-        message.push_str(&wrapped(
-            &format!("Required by {}", item.needed_by),
-            "      ",
-        ));
-        message.push('\n');
+        message.push_str(&format!("    · {}\n", item.name));
     }
-
     for item in uncertain {
         message.push_str(&format!(
-            "  {} may also be missing — this check is a guess, so it isn't the\n  \
-             reason the build stopped.\n",
+            "    · {} (a guess — not why the build stopped)\n",
             item.name
         ));
-        message.push_str(&format!("      How we know: {}.\n", item.evidence));
-        message.push_str(&wrapped(
-            &format!("Required by {}", item.needed_by),
-            "      ",
-        ));
-        message.push('\n');
     }
 
-    message.push_str("  Install what's missing with:\n");
-    for line in hint {
-        message.push_str(&format!("      {line}\n"));
+    if !hint.commands.is_empty() {
+        message.push_str("\n  Run:\n");
+        for line in &hint.commands {
+            message.push_str(&format!("    {line}\n"));
+        }
     }
-    message.push_str(concat!(
-        "\n",
-        "  PaperBoy stops here on purpose. Left alone, the build fails later\n",
-        "  anyway, inside a crate you never asked for and only after several\n",
-        "  more minutes of compiling.\n",
-        "\n",
-        "  The README's \"Build prerequisites\" section covers every platform.\n",
-        "  If this check is wrong about your machine, set\n",
+    if !hint.steps.is_empty() {
+        message.push_str("\n  Then:\n");
+        for step in &hint.steps {
+            message.push_str(&format!("    · {step}\n"));
+        }
+    }
+
+    message.push_str(&format!(
+        "\n  Stopping now rather than failing in ten minutes inside a crate you\n  \
+         never asked for. Details: README → \"Build prerequisites\".\n  \
+         Wrong about your machine? {SKIP_VAR}=1 skips this check.\n"
     ));
-    message.push_str(&format!("  {SKIP_VAR}=1 to bypass it.\n"));
+
+    // The evidence, last and once: it is what someone arguing with a false
+    // negative needs, and what nobody reading a correct one has to read.
+    message.push_str("\n  How this was detected:\n");
+    for item in certain.iter().chain(uncertain) {
+        message.push_str(&wrapped(
+            &format!("· {}: {}.", item.name, item.evidence),
+            "    ",
+            "      ",
+        ));
+    }
     message
 }
 
-/// Wrap prose to a sensible width. The `needed_by` strings are written as
+/// Wrap prose to a sensible width. The evidence strings are written as
 /// sentences rather than pre-broken lines so they stay editable, which means
 /// something has to fold them before they hit a terminal.
-fn wrapped(text: &str, indent: &str) -> String {
+///
+/// Continuations are indented past the first line, so a folded bullet still
+/// reads as one item rather than as the start of the next one.
+fn wrapped(text: &str, indent: &str, hang: &str) -> String {
     const WIDTH: usize = 66;
     let mut out = String::new();
     let mut line = String::new();
+    let mut first = true;
+    let flush = |line: &mut String, first: &mut bool, out: &mut String| {
+        let lead = if *first { indent } else { hang };
+        out.push_str(&format!("{lead}{line}\n"));
+        line.clear();
+        *first = false;
+    };
     for word in text.split_whitespace() {
         if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > WIDTH {
-            out.push_str(&format!("{indent}{line}\n"));
-            line.clear();
+            flush(&mut line, &mut first, &mut out);
         }
         if !line.is_empty() {
             line.push(' ');
@@ -641,7 +628,7 @@ fn wrapped(text: &str, indent: &str) -> String {
         line.push_str(word);
     }
     if !line.is_empty() {
-        out.push_str(&format!("{indent}{line}\n"));
+        flush(&mut line, &mut first, &mut out);
     }
     out
 }
@@ -661,21 +648,18 @@ fn warn(line: &str) {
 /// only the piece that was detected as missing: they are cheap to re-run, a
 /// package manager will simply report the ones already present, and it saves a
 /// user who is missing two things from having to come back twice.
-fn install_hint() -> Vec<String> {
+fn install_hint() -> Hint {
     // Read from Cargo's view of the target rather than `cfg!(target_os)` so the
     // whole function stays exercisable without a Mac to hand.
     if target_cfg("CARGO_CFG_TARGET_OS") == "macos" {
-        let mut hint = vec![
-            "xcode-select --install   # C compiler, libclang, libxml2, perl, make".to_string(),
-        ];
+        let mut hint = Hint::new();
+        hint.run("xcode-select --install");
         if has("brew") {
-            hint.push("brew install pkg-config".to_string());
+            hint.run("brew install pkg-config");
         } else if has("port") {
-            hint.push("sudo port install pkgconfig".to_string());
+            hint.run("sudo port install pkgconfig");
         } else {
-            hint.push(
-                "install Homebrew (https://brew.sh), then: brew install pkg-config".to_string(),
-            );
+            hint.step("install Homebrew (https://brew.sh), then: brew install pkg-config");
         }
         return hint;
     }
@@ -685,42 +669,35 @@ fn install_hint() -> Vec<String> {
     // pkg-config. The rest are ordinary installers, offered through whichever
     // package manager this machine has.
     if target_cfg("CARGO_CFG_TARGET_OS") == "windows" {
-        let mut hint = Vec::new();
+        let mut hint = Hint::new();
 
         // Bootstrapping comes first when there is no tree, because `vcpkg
         // install` is not a command this machine has yet — and the `VCPKG_ROOT`
         // line is not optional decoration: vcpkg-rs finds the tree by that
         // variable (or by `vcpkg integrate install`), never by PATH.
         if vcpkg_root().is_none() {
-            hint.push("git clone https://github.com/microsoft/vcpkg C:\\vcpkg".to_string());
-            hint.push("C:\\vcpkg\\bootstrap-vcpkg.bat".to_string());
-            hint.push("setx VCPKG_ROOT C:\\vcpkg   # then reopen the shell".to_string());
+            hint.run("git clone https://github.com/microsoft/vcpkg C:\\vcpkg");
+            hint.run("C:\\vcpkg\\bootstrap-vcpkg.bat");
+            hint.run("setx VCPKG_ROOT C:\\vcpkg");
         }
-        hint.push(format!("vcpkg install libxml2:{}", vcpkg_triplet()));
+        hint.run(&format!("vcpkg install libxml2:{}", vcpkg_triplet()));
 
         if has("winget") {
-            hint.push(
-                "winget install LLVM.LLVM StrawberryPerl.StrawberryPerl NASM.NASM".to_string(),
-            );
+            hint.run("winget install LLVM.LLVM StrawberryPerl.StrawberryPerl NASM.NASM");
         } else if has("choco") {
-            hint.push("choco install llvm strawberryperl nasm".to_string());
+            hint.run("choco install llvm strawberryperl nasm");
         } else {
-            hint.push(
-                "install LLVM (for libclang), Strawberry Perl and NASM (https://nasm.us)"
-                    .to_string(),
-            );
+            hint.step("install LLVM, Strawberry Perl and NASM (https://nasm.us)");
         }
-        // NASM's installer doesn't put itself on PATH, and OpenSSL's build
-        // looks for it there — the one manual step in the list.
-        hint.push("add NASM's folder to PATH (the installer doesn't)".to_string());
-        hint.push(
-            "setx LIBCLANG_PATH \"C:\\Program Files\\LLVM\\bin\"   # if bindgen can't find it"
-                .to_string(),
-        );
-        hint.push(
-            "…plus \"Desktop development with C++\" in the Visual Studio Installer".to_string(),
-        );
-        hint.push("then build from an \"x64 Native Tools Command Prompt for VS\"".to_string());
+        hint.run("setx LIBCLANG_PATH \"C:\\Program Files\\LLVM\\bin\"");
+
+        // Everything a command can't do. These used to be `#` comments on the
+        // command lines and extra entries in the same list, which made a block
+        // of nine lines where only six could be pasted -- see [`Hint`].
+        hint.step("reopen your shell, so the `setx` variables are picked up");
+        hint.step("add NASM's install folder to PATH (its installer doesn't)");
+        hint.step("install \"Desktop development with C++\" from the Visual Studio Installer");
+        hint.step("build from an \"x64 Native Tools Command Prompt for VS\"");
         return hint;
     }
 
@@ -752,16 +729,46 @@ fn install_hint() -> Vec<String> {
             "sudo apk add build-base pkgconfig perl libxml2-dev clang-dev",
         ),
     ];
+    let mut hint = Hint::new();
     for (bin, command) in candidates {
         if has(bin) {
-            return vec![(*command).to_string()];
+            hint.run(command);
+            return hint;
         }
     }
+    hint.step(
+        "install your distribution's pkg-config, libxml2, clang, C compiler, perl and make packages",
+    );
+    hint
+}
 
-    vec![
-        "install your distribution's pkg-config, libxml2, clang, C compiler, perl and make packages"
-            .to_string(),
-    ]
+/// Advice, split into what can be pasted and what cannot.
+///
+/// It was one list. A reader then had to tell `C:\vcpkg\bootstrap-vcpkg.bat`
+/// from `add NASM's folder to PATH (the installer doesn't)` by reading every
+/// line closely -- and the commands carried trailing `#` comments that wrapped,
+/// so even the runnable ones didn't survive a copy. Keeping the two apart means
+/// the first block can be pasted whole and the second is visibly a to-do list.
+struct Hint {
+    /// Lines that are literally runnable, in order, with nothing else on them.
+    commands: Vec<String>,
+    /// Things a human has to do: reopen a shell, tick a box in an installer.
+    steps: Vec<String>,
+}
+
+impl Hint {
+    fn new() -> Self {
+        Hint {
+            commands: Vec::new(),
+            steps: Vec::new(),
+        }
+    }
+    fn run(&mut self, command: &str) {
+        self.commands.push(command.to_string());
+    }
+    fn step(&mut self, step: &str) {
+        self.steps.push(step.to_string());
+    }
 }
 
 /// Is `bin` an executable on `PATH`? Spawning `which` would itself be a
