@@ -109,7 +109,11 @@ than it does on Unix, so in order:
 
    `vcpkg.exe` is called by its full path on purpose: bootstrapping builds it
    inside the tree and adds nothing to `PATH`, so a bare `vcpkg install` in the
-   shell that just ran the bootstrap fails with "not recognized".
+   shell that just ran the bootstrap fails with "not recognized". In PowerShell
+   that is true even from inside `C:\vcpkg` — unlike `cmd`, PowerShell does not
+   search the current directory, so there it is `.\vcpkg install …`. If your
+   tree is somewhere with a space in the path, quote it (`"C:\Program
+   Files\vcpkg\vcpkg" install …`) and, in PowerShell, put `&` in front.
 
    The triplet is the part worth reading twice. `x64-windows-static-md` is a
    static libxml2 built against the *dynamic* CRT, which is what Rust's MSVC

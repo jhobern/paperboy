@@ -689,11 +689,19 @@ fn install_hint() -> Hint {
                 "C:\\vcpkg".to_string()
             }
         };
-        hint.run(&format!(
-            "{}\\vcpkg install libxml2:{}",
-            root.trim_end_matches('\\'),
-            vcpkg_triplet()
-        ));
+        let exe = format!("{}\\vcpkg", root.trim_end_matches('\\'));
+        if exe.contains(' ') {
+            // A quoted path is what `cmd` needs and all PowerShell will do with
+            // it is print it back: a bare quoted string is an expression there,
+            // not a command. There is no one spelling that works in both, so
+            // the quoted (cmd) form is printed and the other is a note.
+            hint.run(&format!("\"{exe}\" install libxml2:{}", vcpkg_triplet()));
+            hint.step(&format!(
+                "in PowerShell, put `&` in front of that line: & \"{exe}\" install …"
+            ));
+        } else {
+            hint.run(&format!("{exe} install libxml2:{}", vcpkg_triplet()));
+        }
 
         // One `winget` line per package, and every prompt pre-answered. Both
         // matter for a list meant to be pasted in one go: `winget` takes several
