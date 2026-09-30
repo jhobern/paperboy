@@ -60,6 +60,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   `--fail-under` already uses, and is refused before anything is sent when the
   report has no `TRUTH` or no baseline to measure against.
 
+- **Windows and macOS are now built and tested on every change.** CI ran
+  entirely on Linux, so "PaperBoy runs on Windows" was a claim nothing
+  enforced — the first person to test it did so by hand, one missing
+  dependency at a time. Both platforms now build and run the full suite in the
+  `gui` shape, which is the same binary that serves `-c`, the terminal UI and
+  `--gui`. It also puts the build prerequisites under test rather than under
+  documentation: the Windows job installs libxml2 from vcpkg with the
+  `-static-md` triplet Rust's MSVC target needs and adds the NASM that
+  OpenSSL's assembler requires, and the macOS job points `pkg-config` at
+  Homebrew's keg-only libxml2.
+
 - **`run_finished` carries the run's own figures.** A caller gating on quality
   itself had to parse the report the run had just written — or re-derive the
   numbers and risk disagreeing with the gate. The terminal `--progress-json`
