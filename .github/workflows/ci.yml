@@ -37,6 +37,49 @@ jobs:
   # built it. `-D warnings` is deliberate — the dead-code suppression in
   # `main.rs` is keyed on the `tui` feature, and this is what proves the two
   # front-end-complete configurations are still carrying full analysis.
+  # The Windows jobs copy an icon into the cargo registry to get past hurl
+  # 8.0.1's build script, which embeds `../../bin/windows/logo.ico`
+  # unconditionally -- a path that resolves only inside hurl's own checkout
+  # (Orange-OpenSource/hurl#5207). The trouble with that workaround is that it
+  # is silent once it stops being necessary: copying a file goes on succeeding
+  # forever, so no build would ever fail in a way that says "this can go now",
+  # and the registry copy would sit there looking inexplicable. Upstream fixed
+  # it after 8.0.1, so the moment the lockfile resolves anything newer this
+  # job fails and spells out what to delete. Removing the shim is the whole
+  # point of the failure; do that rather than deleting this check.
+  hurl-icon-shim:
+    name: hurl icon shim still needed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail once hurl outgrows the Windows icon workaround
+        run: |
+          set -euo pipefail
+          version="$(grep -A1 '^name = "hurl"$' Cargo.lock \
+            | sed -n 's/^version = "\(.*\)"$/\1/p')"
+          if [ -z "$version" ]; then
+            echo "::error::could not read hurl's version from Cargo.lock"
+            exit 1
+          fi
+          echo "lockfile resolves hurl $version"
+          oldest="$(printf '%s\n8.0.1\n' "$version" | sort -V | head -n1)"
+          if [ "$version" = "8.0.1" ] || { [ "$oldest" = "$version" ] && [ "$version" != "8.0.1" ]; }; then
+            echo "hurl#5207 is unfixed at this version -- the icon shim is still required"
+            exit 0
+          fi
+          echo "hurl $version is past 8.0.1 and carries the fix for hurl#5207."
+          echo "Remove the 'Work around hurl's unreachable Windows icon' step from"
+          echo "  .github/workflows/ci.yml"
+          echo "  .github/workflows/release.yml"
+          echo "and item 4 from the README's 'Windows' build-prerequisites section."
+          echo
+          echo "Note that paperboy.exe then gets NO icon at all: upstream's fix skips"
+          echo "the resource when the file is missing, and the icon it embeds is hurl's"
+          echo "own regardless. To keep ours, embed assets/windows/paperboy.ico from"
+          echo "our build.rs instead of relying on a dependency's build script."
+          echo "::error::hurl $version no longer needs the Windows icon shim; see this job's log"
+          exit 1
+
   check:
     name: check (${{ matrix.name }})
     runs-on: ubuntu-latest
