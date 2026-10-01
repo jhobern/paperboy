@@ -50,8 +50,9 @@ still runs on a machine that has none.
 
 The Linux archives also need the system `libxml2` (`libxml2.so.2`), which
 every desktop distribution installs and a minimal container image does not —
-if that is where you are heading, use the image below. The macOS and Windows
-builds link libxml2 in and need nothing. RHEL 9 and Rocky/Alma 9 ship glibc
+if that is where you are heading, use the image below. The Windows build links
+libxml2 in and needs nothing; the macOS build uses the copy macOS itself ships
+at `/usr/lib`, so it needs nothing either. RHEL 9 and Rocky/Alma 9 ship glibc
 2.34 and so are *not* covered by the Linux archive; build from source or use
 the container there.
 
@@ -108,7 +109,7 @@ Five things Cargo can't fetch for you:
 
 | Platform | Command |
 | --- | --- |
-| macOS | `xcode-select --install` then `brew install pkg-config` |
+| macOS | `xcode-select --install` then `brew install pkg-config libxml2` |
 | Debian/Ubuntu | `sudo apt install build-essential pkg-config libxml2-dev libclang-dev perl` |
 | Fedora/RHEL | `sudo dnf install pkgconf-pkg-config gcc make perl libxml2-devel clang-devel` |
 | Arch | `sudo pacman -S pkgconf base-devel perl libxml2 clang` |
@@ -129,12 +130,26 @@ On Windows (MSVC) the same needs are met by different tools, so it gets its own
 section below.
 
 On macOS the Command Line Tools cover everything except `pkg-config`, which is
-the failure most people hit. If your libxml2 came from Homebrew rather than the
-SDK:
+the failure most people hit. The second is subtler: macOS *does* ship libxml2,
+but the SDK carries only its headers and a linker stub — there is no
+`libxml-2.0.pc` anywhere, so `pkg-config` cannot discover the system copy and
+the build fails even though the library is right there. The simple fix is
+Homebrew's keg-only libxml2, pointed at explicitly:
 
 ```sh
+brew install pkg-config libxml2
 export PKG_CONFIG_PATH="$(brew --prefix libxml2)/lib/pkgconfig:$PKG_CONFIG_PATH"
 ```
+
+That bakes an `/opt/homebrew/...` path into the binary, which is fine for a
+local build and not for one you intend to hand to anyone else. The released
+macOS archive instead writes a one-off `libxml-2.0.pc` pointing at the SDK, so
+it links `/usr/lib/libxml2.2.dylib` and runs on any Mac; see the
+`Point pkg-config at the macOS SDK's libxml2` step in
+[`.github/workflows/release.yml`](.github/workflows/release.yml) if you need to
+do the same. Note that static linking is *not* an alternative here: Homebrew's
+bottle ships no `libxml2.a`, and even with one, Apple's linker has no
+`-Bstatic`, so `-lxml2` against a directory holding both takes the `.dylib`.
 
 #### Windows
 
