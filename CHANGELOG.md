@@ -275,6 +275,27 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   on what the bucket is called and clicking it still returns exactly the rows
   it counted.
 
+- **A report written on Windows can be opened on Linux.** The collection and
+  output paths a report stores are deliberately relative, so that a report and
+  the collection it binds to stay a working pair when the workspace is handed
+  to someone else or committed. They were written with the host's own
+  separator, so a report saved on Windows said `apis\\billing.hurl` — which on
+  Linux is not a path into `apis/` but a single filename with a backslash in
+  it, and names nothing. The walk-up form (`../apis/…`) already forced forward
+  slashes for exactly this reason; now every relative path a report stores
+  does. Absolute paths are left in the host's spelling, since they name a
+  location on one machine and are shown to the user as such.
+
+- **A file whose path arrives with a trailing `/` can be saved on Windows.**
+  `collection.hurl/` and `collection.hurl` name the same file to a reader and
+  two different things to the kernel, so a trailing separator is stripped
+  wherever a path enters the app. That strip looked for the platform's
+  *preferred* separator — a backslash on Windows — and so missed a trailing
+  forward slash on the one platform that accepts both, leaving a perfectly
+  ordinary collection unable to save, re-read or revert, with an error about a
+  directory that is not one. Unix is unchanged, where a backslash is an
+  ordinary character in a filename and must stay one.
+
 - **Windows builds get past `hurl`'s unreachable icon, and `paperboy.exe` now
   has an icon of its own.** `hurl` 8.0.1's build script embeds a Windows icon
   from `../../bin/windows/logo.ico` — a path that resolves only inside hurl's

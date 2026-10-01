@@ -42,9 +42,17 @@ pub(crate) fn friendly_error(e: &impl std::fmt::Display) -> String {
 ///
 /// A path that is *only* separators (`/`) is left alone: it is the root, and
 /// there is nothing left of it to keep.
+///
+/// `is_separator` rather than `MAIN_SEPARATOR` because Windows accepts both
+/// slashes and this ran on the separator Windows *prefers*: a path arriving as
+/// `C:\\dir\\c.hurl/` -- which is how one looks after being joined by anything
+/// that writes POSIX-style, including our own report files -- kept its trailing
+/// slash and failed at the write with "the directory name is invalid". On Unix
+/// the two agree, and a backslash is an ordinary character in a filename there,
+/// so `is_separator` is also the only form that cannot eat part of a real name.
 pub(crate) fn file_path(path: PathBuf) -> PathBuf {
     let text = path.to_string_lossy();
-    let trimmed = text.trim_end_matches(std::path::MAIN_SEPARATOR);
+    let trimmed = text.trim_end_matches(std::path::is_separator);
     if trimmed.is_empty() || trimmed.len() == text.len() {
         drop(text);
         return path;
@@ -286,7 +294,32 @@ pub(crate) fn open_in_desktop(path: impl AsRef<Path>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_long_strings, desktop_open_command};
+    use super::{compact_long_strings, desktop_open_command, file_path};
+
+    /// Windows takes a forward slash as a separator too, so a path arriving
+    /// with one on the end is the same broken case as a trailing backslash --
+    /// and trimming `MAIN_SEPARATOR` alone missed it there, which is how a
+    /// perfectly ordinary file ended up failing to save with "the directory
+    /// name is invalid".
+    #[test]
+    fn a_trailing_separator_is_dropped_whichever_slash_it_is() {
+        use std::path::PathBuf;
+        assert_eq!(
+            file_path(PathBuf::from("a/b/c.hurl/")).as_os_str(),
+            "a/b/c.hurl"
+        );
+        let backslash = file_path(PathBuf::from("a/b/c.hurl\\"));
+        if cfg!(windows) {
+            assert_eq!(backslash.as_os_str(), "a/b/c.hurl");
+        } else {
+            // On Unix a backslash is an ordinary character in a filename, so
+            // trimming it would rename the file.
+            assert_eq!(backslash.as_os_str(), "a/b/c.hurl\\");
+        }
+        // A path that is nothing but separators is the root; there is nothing
+        // left of it to keep.
+        assert_eq!(file_path(PathBuf::from("/")).as_os_str(), "/");
+    }
 
     /// A path with a space in it must survive as a single argument — the whole
     /// point of not building a shell string.

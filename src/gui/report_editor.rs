@@ -8328,15 +8328,36 @@ pub(super) fn apply_picked_loop_dir(
     app.report_editor = Some(ed);
 }
 
+/// A relative path written with forward slashes whatever the host separator is.
+///
+/// These paths go into the report file, which is meant to be read on someone
+/// else's machine -- a `apis\\billing.hurl` written on Windows names nothing on
+/// Linux, where a backslash is an ordinary character in a filename rather than
+/// a separator. The reverse is safe, because Windows accepts both. Built from
+/// components rather than by replacing backslashes, so a Unix filename that
+/// genuinely contains one survives.
+fn slashed(path: &std::path::Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// `path` expressed relative to the report's own folder when it lives under it,
 /// else the absolute path.
+///
+/// The relative form is slash-separated because it is going into a file meant
+/// to travel; the absolute fallback is left in the host's own spelling, since
+/// it names a location on this machine and nowhere else and is shown to the
+/// user as such.
 fn relative_to_report(path: &std::path::Path, report: Option<&std::path::Path>) -> String {
-    report
+    match report
         .and_then(|r| r.parent())
         .and_then(|dir| path.strip_prefix(dir).ok())
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
+    {
+        Some(rel) => slashed(rel),
+        None => path.to_string_lossy().into_owned(),
+    }
 }
 
 /// `path` expressed relative to the report, walking *up* out of the report's
@@ -8388,10 +8409,7 @@ fn portable_ref(
     if rel.as_os_str().is_empty() {
         return plain;
     }
-    // Forward slashes even on Windows: the directive is written into a file
-    // that is meant to be read on someone else's machine, and every path API
-    // involved accepts them.
-    rel.to_string_lossy().replace('\\', "/")
+    slashed(&rel)
 }
 
 /// The `END` closing the whole flow, mirroring the `BEGIN` chip at the top.
@@ -11433,14 +11451,13 @@ REPORT REQUEST x
             "collections are listed by name, and only collections are listed"
         );
         let values: Vec<&str> = choices.iter().map(|c| c.value.as_str()).collect();
+        // Forward slashes on every platform, deliberately: this goes into the
+        // report file, and a backslash written on Windows names nothing on
+        // Linux. (Spelling the expectation through `Path` looks platform-
+        // agnostic and is not -- `Path` keeps whatever separator it was given.)
         assert_eq!(
             values,
-            [
-                std::path::Path::new("apis/billing.hurl")
-                    .to_string_lossy()
-                    .as_ref(),
-                "smoke.hurl"
-            ],
+            ["apis/billing.hurl", "smoke.hurl"],
             "the stored value stays a path, relative to the report so the pair stays portable"
         );
         assert!(
@@ -11525,14 +11542,27 @@ REPORT REQUEST x
         let _ = out;
     }
 
+    /// An absolute path for the host, built from POSIX-shaped parts.
+    ///
+    /// `/w/apis` has a root but no drive letter, and `Path::is_absolute` is
+    /// false for such a path on Windows -- so a POSIX-shaped fixture sends
+    /// `portable_ref` down the "already relative" branch that no real path
+    /// reaches, and the walk-up these tests exist to check never runs.
+    fn abs_path(rest: &str) -> std::path::PathBuf {
+        let mut p = std::path::PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" });
+        p.extend(rest.split('/').filter(|s| !s.is_empty()));
+        p
+    }
+
     /// A workspace has to survive being handed to someone else, so a report
     /// bound to a collection in a sibling folder must say `../apis/…` rather
     /// than an absolute path that only exists on the machine it was made on.
     #[test]
     fn a_collection_in_a_sibling_folder_is_referenced_relatively_so_it_stays_portable() {
-        let root = std::path::Path::new("/w");
-        let report = std::path::Path::new("/w/reports/nightly.trail");
-        let target = std::path::Path::new("/w/apis/billing.hurl");
+        let root = abs_path("w");
+        let report = abs_path("w/reports/nightly.trail");
+        let target = abs_path("w/apis/billing.hurl");
+        let (root, report, target) = (root.as_path(), report.as_path(), target.as_path());
 
         assert_eq!(
             portable_ref(target, Some(report), Some(root)),
@@ -11541,29 +11571,22 @@ REPORT REQUEST x
         );
         // Below the report, no walking up is needed.
         assert_eq!(
-            portable_ref(
-                std::path::Path::new("/w/reports/sub/c.hurl"),
-                Some(report),
-                Some(root)
-            ),
+            portable_ref(&abs_path("w/reports/sub/c.hurl"), Some(report), Some(root)),
             "sub/c.hurl",
             "a collection under the report is named directly"
         );
         // Outside the workspace the two files aren't travelling together, so a
         // relative path would be a lie.
+        let outside = abs_path("elsewhere/legacy.hurl");
         assert_eq!(
-            portable_ref(
-                std::path::Path::new("/elsewhere/legacy.hurl"),
-                Some(report),
-                Some(root)
-            ),
-            "/elsewhere/legacy.hurl",
+            portable_ref(&outside, Some(report), Some(root)),
+            outside.to_string_lossy(),
             "nothing outside the workspace is made to look relative to it"
         );
         // With no workspace to bound the walk, the old behaviour stands.
         assert_eq!(
             portable_ref(target, Some(report), None),
-            "/w/apis/billing.hurl",
+            target.to_string_lossy(),
             "without a workspace there is no scope to stay inside"
         );
 
@@ -11571,7 +11594,7 @@ REPORT REQUEST x
         // a relative ref back through the report's own directory.
         assert_eq!(
             crate::report::context::resolve_ref_path(Some(report), "../apis/billing.hurl"),
-            std::path::PathBuf::from("/w/reports/../apis/billing.hurl"),
+            abs_path("w/reports").join("../apis/billing.hurl"),
             "the relative ref resolves against the report's folder"
         );
     }

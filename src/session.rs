@@ -1444,7 +1444,17 @@ mod workspace_tests {
 
         let mut back = Session::default();
         back.apply_persisted(state);
-        assert_eq!(back.collections[0].path.as_deref(), Some(path.as_path()));
+        // Compared as text, not as `Path`: `c.hurl/` and `c.hurl` have the
+        // same components and so compare *equal* as paths, which let this
+        // assertion pass on Windows while the trailing slash was still there
+        // and the write below was still failing.
+        assert_eq!(
+            back.collections[0]
+                .path
+                .as_deref()
+                .map(std::path::Path::as_os_str),
+            Some(path.as_os_str())
+        );
         // And the file it names can actually be written.
         let text = back.collections[0].to_hurl();
         std::fs::write(back.collections[0].path.as_ref().unwrap(), text).unwrap();
