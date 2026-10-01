@@ -150,7 +150,7 @@ jobs:
           dir="paperboy-${{ needs.verify.outputs.version }}-${{ matrix.name }}"
           mkdir "$dir"
           cp target/release/paperboy "$dir/"
-          cp README.md CHANGELOG.md "$dir/"
+          cp README.md CHANGELOG.md LICENSE "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
           ls -l "$dir.tar.gz"
 
@@ -160,7 +160,7 @@ jobs:
           $dir = "paperboy-${{ needs.verify.outputs.version }}-${{ matrix.name }}"
           New-Item -ItemType Directory -Path $dir | Out-Null
           Copy-Item target\release\paperboy.exe $dir\
-          Copy-Item README.md, CHANGELOG.md $dir\
+          Copy-Item README.md, CHANGELOG.md, LICENSE $dir\
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           Get-Item "$dir.zip"
 

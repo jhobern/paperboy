@@ -50,6 +50,10 @@ RUN apt-get update \
 
 COPY --from=build /src/target/release/paperboy /usr/local/bin/paperboy
 
+# MIT asks that the copyright notice travel with the software, and an image is
+# a distribution like any other.
+COPY --from=build /src/LICENSE /usr/local/share/paperboy/LICENSE
+
 # Collections, environments and the reports written beside them are mounted in.
 # Keeping a fixed working directory means `-v "$PWD:/work"` is the whole of the
 # invocation rather than something the user has to work out.
