@@ -27,6 +27,13 @@
 
 use std::collections::HashMap;
 
+/// Display name for an answer that is empty, used by [`LabelMap::label_of`].
+///
+/// Parenthesised for the same reason as [`crate::report::compare::NOT_RUN`]:
+/// it says something *about* the cell rather than pretending to be a value the
+/// engine returned, and no plausible literal answer collides with it.
+pub const NO_ANSWER: &str = "(no answer)";
+
 /// The label classes a report declares, in the order they were written.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LabelMap {
@@ -131,10 +138,22 @@ impl LabelMap {
     /// lumped into an "other" bucket — an answer nobody expected is exactly
     /// what the reader most needs to see, and hiding it would make a confusion
     /// matrix lie about what happened.
+    ///
+    /// The one value that cannot be shown as itself is the empty one: a scored
+    /// row whose answer cell is blank would otherwise contribute an *untitled*
+    /// row and column to the matrix, which reads as a rendering fault rather
+    /// than as a result. It is named [`NO_ANSWER`] instead. The name is
+    /// parenthesised so it cannot be confused with a literal answer of the same
+    /// words, and the naming happens here — rather than at the point the axis
+    /// is built — so that the matrix, the exports and the matrix-cell drill-down
+    /// filter all agree on what the bucket is called.
     pub fn label_of(&self, value: &str) -> String {
         match self.class_of(value) {
             Some(i) => self.classes[i].clone(),
-            None => canon(value),
+            None => match canon(value) {
+                v if v.is_empty() => NO_ANSWER.to_string(),
+                v => v,
+            },
         }
     }
 
@@ -180,6 +199,26 @@ mod tests {
         assert_eq!(canon("  Low   RISK\t"), "low risk");
         assert_eq!(canon(""), "");
         assert_eq!(canon("   "), "");
+    }
+
+    /// An empty answer is still an answer the reader has to account for, but it
+    /// cannot be displayed as itself: an untitled confusion-matrix row and
+    /// column reads as a broken renderer rather than as a result. Naming it in
+    /// `label_of` -- and not at the point the axis is built -- is what keeps the
+    /// axis, the exports and the matrix-cell drill-down filter agreeing.
+    #[test]
+    fn an_empty_answer_is_named_rather_than_left_untitled() {
+        let labels = LabelMap::parse(&["Pass = pass, real", "Fail = fail, fake"]);
+        assert_eq!(labels.label_of(""), NO_ANSWER);
+        assert_eq!(labels.label_of("   "), NO_ANSWER);
+        assert_eq!(labels.label_of("real"), "Pass");
+        assert_eq!(labels.label_of("Maybe"), "maybe");
+        // Naming the bucket must not make blanks *match* anything new: `same`
+        // goes through `class_of`, not `label_of`, so two blanks still mean the
+        // same thing and a blank still differs from a real answer.
+        assert!(labels.same("", "  "));
+        assert!(!labels.same("", "real"));
+        assert!(!labels.same("", NO_ANSWER));
     }
 
     /// The structured editors edit a class as two fields, so the split has to

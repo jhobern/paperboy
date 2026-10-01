@@ -112,3 +112,98 @@ jobs:
       # compiled into `src/main.rs` and plain `cargo test` is the only form that
       # works (`--lib` fails outright).
       - run: cargo test ${{ matrix.features }}
+
+  # Everything above runs on Linux, which for a long time meant the two
+  # platforms a user is most likely to *download* were never compiled at all --
+  # "PaperBoy runs on Windows" was a claim resting on nothing, and the first
+  # person to test it did so by hand, one missing dependency at a time.
+  #
+  # Only the `gui` shape is built here. It is a strict superset: the same binary
+  # serves `-c`, the terminal UI and `--gui`, so it is both the widest compile
+  # and exactly what a release artifact will be. A second shape would double a
+  # slow job to prove something the Linux matrix already proves.
+  #
+  # Neither runner can build this out of the box, and what each is missing is
+  # not the same:
+  platform:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+          - name: macos
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      # On MSVC, `libxml` asks vcpkg and nothing else. The image ships a vcpkg
+      # tree already, so this installs the port rather than bootstrapping one --
+      # and `VCPKG_ROOT` is exported because that, not `PATH`, is how vcpkg-rs
+      # finds the tree. The triplet must be the `-static-md` one Rust's MSVC
+      # target wants; the plain `x64-windows` port installs fine and then reads
+      # as missing.
+      - name: Install libxml2 (vcpkg)
+        if: runner.os == 'Windows'
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg" install libxml2:x64-windows-static-md
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+      # OpenSSL assembles its Windows primitives with NASM, which is the one
+      # prerequisite the image does not carry (it has Perl, LLVM and MSVC). Its
+      # installer does not extend PATH either, hence the second line.
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        run: |
+          choco install nasm -y --no-progress
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+      # hurl 8.0.1's build script embeds a Windows icon from
+      # `../../bin/windows/logo.ico`, a path relative to hurl's own git
+      # checkout. The crates.io package ships nothing outside its own
+      # directory, so on Windows `rc.exe` fails with RC2135 and the build
+      # script panics -- hurl as a library simply cannot be built on Windows
+      # from crates.io. Upstream fixed it by guarding the path
+      # (Orange-OpenSource/hurl#5207, merged 2026-09-14) but has not released
+      # it; 8.0.1 is still the newest crate.
+      #
+      # rc.exe resolves that relative path from the build script's working
+      # directory, which Cargo sets to the package root -- so `../../` lands in
+      # `registry/src`, and putting a file there is enough to satisfy it. We
+      # supply *our own* icon rather than fetching hurl's: the resource is
+      # linked into the final executable, so hurl's logo would otherwise become
+      # paperboy.exe's icon. Remove this once hurl 8.1.0 is out.
+      - name: Work around hurl's unreachable Windows icon (hurl#5207)
+        if: runner.os == 'Windows'
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+          $dir = Join-Path $cargoHome "registry\src\bin\windows"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item "assets\windows\paperboy.ico" (Join-Path $dir "logo.ico") -Force
+
+      # macOS has pkgconf but no discoverable libxml2 -- the system copy lives
+      # inside the SDK and moves between Xcode releases. Homebrew's is keg-only,
+      # so it has to be pointed at explicitly rather than assumed on the path.
+      # `LIBXML2_STATIC` matches what release.yml does, so the configuration
+      # that ships is the one under test. Without it this job would prove a
+      # dynamically linked build works and the release would link differently.
+      - name: Install libxml2 (Homebrew)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libxml2
+          echo "PKG_CONFIG_PATH=$(brew --prefix libxml2)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LIBXML2_STATIC=1" >> "$GITHUB_ENV"
+
+      # `-D warnings` matches the Linux matrix. Platform-gated code (clipboard
+      # and terminal handling differ per OS) has never been under it before, so
+      # this is the job that will say so.
+      - run: cargo test --features gui
+        env:
+          RUSTFLAGS: -D warnings

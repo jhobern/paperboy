@@ -588,7 +588,8 @@ strings! {
     help_revert_env => "revert the whole environment to its last saved values on disk", "rétablir tout l'environnement à ses dernières valeurs enregistrées sur le disque", "gendan hele miljøet til dets sidst gemte værdier på disken";
     help_resize => "shrink / grow response pane", "réduire / agrandir le panneau de réponse", "formindsk / forøg svarpanelet";
     help_resize_width => "grow / shrink left column", "agrandir / réduire la colonne de gauche", "forøg / formindsk venstre kolonne";
-    help_tab_manage => "close / reopen collection or workspace tab", "fermer / rouvrir un onglet de collection ou d'espace de travail", "luk / genåbn samlings- eller workspace-fane";
+    help_tab_manage => "reopen the last closed collection or workspace tab", "rouvrir le dernier onglet de collection ou d'espace de travail fermé", "genåbn den senest lukkede samlings- eller workspace-fane";
+    help_tab_close => "close the active collection or workspace tab (from any pane)", "fermer l'onglet de collection ou d'espace de travail actif (depuis n'importe quel volet)", "luk den aktive samlings- eller workspace-fane (fra enhver rude)";
     help_tab_reorder => "reorder tabs", "réorganiser les onglets", "omarranger faner";
     help_restore_request => "restore deleted request (List pane)", "restaurer la requête supprimée (volet Liste)", "gendan slettet anmodning (Liste-rude)";
     help_move_request => "move request to another collection (workspace, List pane)", "déplacer la requête vers une autre collection (espace de travail, volet Liste)", "flyt anmodning til en anden samling (arbejdsområde, Liste-rude)";
@@ -600,6 +601,10 @@ strings! {
     foot_reorder => "reorder", "réordonner", "omarrangér";
     foot_find_request => "find request", "chercher requête", "find forespørgsel";
     help_find_request => "find a request anywhere in the collection — or any row of a workspace tree (Esc clears it)", "chercher une requête dans toute la collection — ou n'importe quelle ligne d'un arbre d'espace de travail (Échap l'efface)", "find en forespørgsel hvor som helst i samlingen — eller en vilkårlig række i et arbejdsområdetræ (Esc rydder det)";
+    help_resolve_body_notes => "resolve the notes on a body that has changed since they were written (List pane)", "résoudre les notes d'un corps modifié depuis leur rédaction (volet Liste)", "løs noterne på en brødtekst, der er ændret siden de blev skrevet (Liste-ruden)";
+    help_workspace_file_filter => "show only workspace files in the tree — .hurl / .json / .vars / .trail (workspace, List pane)", "n'afficher que les fichiers d'espace de travail dans l'arbre — .hurl / .json / .vars / .trail (espace de travail, volet Liste)", "vis kun workspace-filer i træet — .hurl / .json / .vars / .trail (arbejdsområde, Liste-ruden)";
+    help_workspace_folder_up => "go up to the parent folder (workspace, List pane)", "remonter au dossier parent (espace de travail, volet Liste)", "gå op til den overordnede mappe (arbejdsområde, Liste-ruden)";
+    help_copy_status => "copy the status or error message currently on screen", "copier le message d'état ou d'erreur affiché", "kopiér den status- eller fejlmeddelelse, der vises";
     help_row_toggle_delete => "in wizard tables: ^E toggle row enabled, ^D delete row", "dans les tableaux : ^E activer/désactiver la ligne, ^D supprimer la ligne", "i guidens tabeller: ^E slå række til/fra, ^D slet række";
     help_text_undo => "undo / redo in the focused text field (^Z / ^Shift+Z)", "annuler / rétablir dans le champ de texte actif (^Z / ^Maj+Z)", "fortryd / gendan i det aktive tekstfelt (^Z / ^Skift+Z)";
     help_copy_selection => "copy the selection, or the whole panel if nothing is selected (Request JSON / Request Hurl / Response panel)", "copier la sélection, ou tout le panneau si rien n'est sélectionné (panneau JSON de requête / Hurl de requête / réponse)", "kopiér markeringen, eller hele ruden hvis intet er markeret (Request JSON / Request Hurl / Response-rude)";
@@ -638,6 +643,9 @@ strings! {
     help_report_columns => "pick, reorder and rename the report's output columns", "choisir, réordonner et renommer les colonnes de sortie du rapport", "vælg, omorden og omdøb rapportens outputkolonner";
     help_report_params => "show or hide the values this report asks for before it runs (its PARAMs)", "afficher ou masquer les valeurs que ce rapport demande avant son exécution (ses PARAM)", "vis eller skjul de værdier, denne rapport beder om, før den kører (dens PARAM)";
     help_report_bind => "bind the report to one of the open collections", "lier le rapport à l'une des collections ouvertes", "bind rapporten til en af de åbne samlinger";
+    help_report_reformat => "re-indent the report source to its real block depth", "réindenter la source du rapport selon sa profondeur de blocs réelle", "genindryk rapportkilden til dens faktiske blokdybde";
+    help_report_grid => "in the results grid: arrows move the cell cursor · Home/End first/last row · Enter opens the cell or its row's drill-down", "dans la grille de résultats : les flèches déplacent le curseur de cellule · Début/Fin première/dernière ligne · Entrée ouvre la cellule ou le détail de sa ligne", "i resultatgitteret: piletasterne flytter cellemarkøren · Home/End første/sidste række · Enter åbner cellen eller rækkens detaljevisning";
+    help_report_grid_page => "page the cell cursor a whole screenful up/down the results grid", "faire défiler le curseur de cellule d'un écran entier dans la grille de résultats", "flyt cellemarkøren en hel skærm op/ned i resultatgitteret";
     help_tab_reports => "Reports", "Rapports", "Rapporter";
     help_reports_about_heading => "What is a report?", "Qu'est-ce qu'un rapport ?", "Hvad er en rapport?";
     help_reports_about_1 => "A report is a saved flow that drives a bound collection against ranges of files or environments and collects the results into a table.", "Un rapport est un flux enregistré qui exécute une collection liée sur des ensembles de fichiers ou d'environnements et rassemble les résultats dans un tableau.", "En rapport er et gemt flow, der kører en bundet samling mod intervaller af filer eller miljøer og samler resultaterne i en tabel.";
@@ -712,7 +720,11 @@ strings! {
     // thing wherever it appears.
     tab_unsaved_marker => "✎", "✎", "✎";
     report_results_heading => "Results", "Résultats", "Resultater";
-    report_hint_results => "Enter drill-down · / filter · v source · Ctrl+E export · Ctrl+O open · B baseline", "Entrée exploration · / filtre · v source · Ctrl+E export · Ctrl+O ouvrir · B référence", "Enter udforsk · / filter · v kilde · Ctrl+E export · Ctrl+O åbn · B basislinje";
+    // The cell cursor and its drill-down are documented in `?` (see
+    // `help_report_grid`) rather than here: Enter-to-open is the one binding in
+    // this list a reader can guess, and the title truncates from the right, so
+    // spending its width on the guessable key cost the ones that aren't.
+    report_hint_results => "/ filter · v source · Ctrl+E export · Ctrl+O open · B baseline", "/ filtre · v source · Ctrl+E export · Ctrl+O ouvrir · B référence", "/ filter · v kilde · Ctrl+E export · Ctrl+O åbn · B basislinje";
     report_results_empty => "No results yet — press r to run the report.", "Aucun résultat — appuyez sur r pour exécuter le rapport.", "Ingen resultater endnu — tryk r for at køre rapporten.";
     report_run_parse_error => "Can't run — the source has a parse error:", "Exécution impossible — la source a une erreur d'analyse :", "Kan ikke køre — kilden har en parsefejl:";
     report_run_unbound => "Bind a collection before running (edit the '# collection:' header).", "Liez une collection avant l'exécution (modifiez l'en-tête « # collection: »).", "Bind en samling før kørsel (rediger « # collection: »-headeren).";

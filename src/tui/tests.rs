@@ -5361,6 +5361,9 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
         s.help_env_reopen,
         s.help_env_view_vars,
         s.help_tab_manage,
+        s.help_tab_close,
+        s.help_copy_status,
+        s.help_workspace_folder_up,
         s.help_restore_request,
         s.help_tab_reorder,
         s.help_multi_select,
@@ -5385,6 +5388,20 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
         text.contains("copy the selection"),
         "the copy-selection shortcut description still appears (possibly wrapped)"
     );
+    // The rest of the long ones are matched with the wrapping collapsed, so a
+    // description is checked in full rather than by a leading fragment that
+    // could go on matching after the tail of the string had changed.
+    for desc in [
+        s.help_resolve_body_notes,
+        s.help_workspace_file_filter,
+        s.help_report_grid,
+        s.help_report_grid_page,
+    ] {
+        assert!(
+            contains_wrapped(term.backend().buffer(), desc),
+            "shortcut description {desc:?} is shown (allowing for wrapping)"
+        );
+    }
 }
 
 /// Typing in the Help popup filters its entries to those matching the query
@@ -5544,6 +5561,69 @@ fn help_reports_tab_explains_reports_shortcuts_and_grammar() {
         assert!(
             text.contains(expected),
             "the Reports help tab shows {expected:?}"
+        );
+    }
+}
+
+/// The two help tabs describe the same report view, and they drifted: `b`
+/// (bind) and `p` (run settings) were listed on the Shortcuts tab while the
+/// Reports tab — the self-contained report reference someone reads *because*
+/// they are working on a report — never mentioned them. Checked rather than
+/// remembered, since the lists are two literal arrays in different functions
+/// and nothing but this ties them together.
+#[test]
+fn every_report_shortcut_on_the_shortcuts_tab_is_on_the_reports_tab_too() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+    let render = |tab: usize| {
+        let mut app = TuiApp {
+            overlay: Some(Overlay::Help(tab)),
+            ..Default::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(120, 200)).unwrap();
+        term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+            .unwrap();
+        // The two tabs give their key column different widths, so the same
+        // description wraps in one and not the other — compared with the
+        // wrapping collapsed so the test is about the entries, not the layout.
+        let collapse = |t: String| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        collapse(flattened_content(term.backend().buffer()))
+    };
+    let shortcuts = render(0);
+    let reports = render(2);
+    for desc in [
+        s.help_report_new,
+        s.help_report_edit,
+        s.help_report_nodes,
+        s.help_report_run,
+        s.help_report_dry_run,
+        s.help_report_view,
+        s.help_report_nodes_edit,
+        s.help_report_nodes_forms,
+        s.help_report_focus_cycle,
+        s.help_report_grid,
+        s.help_report_grid_page,
+        s.help_report_workspace_tree,
+        s.help_report_filter,
+        s.help_report_export,
+        s.help_report_open_export,
+        s.help_report_baseline,
+        s.help_report_columns,
+        s.help_report_reformat,
+        s.help_report_bind,
+        s.help_report_params,
+        s.help_report_leave_edit,
+    ] {
+        let needle = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            shortcuts.contains(&needle),
+            "the Shortcuts tab lists {desc:?}"
+        );
+        assert!(
+            reports.contains(&needle),
+            "the Reports tab lists {desc:?} as well"
         );
     }
 }
@@ -6993,6 +7073,16 @@ fn flattened_content(buf: &ratatui::buffer::Buffer) -> String {
         .chars()
         .filter(|c| !"\n│─┌┐└┘\u{2588}\u{21b5}".contains(*c))
         .collect()
+}
+
+/// Whether `needle` appears in the buffer once the panel's line wrapping is
+/// ignored. A long help description is wrapped across rows, so where the source
+/// string has one space the rendered text carries a run of padding (and a
+/// border, which [`flattened_content`] has already removed). Both sides are
+/// collapsed to single spaces before the comparison.
+fn contains_wrapped(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
+    let collapse = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapse(&flattened_content(buf)).contains(&collapse(needle))
 }
 
 /// The foreground colour of the first cell where `needle` starts, scanning
@@ -20743,9 +20833,15 @@ fn export_format_cycles_through_output_formats() {
     app.cycle_browser_export_format(true);
     assert_eq!(app.browser_name.text(), "report.pdf");
     app.cycle_browser_export_format(true);
+    assert_eq!(
+        app.browser_name.text(),
+        "report.xml",
+        "JUnit is a format too"
+    );
+    app.cycle_browser_export_format(true);
     assert_eq!(app.browser_name.text(), "report.csv", "wraps back to csv");
     app.cycle_browser_export_format(false);
-    assert_eq!(app.browser_name.text(), "report.pdf", "↑ steps backwards");
+    assert_eq!(app.browser_name.text(), "report.xml", "↑ steps backwards");
     // An unknown extension is treated as csv, so the next format is json.
     app.browser_name = super::editor::Editor::new("data.txt", false);
     app.cycle_browser_export_format(true);
@@ -27564,6 +27660,39 @@ fn drill_down_popup_grows_for_long_wrapped_values() {
         long > short,
         "a long wrapped value should get a taller popup (long={long}, short={short})"
     );
+}
+
+/// While a run streams, a row it hasn't reached yet carries the dry pass's
+/// filler (`Time` 0, `status` 0) rather than a measurement. Shown as-is it reads
+/// like a result, so produced cells are placeholdered — while the parameters
+/// that decided the row exists (its file, its environment) are real and stay.
+#[test]
+fn a_pending_rows_produced_cells_drill_down_to_a_placeholder_not_a_dry_zero() {
+    use crate::report::model::PENDING_CELL_MARKER;
+    let (mut app, idx) = report_with_multi_row_result();
+    {
+        let result = app.reports[idx].result.as_mut().unwrap();
+        result.rows[1]
+            .cells
+            .insert("Col2".to_string(), "0".to_string());
+        result.rows[1]
+            .vars
+            .insert("FILE".to_string(), "b.jpg".to_string());
+        result.column_order.push("FILE".to_string());
+        result.pending = [1usize].into_iter().collect();
+    }
+    let open = |app: &mut TuiApp, row: usize, col: usize| -> String {
+        app.overlay = None;
+        app.reports[idx].cell_cursor = Some((row, col));
+        app.open_result_cell_popup();
+        match &app.overlay {
+            Some(Overlay::ReportCellPopup { content, .. }) => content.clone(),
+            _ => panic!("expected Overlay::ReportCellPopup"),
+        }
+    };
+    assert_eq!(open(&mut app, 1, 1), PENDING_CELL_MARKER, "not a dry 0");
+    assert_eq!(open(&mut app, 1, 3), "b.jpg", "the row's parameter is real");
+    assert_eq!(open(&mut app, 0, 1), "r0c1", "a finished row is untouched");
 }
 
 #[test]

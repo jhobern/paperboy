@@ -2395,12 +2395,17 @@ impl TuiApp {
         };
         // `row` counts rows on screen; with a filter up that is not the run's
         // own numbering, so it is mapped back before the row is read.
-        let Some(data_row) = visible.get(row).and_then(|&r| result.rows.get(r)) else {
+        let Some(&data_row) = visible.get(row) else {
             return;
         };
+        if data_row >= result.rows.len() {
+            return;
+        }
         let title = col_def.header.clone();
-        // Full (unflattened) cell value — may be multi-line.
-        let content = col_def.value(data_row, &result.no_match_marker);
+        // Full (unflattened) cell value — may be multi-line. Placeholdered for a
+        // row that hasn't run, so drilling in agrees with the grid rather than
+        // presenting a dry-pass `0` as the cell's answer.
+        let content = result.display_cell(data_row, col_def, false);
         // Pretty-print the cell when its whole trimmed value is a single JSON
         // document (e.g. a captured response body), so drilling into it shows
         // an indented, one-field-per-line view instead of a dense single line.
@@ -4590,11 +4595,14 @@ fn report_grid_lines(
     // it is showing rather than carrying columns sized for hidden ones.
     let body: Vec<Vec<String>> = visible
         .iter()
-        .filter_map(|&r| result.rows.get(r))
-        .map(|row| {
+        .filter(|&&r| r < result.rows.len())
+        .map(|&r| {
+            // A row the run hasn't reached yet shows placeholders rather than
+            // the dry pass's fabricated intrinsics (see `display_cell`).
+            let running = states.and_then(|s| s.get(r)) == Some(&RowState::Running);
             columns
                 .iter()
-                .map(|c| flatten_cell(&c.value(row, &result.no_match_marker)))
+                .map(|c| flatten_cell(&result.display_cell(r, c, running)))
                 .collect()
         })
         .collect();
@@ -4753,11 +4761,14 @@ pub(crate) fn result_column_widths(
     let headers: Vec<String> = columns.iter().map(|c| c.header.clone()).collect();
     let body: Vec<Vec<String>> = visible
         .iter()
-        .filter_map(|&r| result.rows.get(r))
-        .map(|row| {
+        .filter(|&&r| r < result.rows.len())
+        .map(|&r| {
+            // Placeholder-substituted exactly as `report_grid_lines` does, so
+            // the two agree on every width. Which pending marker is used makes
+            // no difference here: both are one column wide.
             columns
                 .iter()
-                .map(|c| flatten_cell(&c.value(row, &result.no_match_marker)))
+                .map(|c| flatten_cell(&result.display_cell(r, c, false)))
                 .collect()
         })
         .collect();

@@ -58,8 +58,23 @@ impl ColumnMetrics {
 
     /// The accuracy as it is shown: one decimal place, e.g. `95.9%`.
     pub fn accuracy_text(&self) -> Option<String> {
-        self.accuracy().map(|a| format!("{:.1}%", a * 100.0))
+        self.accuracy().map(|a| percent_text(a * 100.0))
     }
+}
+
+/// How many decimal places a percentage is shown with everywhere in PaperBoy.
+pub const PERCENT_DECIMALS: usize = 1;
+
+/// A percentage as PaperBoy shows it.
+///
+/// The single place the rendering lives, so the figure in a table, in a summary
+/// and in a `--fail-under` verdict are the same rounding of the same number.
+/// Two call sites that each formatted it themselves once disagreed by a tenth
+/// (`f64`'s `{:.1}` rounds half to even, `f64::round` rounds half away from
+/// zero), which is how a gate came to print a passing figure next to a failing
+/// verdict.
+pub fn percent_text(percent: f64) -> String {
+    format!("{percent:.PERCENT_DECIMALS$}%")
 }
 
 /// Truth (down) against prediction (across).
@@ -184,6 +199,13 @@ impl Metrics {
         if result.verdicts.is_empty() {
             return None;
         }
+        // Nothing was measured: a dry run sent no request, so there is no
+        // answer to have been right or wrong about. Reporting "0 of 12
+        // compared, Accuracy —" would still invite the reader to treat a
+        // preview as a scored run; reporting nothing is the honest shape.
+        if result.dry_run {
+            return None;
+        }
         // A row still waiting on its request is not part of the table yet: a
         // live "compared 3 of 500" would spend the whole run reading as a
         // catastrophe in progress.
@@ -256,6 +278,43 @@ impl Metrics {
             overall,
             movement: movement(result),
         })
+    }
+
+    /// The whole run's ground-truth roll-up, regardless of which columns the
+    /// table happens to show.
+    ///
+    /// [`Metrics::overall`] describes the report in front of the reader, so a
+    /// `# columns:` directive that hides the `Correct` column hides the roll-up
+    /// with it. A quality gate is not about the reader: `--fail-under` asks how
+    /// the run *went*, and that answer cannot depend on which columns someone
+    /// chose to print. `None` when the report scored nothing at all (no
+    /// `TRUTH`, or a dry run that measured nothing).
+    pub fn gate_rollup(result: &ReportResult) -> Option<ColumnMetrics> {
+        if result.verdicts.is_empty() || result.dry_run {
+            return None;
+        }
+        Some(row_rollup(result, result.rows.len() - result.pending.len()))
+    }
+
+    /// How the run moved against its baseline, independently of what the report
+    /// shows.
+    ///
+    /// The same relation to [`Metrics::movement`] as [`Metrics::gate_rollup`]
+    /// has to [`Metrics::overall`]: that one describes the table in front of
+    /// the reader, and a `# columns:` directive that hides the `Trend` column
+    /// rightly hides the summary with it. This one answers a question nobody is
+    /// reading a table to ask — a gate on regressions, and the figures on the
+    /// `run_finished` event a caller may be gating on itself — and that answer
+    /// cannot depend on which columns somebody chose to print.
+    ///
+    /// `None` when there was no baseline, or no row was scored on both sides:
+    /// a run with nothing to compare against has not "stayed still", and four
+    /// zeroes would say that it had.
+    pub fn gate_movement(result: &ReportResult) -> Option<Movement> {
+        if result.dry_run {
+            return None;
+        }
+        movement(result)
     }
 
     /// The metric rows appended to the table's footer, one cell per column.
@@ -401,6 +460,7 @@ mod tests {
 
     fn row(cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {
+            errors: Vec::new(),
             role: crate::report::model::RowRole::default(),
             cells: cells
                 .iter()
@@ -559,6 +619,19 @@ mod tests {
         assert_eq!(matrix.total(), 4, "no scored row is lost");
     }
 
+    /// A dry run sent nothing, so nothing was measured. Scoring it would mark
+    /// every projected row wrong for the crime of not having been run, and the
+    /// footer would assert an accuracy for a run that never happened.
+    #[test]
+    fn a_dry_run_is_not_scored_at_all() {
+        let (mut res, cols, labels) = fixture();
+        res.dry_run = true;
+        assert!(
+            Metrics::compute(&res, &cols, &labels).is_none(),
+            "a preview has no accuracy, not an accuracy of zero"
+        );
+    }
+
     #[test]
     fn a_report_without_a_truth_has_no_metrics_at_all() {
         let mut res = ReportResult::default();
@@ -592,6 +665,51 @@ mod tests {
         assert!(
             rows[0].cells.iter().flatten().all(|c| c.stat.is_none()),
             "a metric is not a statistic a spreadsheet could recompute"
+        );
+    }
+
+    /// A blank answer used to reach the axis as the empty string, so the matrix
+    /// grew an untitled row and column -- which reads as a broken renderer
+    /// rather than as "these rows answered nothing". The bucket is named by
+    /// `LabelMap::label_of`, which is also what the matrix-cell filter matches
+    /// on, so naming it must not cost the drill-down.
+    #[test]
+    fn a_blank_answer_gets_a_named_matrix_bucket_that_still_drills_down() {
+        use crate::report::filter::RowFilter;
+        use crate::report::labels::NO_ANSWER;
+
+        let (mut res, _, labels) = fixture();
+        res.rows[0].cells.insert("Verdict".into(), String::new());
+        let cols = res.resolved_columns(&Header::default());
+        let metrics = Metrics::compute(&res, &cols, &labels).expect("a scored column");
+        let matrix = metrics.columns[0].matrix.as_ref().expect("a matrix");
+
+        assert!(
+            !matrix.axis.iter().any(|a| a.trim().is_empty()),
+            "no axis entry is untitled: {:?}",
+            matrix.axis
+        );
+        assert!(matrix.axis.contains(&NO_ANSWER.to_string()));
+
+        // The blank row was truthfully `real` -> `Pass`, so it is counted in
+        // that truth's row, under the named column, and clicking that cell has
+        // to come back with exactly the row the count was made of.
+        let truth = matrix.axis.iter().position(|a| a == "Pass").expect("Pass");
+        let answer = matrix
+            .axis
+            .iter()
+            .position(|a| a == NO_ANSWER)
+            .expect("the named bucket");
+        assert_eq!(matrix.counts[truth][answer], 1);
+
+        let filter = RowFilter::MatrixCell {
+            column: "Verdict".into(),
+            truth: "Pass".into(),
+            answer: NO_ANSWER.into(),
+        };
+        assert_eq!(
+            crate::report::filter::visible_rows(&res, &cols, &labels, &filter, ""),
+            vec![0]
         );
     }
 }

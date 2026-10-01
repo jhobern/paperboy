@@ -222,6 +222,7 @@ pub fn run_hurl_watching(
             .first()
             .map(|e| entry_retry_limit(e, &variables))
             .unwrap_or_default(),
+        seen: std::cell::RefCell::new(Vec::new()),
     };
     let result = runner::run_entries(
         &hurl_file.entries,
@@ -243,7 +244,7 @@ pub fn run_hurl_watching(
         entries.push(outcome);
         errors.push(entry_error);
     }
-    mark_superseded(&mut entries, |i| {
+    mark_superseded(&mut entries, &reporter.seen.borrow(), |i| {
         hurl_file.entries.get(i).is_some_and(entry_retries)
     });
     // The run's error is the first *surviving* failure. Taking the first of any
@@ -359,6 +360,27 @@ struct AttemptReporter<'a> {
     /// to record what it sees needs `&mut`.
     on_attempt: std::cell::RefCell<&'a mut dyn FnMut(usize, usize, RetryLimit)>,
     limit: RetryLimit,
+    /// Every attempt the runner announced, in order — kept because it is the
+    /// only place the *shape* of a run is visible. See [`Attempt`].
+    seen: std::cell::RefCell<Vec<Attempt>>,
+}
+
+/// One attempt at one entry, as the runner announced it.
+///
+/// The results of a retried entry all arrive together at the end, indexed by
+/// entry and nothing else, so a finished run cannot be asked whether its third
+/// result was a retry of the second or a fresh repetition of the same request.
+/// The running commentary can: Hurl announces every attempt before it sends it,
+/// and `retry` is zero exactly once per repetition — the first attempt at it —
+/// and counts up from there within it. That single number is the difference
+/// between "this failure was replaced" and "this failure stands".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Attempt {
+    /// Zero-based index of the entry in the file.
+    index: usize,
+    /// How many times this attempt had already been retried: 0 for the first
+    /// attempt of a repetition.
+    retry: usize,
 }
 
 impl EventListener for AttemptReporter<'_> {
@@ -368,7 +390,12 @@ impl EventListener for AttemptReporter<'_> {
         _last: hurl_core::types::Index,
         retry_count: usize,
     ) {
-        (self.on_attempt.borrow_mut())(current.to_zero_based(), retry_count, self.limit);
+        let index = current.to_zero_based();
+        self.seen.borrow_mut().push(Attempt {
+            index,
+            retry: retry_count,
+        });
+        (self.on_attempt.borrow_mut())(index, retry_count, self.limit);
     }
 }
 
@@ -388,14 +415,52 @@ fn entry_retries(entry: &hurl_core::ast::Entry) -> bool {
 
 /// Mark every outcome that a later attempt of the same request replaced.
 ///
-/// `outcomes` must be the results of one runner call, in the order the runner
-/// produced them: attempts of one entry are consecutive, so "another result
-/// with my index follows" is exactly "I was retried".
-fn mark_superseded(outcomes: &mut [EntryOutcome], retries: impl Fn(usize) -> bool) {
-    for i in 0..outcomes.len().saturating_sub(1) {
-        let index = outcomes[i].entry_index;
-        if outcomes[i + 1].entry_index == index && retries(index) {
-            outcomes[i].superseded = true;
+/// A retried request produces one result per attempt, and only the last of them
+/// says how the request actually ended — the earlier ones are the failures the
+/// retry existed to ride out, and reporting them would call a poll that
+/// eventually succeeded a failed run.
+///
+/// A *repeat* produces several results for one entry too, and those are the
+/// opposite case: each repetition is a request in its own right, and a failure
+/// in one of them is the run's answer even if a later repetition passed.
+/// Telling them apart cannot be done from the results, which carry an entry
+/// index and nothing else — with `repeat: 3, retry: 2` written together, an
+/// earlier repetition's genuine failure was marked as superseded by the next
+/// repetition's first attempt, and a broken API reported a clean run and exit
+/// 0. So the runner's own commentary is used instead: `attempts` is what it
+/// announced, and an attempt with `retry > 0` is a retry of the one before it
+/// within the same repetition.
+///
+/// `retries` is the fallback for a run with no usable commentary (an entry the
+/// runner skipped announces an attempt and produces no result, so the two
+/// cannot be lined up): the old behaviour, which is right whenever `repeat` is
+/// not also in play.
+fn mark_superseded(
+    outcomes: &mut [EntryOutcome],
+    attempts: &[Attempt],
+    retries: impl Fn(usize) -> bool,
+) {
+    let mut results: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, o) in outcomes.iter().enumerate() {
+        results.entry(o.entry_index).or_default().push(i);
+    }
+    let mut announced: HashMap<usize, Vec<usize>> = HashMap::new();
+    for a in attempts {
+        announced.entry(a.index).or_default().push(a.retry);
+    }
+    for (index, positions) in results {
+        // Lined up one-to-one or not at all: a count that disagrees means some
+        // attempt announced itself and produced nothing (`skip`, `repeat: 0`),
+        // and a silently shifted alignment would mark the wrong results.
+        let counts = announced.get(&index).filter(|c| c.len() == positions.len());
+        for (k, &at) in positions.iter().enumerate().take(positions.len() - 1) {
+            let replaced = match counts {
+                Some(counts) => counts[k + 1] > 0,
+                None => retries(index),
+            };
+            if replaced {
+                outcomes[at].superseded = true;
+            }
         }
     }
 }
@@ -533,6 +598,7 @@ pub fn run_hurl_streaming_with(
         let reporter = AttemptReporter {
             on_attempt: std::cell::RefCell::new(&mut on_attempt),
             limit: entry_retry_limit(&hurl_file.entries[i - 1], &variables),
+            seen: std::cell::RefCell::new(Vec::new()),
         };
         let result = runner::run_entries(
             &hurl_file.entries,
@@ -558,7 +624,7 @@ pub fn run_hurl_streaming_with(
             window_errors.push(entry_error);
         }
         let retried = entry_retries(&hurl_file.entries[i - 1]);
-        mark_superseded(&mut window, |_| retried);
+        mark_superseded(&mut window, &reporter.seen.borrow(), |_| retried);
         for (outcome, entry_error) in window.into_iter().zip(window_errors) {
             if error.is_none() && !outcome.superseded {
                 error = entry_error;
@@ -1114,6 +1180,45 @@ mod tests {
         assert_eq!(surviving.len(), 1);
         assert!(!surviving[0].ok);
         assert!(out.error.is_some(), "a failed run must say why");
+    }
+
+    /// The two written together, which is where the rule that told them apart
+    /// by entry index alone came apart. With `repeat: 2, retry: 2`, a first
+    /// repetition that exhausts its retries and a second that passes produce
+    /// four results under one index -- and "another result with my index
+    /// follows" marked the failed repetition as superseded by the next
+    /// repetition's opening attempt. The failure disappeared, the run reported
+    /// no error, and a broken API exited 0 under precisely the options someone
+    /// chose to be thorough.
+    #[test]
+    fn a_repeat_that_failed_is_not_superseded_by_the_next_repeats_first_try() {
+        // Three "Pending" answers: the first repetition spends all three of its
+        // attempts on them, and the second repetition sees "Matched".
+        let port = polling_server(3);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nrepeat: 2\nretry: 2\nretry-interval: 20\n\
+             HTTP 200\n[Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let out = run_hurl(&content, &HashMap::new(), None);
+        let shape: Vec<(usize, bool, bool)> = out
+            .entries
+            .iter()
+            .map(|e| (e.entry_index, e.ok, e.superseded))
+            .collect();
+
+        assert_eq!(out.entries.len(), 4, "three attempts, then one: {shape:?}");
+        let surviving: Vec<&EntryOutcome> = out.entries.iter().filter(|e| !e.superseded).collect();
+        assert_eq!(
+            surviving.len(),
+            2,
+            "one outcome per repetition, not one for the pair: {shape:?}"
+        );
+        assert!(!surviving[0].ok, "the repetition that failed: {shape:?}");
+        assert!(surviving[1].ok, "the repetition that passed: {shape:?}");
+        assert!(
+            out.error.is_some(),
+            "a repetition that failed is the run's answer: {shape:?}"
+        );
     }
 
     /// `repeat` is not `retry`: those are N runs the user asked for, and every

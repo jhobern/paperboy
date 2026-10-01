@@ -8,6 +8,309 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.7.0] - 2026-09-30
+
+### Added
+
+- **`--fail-under PERCENT`: a quality gate for a report used as a deploy
+  check.** A run in which every request was sent and read, and every answer was
+  wrong, was a successful run — the report had been produced, so the process
+  exited `0`. That is the right answer to "did the run work" and the wrong
+  answer to the question a pipeline is actually asking. `--fail-under 95` holds
+  the run to a threshold and exits **`5`** when it falls short. The figure is
+  the whole run's `Correct` roll-up over the rows that had a `TRUTH` to compare
+  against (rows with no ground truth are not counted as wrong — they were never
+  asked). The comparison is unrounded, so `--fail-under 100` means every scored
+  row was right; where the rounded figure would contradict the verdict, the
+  summary prints both numbers to the precision that separates them. A report
+  that scores no column at all is refused before anything is sent, rather than
+  passing every deploy on no evidence, and `--dry-run` and `--postman-import`
+  are refused for the same reason; a run that declared a `TRUTH` and then
+  scored nothing exits `1` (a broken run), and a run that was stopped is not
+  given a gate verdict at all.
+  `5` is its own exit code because `1` is worth retrying and this never is. The
+  threshold is deliberately not written into the report file: it is the
+  caller's policy, not a fact about the run. With `--progress-json`,
+  `run_finished` carries a `gate` object (and `null` without a gate, so
+  "passed" and "never checked" stay distinguishable).
+
+- **JUnit XML output (`-o results.xml`).** One `<testcase>` per row, named by
+  the row's key so a case keeps its identity between runs: a failed request is
+  an `<error>`, a wrong answer a `<failure>` carrying both sides of the
+  comparison, and a dry run's cases are `<skipped>` — one status per case, an
+  error outranking a failure, with the demoted verdict kept in `<system-out>`.
+  The run's caveats (`DRY RUN`, `PARTIAL`, skips, warnings) go to
+  `<system-err>` *and* to a run-level case, since some CI systems read output
+  only from a case. Run errors that belong to no row become that same case, so a run that produced nothing
+  *because* something was wrong is never reported as a green suite of zero
+  tests. An ordinary `-o`, so `-o results.xml -o report.html` gives a pipeline
+  its verdict and a human the detail from the same single run.
+
+
+- **`--require-net-gain N`: a CI gate on whether the answers got *worse*.**
+  `--fail-under` is an absolute floor, and a suite that has climbed well above
+  it can break rows for months without ever reaching it — a run at 98% that
+  breaks three rows in a hundred still clears `--fail-under 95` comfortably,
+  and the only evidence is a number nobody is comparing with last week's. This
+  gates on the change instead: rows fixed minus rows regressed, counted exactly
+  as the `Trend` column counts them, over the rows scored on both sides of the
+  report's baseline. `--require-net-gain 0` is "do not go backwards", which
+  needs no maintenance as a suite improves; a positive number demands progress
+  and a negative one is a tolerance. It fails the run with exit `5`, the code
+  `--fail-under` already uses, and is refused before anything is sent when the
+  report has no `TRUTH` or no baseline to measure against.
+
+- **Prebuilt binaries and a container image.** Installing meant `cargo
+  install`, which meant a Rust toolchain and the whole build-prerequisite list
+  — on Windows, vcpkg, LLVM, Perl, NASM and a Visual Studio workload before a
+  single request could be sent. Tagging a release now publishes binaries for
+  Linux x86-64, macOS on Apple Silicon and Windows x86-64, with `SHA256SUMS`
+  beside them, and `ghcr.io/jhobern/paperboy` for CI images whose slim base has
+  no system libxml2. The desktop builds are one binary per platform rather than
+  a split: the same file runs `-c`, the terminal UI and `--gui`, because the
+  graphical front-end loads its display libraries only when `--gui` is passed
+  and so costs nothing to a user who never opens it. Linux builds against the
+  oldest supported runner, since glibc is backward but not forward compatible
+  and building on the newest would have excluded every distro older than it.
+
+- **Windows and macOS are now built and tested on every change.** CI ran
+  entirely on Linux, so "PaperBoy runs on Windows" was a claim nothing
+  enforced — the first person to test it did so by hand, one missing
+  dependency at a time. Both platforms now build and run the full suite in the
+  `gui` shape, which is the same binary that serves `-c`, the terminal UI and
+  `--gui`. It also puts the build prerequisites under test rather than under
+  documentation: the Windows job installs libxml2 from vcpkg with the
+  `-static-md` triplet Rust's MSVC target needs and adds the NASM that
+  OpenSSL's assembler requires, and the macOS job points `pkg-config` at
+  Homebrew's keg-only libxml2.
+
+- **`run_finished` carries the run's own figures.** A caller gating on quality
+  itself had to parse the report the run had just written — or re-derive the
+  numbers and risk disagreeing with the gate. The terminal `--progress-json`
+  event now carries `rows_ok`/`rows_failed` beside `rows`, a `scored` object
+  (`compared`, `correct`, `incorrect`, `accuracy`) and a `movement` object
+  (`fixed`, `regressed`, `still_wrong`, `unchanged`), with
+  `--require-net-gain`'s verdict alongside the counts it was drawn from. Both
+  objects are `null` rather than zeroed when there is nothing to report: a run
+  with no ground truth has not scored 0%, and one with no baseline has not held
+  steady. Like the gates, they describe the run rather than the table, so a
+  `# columns:` directive cannot change them.
+
+### Changed
+
+- **The missing-build-dependency message is a third shorter, and its commands
+  can be pasted.** The build-prerequisite check explained each missing piece in
+  a paragraph — how it was detected and which crate wanted it — which on
+  Windows, where four things are typically missing at once, made a wall of
+  prose nobody reads to the end. Worse, the install advice was one list mixing
+  runnable commands with manual steps ("add NASM's folder to PATH"), and the
+  commands carried trailing `#` comments that wrapped, so even the runnable
+  lines didn't survive a copy. The message now lists what's missing by name,
+  then a **Run:** block of nothing but commands, then a **Then:** block of the
+  things no command can do. The detection evidence moved to the end, kept for
+  arguing with a false negative rather than made the first thing read; the
+  per-crate rationale lives in the README and the script's own header, which is
+  where someone asking "why does it need this?" is going anyway.
+
+  Two of the Windows commands were also wrong for a user pasting them. `vcpkg
+  install …` cannot work in the shell that just bootstrapped vcpkg —
+  `bootstrap-vcpkg.bat` builds `vcpkg.exe` inside the tree and adds nothing to
+  `PATH` — so it is now called by its full path, taken from `VCPKG_ROOT` when a
+  tree already exists. And the `winget` line is now one package per line with
+  the agreement prompts pre-answered: a prompt part-way through a pasted block
+  consumes the *next line* as its answer, which loses a command and leaves no
+  sign that it happened.
+
+  Finally, a bootstrapped vcpkg tree is no longer reported as no vcpkg at all.
+  `setx` sets a variable for shells started *after* it, so following the advice
+  and building in the same window left `VCPKG_ROOT` unset and the message read
+  "no vcpkg installation found" — sending the user to reinstall something that
+  was already working. `C:\vcpkg` and `%USERPROFILE%\vcpkg` are now checked for
+  a bootstrapped `vcpkg.exe`, and if one is there the message says the variable
+  is missing from *this shell* and the advice offers `setx VCPKG_ROOT …` in
+  place of a second clone.
+
+- **A report whose request failed now exits `1`.** It exited `0`: the failure
+  existed only as text in the row's `.Error` cell, `run_finished` said `ok:
+  true` with an empty `errors` list, and the same collection run through
+  `paperboy -c` exited `1` — so whether a broken API failed your pipeline
+  depended on which of PaperBoy's two runners you had used. A post-deploy smoke
+  test could go green against a service that was refusing connections. A
+  request that was sent and came back failed is now an error of the run, as it
+  always was for a plain `REQUEST`; the row is still written with its error in
+  the cell, because a report exists to show every case rather than stop at the
+  first. **This changes the exit code of existing runs** — a pipeline that was
+  passing on a broken API will now fail, which is the point. A failing
+  `CLEANUP` is unaffected and remains a warning.
+
+
+- **A row that hasn't run yet no longer shows zeros as if they were results.**
+  While a report streams, the grid is a skeleton produced by a *dry* pass, so
+  the slots the run has not reached carried that pass's filler — `Time` 0,
+  `status` 0, empty captures. A `0` ms response that came back `0` reads like a
+  measurement, and the reader is invited to draw a conclusion from a number
+  nothing produced. Those cells now show a placeholder instead: `·` for a row
+  that is queued and `…` for the row in flight, matching the glyphs the status
+  column already uses for the same two states. A pending row's *parameters* are
+  real — which file, which image, which environment the slot is for — and are
+  still shown, so the table says what it is about to do and stays silent about
+  what it has not yet found out. Applies to both the terminal grid and the GUI
+  table, including a cell's drill-down.
+
+- **The `?` help overlay now matches the keys the app actually has.** The
+  shortcut list had drifted: the report grid's own navigation (`↑↓←→`, `Home` /
+  `End`, `^↑` / `^↓` to jump a page) was undocumented, as were `F` (reformat a
+  report), `^b` (body notes), `^f` and `Backspace` (filter and go up in a
+  workspace tree), `^Y` (copy the status line) and `b` / `p` — the last two
+  present on the Shortcuts tab but missing from the Reports tab, which is the
+  tab someone reading about reports is on. Closing a tab (`^W`) and reopening
+  one (`u`) were described as a single entry, though they are different keys in
+  different places. A test now holds the two lists to each other so a report
+  shortcut cannot be added to one and forgotten in the other.
+
+- **The results panel's hint line dropped `Enter drill-down`.** The hint is the
+  panel's border title, which truncates from the right, so the least guessable
+  shortcuts were the ones being cut. `Enter` to open the thing under the cursor
+  is the one binding a reader will try unprompted, and it is now documented in
+  the help overlay along with the rest of the grid.
+
+### Fixed
+
+- **A `--dry-run` report no longer writes itself up as a scored run.** It wrote
+  an unmarked file: every projected row scored against its ground truth, all of
+  them `Correct: incorrect` because the cells a response would have filled were
+  blank, a comparison `Result` claiming each row matched its baseline (two rows
+  that were never sent are identical the way two blank pages are), and a footer
+  asserting "Accuracy 0.0%" for a run that sent nothing. Nothing in the file
+  said it was a preview, so a reader — or a CI gate — meeting it had no way to
+  tell a catastrophic release from a run nobody had performed.
+
+  A dry run now marks itself and scores nothing. The result carries the fact,
+  and each format says it in its own idiom, exactly as a stopped run's
+  `PARTIAL` does: a `DRY RUN` banner above the HTML, `"dry_run": true` at the
+  top level of the JSON (and on `run_finished`, alongside the existing key on
+  `plan`), a final `DRY RUN,…` record in the CSV, a bold row under the XLSX
+  summary, and the PDF title. Ground-truth verdicts read `untested` rather than
+  `incorrect`, the comparison `Result` reads `not run (dry run)`, and there are
+  no metrics at all — a preview has no accuracy, not an accuracy of zero. The
+  same principle a run that is given up on already followed.
+
+
+
+- **A broken loop no longer blames the loop that follows it.** An error raised
+  in the scope around a loop is inherited by the rows the loop produces —
+  a request that failed before the loop is the reason every one of its rows is
+  wrong. But a finished loop's errors are merged into the block's flat list so
+  the run reports them exactly once, and that list was also what a *later*
+  sibling loop inherited: a broken request in the first loop wrote itself onto
+  every row of the second, which had run perfectly. Errors travel down into a
+  loop, never sideways from the loop before it.
+
+- **A request that reports its time twice no longer appears to have taken twice
+  as long in JUnit.** Nothing stops a flow naming the `Time` intrinsic more than
+  once for the same request — under its own name and under a `[Reports]` alias,
+  or under two aliases — and every one of those columns holds the same
+  milliseconds. The writer added them up. Totals are now collected per step, so
+  a request spends its duration once; two *different* requests in a row still
+  each spend their own.
+
+
+- **A request written `repeat` *and* `retry` could hide a failure entirely.**
+  Hurl reports every attempt at a request, and PaperBoy keeps only the one that
+  counts: a poll that answered "pending" twice and then succeeded is one
+  request that passed. The attempts to throw away were identified as "another
+  result for this entry follows, and the entry is retried" — which is also true
+  of the last attempt of a *repetition*, so with `repeat: 3, retry: 2` a
+  repetition that exhausted its retries was quietly replaced by the next
+  repetition's opening attempt. The failure vanished from the run, the report
+  and the exit code, under exactly the options someone chose in order to be
+  thorough. Attempts are now told apart by what the runner announces as it
+  makes them, so a retry is a retry and a repetition stands on its own. Where a
+  repetition did fail, the row is now built from *that* attempt rather than
+  from whichever one passed, so the cells no longer show a `200` beside an
+  error reporting a `500`.
+
+- **`--fail-under` no longer fails a run that scored exactly what it asked
+  for.** The comparison was made on the computed percentage, and `23 / 40` is
+  `57.49999999999999` in floating point — so `--fail-under 57.5` blocked a
+  release for hitting its target precisely, and said so in the only words it
+  had: "accuracy 57.500000% — UNDER the required 57.500000%". The threshold is
+  now held to the decimal it was written as, and the comparison is done in
+  whole numbers on both sides.
+
+- **A dry run of a broken report no longer produces a clean JUnit document.**
+  Resolving a request happens before one would be sent, so `--dry-run` really
+  can fail — and because every projected case is written as `<skipped>`, which
+  carries no error, the failure was attributed to a row that then said nothing
+  about it. `-o report.xml` reported `errors="0"` for a report that could not
+  run at all. A dry run's errors are now carried by the run's own case, and the
+  skipped case says which row they belong to.
+
+- **Two report rows with the same name can no longer hide each other in JUnit
+  output.** Colliding case names were already renamed `#1`, `#2` — but the name
+  that renaming invents is one a row can already have (a suite holding `same`,
+  `same` and `same #1` produced `same #1` twice), the run's own case was named
+  after the suite *after* the rows had been made unique, and names that differ
+  only by a tab or a control character are the same name to an XML parser.
+  Since CI systems key a case on its name and keep the first of a pair,
+  each of those hid a result. Names are now made unique as the consumer finally
+  reads them, the run's case is named alongside the rows, and where the rows
+  themselves say why there are two of them — two comparison clauses, two `ENVS`
+  targets — the case is named for that rather than counted off, so it keeps its
+  identity in a CI history.
+
+- **A request that never sent is now named by its alias in the errors list.**
+  A `REPORT REQUEST Ping AS ping` that failed before any attempt was made was
+  reported under the request's name rather than the alias, so a request invoked
+  twice under two aliases produced two identical error lines and left the
+  reader to guess which step each came from.
+
+- **A blank answer no longer adds an untitled row and column to the confusion
+  matrix.** A scored row whose answer cell came back empty was labelled with
+  the empty string, so the matrix grew an axis entry with no name — which reads
+  as a rendering fault rather than as a result. It is now named `(no answer)`,
+  parenthesised so it cannot be mistaken for a literal answer of the same
+  words. The naming happens where every reader of a label already looks, so the
+  matrix, the HTML/JSON/xlsx exports and the click-a-cell drill-down all agree
+  on what the bucket is called and clicking it still returns exactly the rows
+  it counted.
+
+- **A report written on Windows can be opened on Linux.** The collection and
+  output paths a report stores are deliberately relative, so that a report and
+  the collection it binds to stay a working pair when the workspace is handed
+  to someone else or committed. They were written with the host's own
+  separator, so a report saved on Windows said `apis\\billing.hurl` — which on
+  Linux is not a path into `apis/` but a single filename with a backslash in
+  it, and names nothing. The walk-up form (`../apis/…`) already forced forward
+  slashes for exactly this reason; now every relative path a report stores
+  does. Absolute paths are left in the host's spelling, since they name a
+  location on one machine and are shown to the user as such.
+
+- **A file whose path arrives with a trailing `/` can be saved on Windows.**
+  `collection.hurl/` and `collection.hurl` name the same file to a reader and
+  two different things to the kernel, so a trailing separator is stripped
+  wherever a path enters the app. That strip looked for the platform's
+  *preferred* separator — a backslash on Windows — and so missed a trailing
+  forward slash on the one platform that accepts both, leaving a perfectly
+  ordinary collection unable to save, re-read or revert, with an error about a
+  directory that is not one. Unix is unchanged, where a backslash is an
+  ordinary character in a filename and must stay one.
+
+- **Windows builds get past `hurl`'s unreachable icon, and `paperboy.exe` now
+  has an icon of its own.** `hurl` 8.0.1's build script embeds a Windows icon
+  from `../../bin/windows/logo.ico` — a path that resolves only inside hurl's
+  own git checkout, and the published crate ships nothing outside its own
+  directory. It is not conditional, so every Windows build of anything
+  depending on it ends at `RC2135: file not found` and a panicked build script;
+  `cargo install paperboy` on Windows could not have worked, which nothing had
+  noticed because nothing had ever compiled PaperBoy on Windows. Upstream has
+  fixed it (hurl#5207) but not released it. The release and CI builds supply
+  the file the build script is reaching for, and supply **PaperBoy's** icon
+  rather than fetching hurl's, since the resource is linked into the finished
+  executable and would otherwise put the Hurl logo on `paperboy.exe`. Building
+  from source needs the same one-line workaround until hurl 8.1.0, and the
+  README gives it; the prebuilt binary is unaffected.
+
 ## [0.6.5] - 2026-09-23
 
 ### Fixed

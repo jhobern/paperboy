@@ -1,0 +1,338 @@
+name: Release
+
+# Publishing is driven by a tag, because the tag is the only thing that makes a
+# release reproducible: the binaries, the notes and the image all come from one
+# commit, and re-running the workflow cannot quietly produce something else.
+#
+# `workflow_dispatch` builds everything and publishes nothing. The expensive
+# part of a release is the four platform builds, and finding out they are broken
+# should not require burning a version number to do it.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # A tag is the one input to a release that nobody reviews, and the failure it
+  # causes is expensive: `v0.7.1` on a tree that still says `0.7.0` publishes
+  # binaries reporting the wrong version, and a tag cannot be moved once anyone
+  # has fetched it. This is the cheap check that makes that impossible.
+  verify:
+    name: verify version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          crate="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          echo "Cargo.toml version: $crate"
+          echo "version=$crate" >> "$GITHUB_OUTPUT"
+
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$crate" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${crate}"
+              exit 1
+            fi
+          fi
+
+          # An unreleased version with no changelog section means the notes
+          # below would be empty, which is worth failing over before four
+          # platform builds rather than after them.
+          if ! grep -q "^## \[${crate}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${crate}]' section"
+            exit 1
+          fi
+
+  # The four artifacts, and why these four:
+  #
+  #   linux-x86_64           the full binary -- headless, terminal UI and GUI
+  #   linux-x86_64-headless  the same core with no front-end, for CI images
+  #   windows-x86_64         full binary; the audience least likely to compile
+  #   macos-arm64            full binary, Apple Silicon
+  #
+  # The `gui` builds are strict supersets: one binary serves `-c`, the terminal
+  # UI and `--gui`, so a user who wants the GUI and a user who wants the CLI
+  # download the same file. The GUI does not force a display dependency on the
+  # others either -- winit `dlopen`s X11/Wayland, so the binary still starts on
+  # a machine that has neither and only needs them for `--gui` itself.
+  #
+  # Linux builds on the *oldest* runner available rather than `ubuntu-latest`.
+  # glibc is backward but not forward compatible, so a binary built against
+  # 24.04's glibc 2.39 refuses to start on anything older, while 22.04's 2.35
+  # covers Ubuntu 22.04+, Debian 12+ and Fedora 36+. It does *not* reach RHEL 9,
+  # which is on 2.34. Slim containers are out of reach for a different reason --
+  # they carry no libxml2 -- and that is what the image is for.
+  build:
+    needs: verify
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            features: --features gui
+          - name: linux-x86_64-headless
+            os: ubuntu-22.04
+            features: --no-default-features
+          - name: windows-x86_64
+            os: windows-latest
+            features: --features gui
+          - name: macos-arm64
+            os: macos-latest
+            features: --features gui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+
+      # Named explicitly rather than relied on from the runner image: a release
+      # build should not change because a base image dropped a package.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxml2-dev libclang-dev perl make
+      # Only the GUI shape needs the display headers; the headless artifact is
+      # built on the same runner and must not acquire them by accident.
+      - name: Install Linux GUI build dependencies
+        if: runner.os == 'Linux' && contains(matrix.features, 'gui')
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      # See the `platform` job in ci.yml: vcpkg is how `libxml` finds libxml2 on
+      # MSVC, `VCPKG_ROOT` is how vcpkg-rs finds vcpkg, and NASM is the one
+      # prerequisite the Windows image does not ship.
+      - name: Install libxml2 and NASM (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg" install libxml2:x64-windows-static-md
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          choco install nasm -y --no-progress
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+      # hurl 8.0.1's build script embeds a Windows icon from
+      # `../../bin/windows/logo.ico`, a path relative to hurl's own git
+      # checkout. The crates.io package ships nothing outside its own
+      # directory, so on Windows `rc.exe` fails with RC2135 and the build
+      # script panics -- hurl as a library simply cannot be built on Windows
+      # from crates.io. Upstream fixed it by guarding the path
+      # (Orange-OpenSource/hurl#5207, merged 2026-09-14) but has not released
+      # it; 8.0.1 is still the newest crate.
+      #
+      # rc.exe resolves that relative path from the build script's working
+      # directory, which Cargo sets to the package root -- so `../../` lands in
+      # `registry/src`, and putting a file there is enough to satisfy it. We
+      # supply *our own* icon rather than fetching hurl's: the resource is
+      # linked into the final executable, so hurl's logo would otherwise become
+      # paperboy.exe's icon. Remove this once hurl 8.1.0 is out.
+      - name: Work around hurl's unreachable Windows icon (hurl#5207)
+        if: runner.os == 'Windows'
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+          $dir = Join-Path $cargoHome "registry\src\bin\windows"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item "assets\windows\paperboy.ico" (Join-Path $dir "logo.ico") -Force
+
+      # Homebrew's libxml2 is keg-only (`provided_by_macos`), and a normal link
+      # against it bakes an `/opt/homebrew/...` path into the binary -- which
+      # exists on this runner and on no user's Mac. `LIBXML2_STATIC` makes
+      # pkg-config emit `static=xml2` instead, so the port is linked in and the
+      # archive carries no libxml2 dependency at all. pkg-config only permits
+      # that for a non-system prefix, which is exactly what Homebrew's is.
+      - name: Install libxml2 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libxml2
+          echo "PKG_CONFIG_PATH=$(brew --prefix libxml2)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LIBXML2_STATIC=1" >> "$GITHUB_ENV"
+
+      # `--locked` for the same reason the README recommends it to users: a
+      # release must be the dependency set that was tested, not whatever
+      # resolved newest on the morning it was cut.
+      - name: Build
+        run: cargo build --release --locked ${{ matrix.features }}
+
+      # The static link above is the difference between an artifact that runs on
+      # any Mac and one that runs only on a machine with the same Homebrew
+      # prefix -- and nothing about a successful build says which happened. A
+      # dry run must fail here rather than a user discovering it.
+      - name: Check the macOS binary is self-contained
+        if: runner.os == 'macOS'
+        run: |
+          otool -L target/release/paperboy
+          if otool -L target/release/paperboy | grep -E '/opt/homebrew|/Cellar/'; then
+            echo "::error::binary links a Homebrew dylib and will not run on a clean Mac"
+            exit 1
+          fi
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="paperboy-${{ needs.verify.outputs.version }}-${{ matrix.name }}"
+          mkdir "$dir"
+          cp target/release/paperboy "$dir/"
+          cp README.md CHANGELOG.md LICENSE "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+          ls -l "$dir.tar.gz"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        run: |
+          $dir = "paperboy-${{ needs.verify.outputs.version }}-${{ matrix.name }}"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item target\release\paperboy.exe $dir\
+          Copy-Item README.md, CHANGELOG.md, LICENSE $dir\
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          Get-Item "$dir.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            paperboy-*.tar.gz
+            paperboy-*.zip
+          if-no-files-found: error
+
+  # Only a tag publishes. A `workflow_dispatch` run stops after `build`, which
+  # is the point of being able to trigger one.
+  # Ordered after `docker` deliberately. The release notes document
+  # `ghcr.io/jhobern/paperboy`, so publishing them while the image push has
+  # failed advertises something that isn't there -- and a release, unlike a job,
+  # cannot be quietly re-run. Failing before the announcement is recoverable;
+  # failing after it is not.
+  release:
+    needs: [verify, build, docker]
+    if: github.ref_type == 'tag'
+    name: publish release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Checksums are what lets someone verify a download they did not build,
+      # which is the whole reason to publish binaries rather than say "cargo
+      # install". Generated next to the files so the paths in it are the names
+      # the release actually serves.
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      # The release notes are the changelog section for this version, rather
+      # than a hand-written summary that can disagree with it.
+      - name: Release notes
+        run: |
+          awk -v v="${{ needs.verify.outputs.version }}" '
+            $0 ~ "^## \\[" v "\\]" { found = 1; next }
+            found && /^## \[/       { exit }
+            found                   { print }
+          ' CHANGELOG.md > notes.md
+          echo "--- notes.md ---"
+          cat notes.md
+
+      # A SemVer prerelease (`0.8.0-beta.1`) must not be offered as the current
+      # version: GitHub's "Latest release" badge, and every tool that reads it,
+      # follows this flag rather than the tag's name.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.verify.outputs.version }}"
+          case "$version" in
+            *-*) prerelease=--prerelease ;;
+            *)   prerelease= ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" \
+            --title "PaperBoy $version" \
+            --notes-file notes.md \
+            --verify-tag \
+            ${prerelease} \
+            dist/*
+
+  # The container is the answer for the audience the glibc binaries do not
+  # reach: slim images and Alpine-based CI, where there is no system libxml2.
+  # A static musl binary would also solve it, but `bindgen` cannot `dlopen`
+  # libclang on a musl host and `libxml`'s `static` feature cannot be enabled
+  # from here (hurl pulls it in with `runtime`, and Cargo feature unification
+  # only ever adds features) -- so it would take a patched hurl, and the
+  # resulting binary still could not run the GUI.
+  # Unlike the jobs above this one runs for a `workflow_dispatch` too -- it
+  # builds either way and only pushes for a tag. A dry run that skipped it
+  # would leave the Dockerfile as the one part of a release never exercised
+  # before the release itself.
+  docker:
+    needs: [verify, build]
+    name: publish image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          version="${{ needs.verify.outputs.version }}"
+          docker build -t "$image:$version" .
+
+      # Worth the half-second: an image that builds but cannot run its own
+      # entrypoint is a failure mode the build alone does not catch, and the
+      # release job publishes notes that tell people to run exactly this.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker run --rm "$image:${{ needs.verify.outputs.version }}" --version
+
+      - name: Log in to ghcr.io
+        if: github.ref_type == 'tag'
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          version="${{ needs.verify.outputs.version }}"
+          docker push "$image:$version"
+          # `latest` is what an unqualified `docker run` resolves to, so a
+          # prerelease must not take it.
+          case "$version" in
+            *-*) echo "prerelease $version: leaving :latest alone" ;;
+            *)
+              docker tag "$image:$version" "$image:latest"
+              docker push "$image:latest"
+              ;;
+          esac

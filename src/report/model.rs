@@ -92,6 +92,19 @@ pub struct ReportRow {
     /// snapshot, which is matched leniently so a saved baseline still stands in
     /// for a live run.
     pub comparison: Option<String>,
+    /// The run errors this row is responsible for: the ones raised while it was
+    /// being produced, plus the ones its enclosing scopes raised before the
+    /// loop forked it (a `REPORT REQUEST` written above a loop fails every row
+    /// the loop goes on to produce).
+    ///
+    /// Carried on the row rather than left to be matched back out of
+    /// [`ReportResult::errors`], which is flat: a consumer that has to ask
+    /// "which row does this sentence belong to" can only compare the formatted
+    /// text, and the row's `…Error` cell and the run's error list are worded
+    /// differently — and a `HIDE(Error)` or a declared field removes the cell
+    /// altogether. The same list is what the streaming `RowEvent::Completed`
+    /// carries, so the live event and the finished file agree by construction.
+    pub errors: Vec<String>,
 }
 
 /// How much of a planned run a stopped run actually covered (see
@@ -117,6 +130,20 @@ pub struct Partial {
 #[derive(Debug, Clone, Default)]
 pub struct ReportResult {
     pub rows: Vec<ReportRow>,
+    /// Set when this result came out of a **dry run** — an expansion of the
+    /// flow against an offline runner, where not one request was sent.
+    ///
+    /// Part of the artefact for exactly the reason [`Self::partial`] is, only
+    /// more so: a dry run's rows are *planned*, not observed, and a file full
+    /// of them that looks like a run is the worst kind of report — every cell
+    /// a response would have filled is blank, so anything scored against those
+    /// blanks comes out wrong, and a reader (or a CI gate) meeting "Accuracy
+    /// 0.0%" has no way to tell a catastrophic release from a preview of one
+    /// nobody has run yet. So the flag both marks the file and suppresses the
+    /// scoring: the comparison verdict reads [`super::compare::NOT_RUN`],
+    /// every ground-truth verdict is [`Verdict::Untested`], and there are no
+    /// metrics — because nothing was measured.
+    pub dry_run: bool,
     /// Set when the run was stopped before it had produced every row it
     /// planned to — how many of the planned rows this report actually covers.
     ///
@@ -212,6 +239,13 @@ pub struct ReportResult {
     /// it holds. Left uncaught, a renamed time made every row of a comparison
     /// report read as changed, because a time never repeats.
     pub timing_columns: std::collections::HashSet<String>,
+    /// The subset of [`Self::timing_columns`] holding a request's *whole*
+    /// elapsed time, under whatever name a `[Reports]`/`WITH` field aliased it
+    /// to. Setup/wait/download are timings too, but they are slices of that
+    /// same total: a reader asking "how long did this row take" — the JUnit
+    /// writer does — must add up the totals alone or count the same
+    /// milliseconds several times.
+    pub duration_columns: std::collections::HashSet<String>,
     /// Resolved picture bytes for `IMAGE` columns, keyed by `(row index within
     /// [`rows`](Self::rows), output-column header)`.
     ///
@@ -460,6 +494,30 @@ impl ReportResult {
                 .filter(|((row, _), _)| *row == r)
                 .map(|(_, t)| *t),
         )
+    }
+
+    /// The render-ready text for one grid cell, standing a placeholder in for a
+    /// row the run hasn't produced yet.
+    ///
+    /// Front-ends draw the skeleton grid while a run streams, so most of what
+    /// the reader sees at first is dry-pass filler. Routing every grid cell
+    /// through here keeps "this hasn't happened" from looking like "this
+    /// happened and the answer was 0". `running` marks the row the run is
+    /// working on right now, which gets the livelier of the two markers; both
+    /// are one column wide, so a row's width doesn't shift as it lands.
+    pub fn display_cell(&self, row: usize, col: &OutputColumn, running: bool) -> String {
+        let Some(r) = self.rows.get(row) else {
+            return String::new();
+        };
+        if self.pending.contains(&row) {
+            let marker = if running {
+                RUNNING_CELL_MARKER
+            } else {
+                PENDING_CELL_MARKER
+            };
+            return col.pending_value(r, marker);
+        }
+        col.value(r, &self.no_match_marker)
     }
 
     pub fn summary_rows(&self, columns: &[OutputColumn]) -> Vec<SummaryRow> {
@@ -843,7 +901,44 @@ impl OutputColumn {
         }
         no_match.to_string()
     }
+
+    /// The cell value for this column in a row whose request **hasn't run yet**.
+    ///
+    /// A skeleton row's produced `cells` come from the dry pass, so they are
+    /// fabrications (`Time` 0, `status` 0, captures empty) rather than
+    /// measurements: shown as-is they read like results — a `0` ms response that
+    /// returned `0` — which is worse than admitting nothing is known. Only the
+    /// parameter-derived sources are real at this point (the row's variable
+    /// snapshot and `TARGET`: which file, which image, which environment this
+    /// slot is *for*), so those still resolve and everything else becomes
+    /// `placeholder`.
+    pub fn pending_value(&self, row: &ReportRow, placeholder: &str) -> String {
+        for src in &self.sources {
+            if let Some(v) = row.vars.get(src)
+                && !v.is_empty()
+            {
+                return v.clone();
+            }
+            if src == TARGET_COLUMN
+                && let Some(t) = &row.target
+                && !t.is_empty()
+            {
+                return t.clone();
+            }
+        }
+        placeholder.to_string()
+    }
 }
+
+/// Stand-in for a cell of a row that is queued but not yet started.
+///
+/// The same glyph the grids use for a scheduled row's status icon, so one
+/// vocabulary covers both: the dot says "nothing has happened here".
+pub const PENDING_CELL_MARKER: &str = "\u{00B7}"; // ·
+/// Stand-in for a cell of the row that is being run right now — the ellipsis the
+/// grids already use for a running row's status icon, reading as "on its way"
+/// rather than "never came".
+pub const RUNNING_CELL_MARKER: &str = "\u{2026}"; // …
 
 /// Parse the `columns:` directive value into ordered [`OutputColumn`]s.
 ///
@@ -1374,6 +1469,7 @@ mod tests {
 
     fn row(cells: &[(&str, &str)], vars: &[(&str, &str)], target: Option<&str>) -> ReportRow {
         ReportRow {
+            errors: Vec::new(),
             role: RowRole::default(),
             cells: cells
                 .iter()
@@ -1701,6 +1797,37 @@ mod tests {
         // baseline's.
         let own = cols.iter().find(|c| c.header == "proc.Time").unwrap();
         assert!(own.stats.is_empty());
+    }
+
+    /// A row the run hasn't reached yet must not present the dry pass's filler
+    /// as a measurement: a `0` ms response with status `0` reads like a result.
+    /// Its parameters (which file, which environment) are real and stay.
+    #[test]
+    fn a_pending_rows_produced_cells_are_placeholders_but_its_parameters_are_not() {
+        let mut res = ReportResult::default();
+        res.rows = vec![
+            row(&[("proc.Time", "120")], &[("FILE", "a.jpg")], Some("stg")),
+            row(&[("proc.Time", "0")], &[("FILE", "b.jpg")], Some("stg")),
+        ];
+        res.pending = [1].into_iter().collect();
+        let cols = parse_columns("FILE, TARGET, proc.Time");
+        let cell = |r: usize, c: usize, running: bool| res.display_cell(r, &cols[c], running);
+        // The finished row is untouched.
+        assert_eq!(cell(0, 2, false), "120");
+        // The pending row keeps what was decided before the run started…
+        assert_eq!(cell(1, 0, false), "b.jpg");
+        assert_eq!(cell(1, 1, false), "stg");
+        // …and admits it has no result yet, livelier while it is in flight.
+        assert_eq!(cell(1, 2, false), PENDING_CELL_MARKER);
+        assert_eq!(cell(1, 2, true), RUNNING_CELL_MARKER);
+    }
+
+    /// Both markers are one column wide, so a grid measured off the scheduled
+    /// marker lines up with one drawn using either.
+    #[test]
+    fn both_pending_markers_are_one_column_wide() {
+        assert_eq!(PENDING_CELL_MARKER.chars().count(), 1);
+        assert_eq!(RUNNING_CELL_MARKER.chars().count(), 1);
     }
 
     #[test]

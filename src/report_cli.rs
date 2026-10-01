@@ -20,6 +20,7 @@ use std::sync::Mutex;
 use crate::environment::{looks_like_env, parse_vars};
 use crate::postman::{looks_like_postman, parse_collection};
 use crate::report::flow::Header;
+use crate::report::metrics::{Metrics, Movement, PERCENT_DECIMALS, percent_text};
 use crate::report::model::{OutputColumn, Partial, ReportRow};
 use crate::report::params::{ParamValues, undeclared};
 use crate::report::producers::resolve_path;
@@ -81,6 +82,7 @@ pub fn run(
     targets: Vec<String>,
     shuffle: Option<Option<u64>>,
     params: ParamValues,
+    gates: Gates,
     progress_json: bool,
     grace_secs: Option<u64>,
     stop_on_stdin: bool,
@@ -96,6 +98,7 @@ pub fn run(
         targets,
         shuffle,
         params,
+        gates,
         Progress::new(progress_json),
         control,
     )
@@ -118,6 +121,7 @@ fn run_with_progress(
     targets: Vec<String>,
     shuffle: Option<Option<u64>>,
     params: ParamValues,
+    gates: Gates,
     progress: Progress,
     control: Control,
 ) -> i32 {
@@ -539,6 +543,50 @@ fn run_with_progress(
     // rows that actually finished poured into it.
     let shape = projection;
 
+    // A gate with nothing to measure is refused before anything is sent: a
+    // `--fail-under` on a report that declares no `TRUTH` can only ever be a
+    // mistake, and the two ways of finding that out later are both bad — a
+    // twenty-minute run thrown away, or a gate that passes every deploy while
+    // measuring nothing at all.
+    let has_truth = shape
+        .as_ref()
+        .map(|p| p.resolved_columns(&flow.header))
+        .unwrap_or_default()
+        .iter()
+        .any(|c| c.truth.is_some());
+    if gates.fail_under.is_some() && !has_truth {
+        return progress.setup_failed(vec![
+            "--fail-under has nothing to measure: no column in this report is scored \
+             against a TRUTH (a `# columns:` directive can also leave the scored column out)"
+                .to_string(),
+        ]);
+    }
+    // The movement gate needs both halves of the comparison it is named after:
+    // something to be right or wrong about, and something to have been right or
+    // wrong about last time. Refused up front for the same reason as the
+    // accuracy gate — the two ways of finding out later are a long run thrown
+    // away, or a gate that waves every deploy through while measuring nothing.
+    if gates.net_gain.is_some() {
+        if !has_truth {
+            return progress.setup_failed(vec![
+                "--require-net-gain has nothing to measure: no column in this report is \
+                 scored against a TRUTH (a `# columns:` directive can also leave the \
+                 scored column out)"
+                    .to_string(),
+            ]);
+        }
+        if crate::report::compare::comparison_roles(&flow).is_none()
+            && flow.header.baseline().is_none()
+        {
+            return progress.setup_failed(vec![
+                "--require-net-gain has nothing to compare against: this report declares \
+                 no baseline (an `ENVS BASELINE(…)/COMPARISON(…)` clause, or a \
+                 `# baseline:` snapshot)"
+                    .to_string(),
+            ]);
+        }
+    }
+
     let done = std::sync::atomic::AtomicUsize::new(0);
     // What a stopped run has to show for itself. The rows are copied out as
     // they land because a run that is given up on never hands its own result
@@ -691,6 +739,7 @@ fn run_with_progress(
                         &mut decor,
                         &progress,
                         &setup_warnings,
+                        gates,
                     );
                     (control.abandon)(code);
                     return Ending::Delivered(code);
@@ -737,6 +786,7 @@ fn run_with_progress(
         &mut decor,
         &progress,
         &setup_warnings,
+        gates,
     )
 }
 
@@ -757,6 +807,7 @@ fn deliver(
     decor: &mut Decor,
     progress: &Progress,
     setup_warnings: &[String],
+    gates: Gates,
 ) -> i32 {
     let progress_json = progress.on();
     // --- warnings, skips, errors -----------------------------------------
@@ -781,11 +832,35 @@ fn deliver(
     }
     // Said in the summary as well as in the file, because the person who
     // pressed the button is looking at this and not at the report yet.
+    if result.dry_run {
+        decor.line("  Dry run    : no requests were sent — rows are projected, nothing was scored");
+    }
     if let Some(partial) = &result.partial {
         decor.line(&format!(
             "  Stopped    : PARTIAL — {} of {} rows ran",
             partial.rows_completed, partial.rows_planned
         ));
+    }
+
+    // --- gate -------------------------------------------------------------
+    // Evaluated before the files are written so the verdict is on the terminal
+    // next to the numbers it was drawn from, and written into no output: the
+    // threshold is this caller's policy, not a fact about the run, and a report
+    // that recorded it would read as though the run had been scored against it
+    // for everyone who opens the file later.
+    let gate = gates.fail_under.map(|required| match result.partial {
+        Some(_) => Gate::not_measured(required),
+        None => Gate::measure(result, required),
+    });
+    if let Some(g) = &gate {
+        decor.line(&format!("  Gate       : {}", g.note));
+    }
+    let net_gain = gates.net_gain.map(|required| match result.partial {
+        Some(_) => NetGain::not_measured(required),
+        None => NetGain::measure(result, required),
+    });
+    if let Some(n) = &net_gain {
+        decor.line(&format!("  Movement   : {}", n.note));
     }
 
     // --- output ----------------------------------------------------------
@@ -847,12 +922,360 @@ fn deliver(
         match (result.skipped.is_empty(), result.errors.is_empty()) {
             (false, _) => EXIT_SKIPPED,
             (true, false) => 1,
-            (true, true) => 0,
+            // The gate is the last word, and only ever on a run that would
+            // otherwise have exited 0: a run that already failed has a better
+            // answer to give than "and the accuracy was low too", and the
+            // accuracy of a run that broke half way through is not the figure
+            // the caller meant to gate on anyway.
+            // A gate that could not be measured at all is a broken run, not a
+            // quality miss: `--fail-under` was asked for and the report came
+            // back with nothing scored, which no retry of a *better* API would
+            // fix and which exit 5 ("the answers were wrong") would misdescribe.
+            // Both gates answer the same question — "is this run good enough
+            // to ship" — so they share an exit code, and either one of them
+            // failing is enough. Unmeasurable beats failed for the same reason
+            // in both: a gate that was asked for and could not be evaluated is
+            // a broken run, which no retry of a *better* API would fix.
+            (true, true) => match (&gate, &net_gain) {
+                (Some(g), _) if g.actual.is_none() => 1,
+                (_, Some(n)) if n.net.is_none() => 1,
+                (Some(g), _) if !g.passed => EXIT_GATE_FAILED,
+                (_, Some(n)) if !n.passed => EXIT_GATE_FAILED,
+                _ => 0,
+            },
         }
     };
-    progress.run_finished(result, exit, setup_warnings);
+    progress.run_finished(
+        result,
+        exit,
+        setup_warnings,
+        gate.as_ref(),
+        net_gain.as_ref(),
+    );
     exit
 }
+
+/// What the caller asked this run to be held to.
+///
+/// One value rather than a parameter each, because they travel together
+/// through three layers to reach [`deliver`] and a second `Option` beside the
+/// first in a positional call is a mistake waiting to be made -- the two are
+/// both "a threshold, or none".
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Gates {
+    /// `--fail-under`: the accuracy, as a percentage, the run must reach.
+    pub fail_under: Option<f64>,
+    /// `--require-net-gain`: how many more rows the run must fix than it
+    /// breaks, against its baseline. Zero is "no net regression"; a negative
+    /// value is a tolerance, allowing that many net regressions through.
+    pub net_gain: Option<i64>,
+}
+
+/// A `--fail-under` quality gate: the accuracy the caller demanded, the
+/// accuracy the run achieved, and the verdict.
+///
+/// Measured on the whole run's `Correct` roll-up — the per-row verdict, over
+/// the rows that had a ground truth to compare against. Rows with no truth are
+/// not counted as failures: a report that scores half its rows is answering a
+/// different question from one that scores all of them, and treating "not
+/// asked" as "got it wrong" would make the threshold mean something different
+/// for every report.
+#[derive(Debug, Clone, PartialEq)]
+struct Gate {
+    /// The threshold, as a percentage.
+    required: f64,
+    /// What the run scored, as a percentage, or `None` when nothing was scored.
+    actual: Option<f64>,
+    /// How many rows the figure is drawn from.
+    compared: usize,
+    passed: bool,
+    /// The one-line explanation, shared by the summary and the event stream so
+    /// the two can never disagree about why a deploy was blocked.
+    note: String,
+}
+
+impl Gate {
+    fn measure(result: &ReportResult, required: f64) -> Gate {
+        match Metrics::gate_rollup(result) {
+            Some(m) if m.compared > 0 => {
+                // Compared *unrounded*. Rounding first meant `--fail-under 100`
+                // passed a run that got a row wrong — 1999 of 2000 is 99.95%,
+                // which displays as "100.0%" — and a gate that can be told
+                // "nothing may fail" and then wave a failure through is worse
+                // than no gate at all.
+                //
+                // The number shown is still the rounded one, except where that
+                // would contradict the verdict: see [`Gate::phrase`].
+                let actual = m.accuracy().unwrap_or(0.0) * 100.0;
+                let passed = meets(m.correct, m.compared, required);
+                let (shown, demanded) = Gate::phrase(actual, required, passed);
+                Gate {
+                    required,
+                    actual: Some(actual),
+                    compared: m.compared,
+                    passed,
+                    note: format!(
+                        "accuracy {shown}% over {} scored row{} — {} the required {demanded}%",
+                        m.compared,
+                        if m.compared == 1 { "" } else { "s" },
+                        if passed { "at or above" } else { "UNDER" }
+                    ),
+                }
+            }
+            // The report declares a `TRUTH` (checked before the run) but no row
+            // arrived at one: every truth was blank, or unresolved, or the rows
+            // that would have carried them never ran. There is no accuracy to
+            // compare, and passing a gate on no evidence is the outcome the
+            // gate exists to prevent — so this is reported as a broken run
+            // (exit 1) rather than as a quality miss; see [`deliver`].
+            _ => Gate {
+                required,
+                actual: None,
+                compared: 0,
+                passed: false,
+                note: format!(
+                    "no row was scored, so there is no accuracy to hold to the required {}%",
+                    percent_text_bare(required)
+                ),
+            },
+        }
+    }
+
+    /// The gate on a run that was stopped: measured on nothing, because the
+    /// figure would be drawn from whichever rows happened to finish.
+    ///
+    /// A stopped run exits [`EXIT_INTERRUPTED`] whatever the gate says, so this
+    /// changes no exit code; it exists so the summary and the `run_finished`
+    /// event cannot report a *verdict* on a half-run — "passed: true" over the
+    /// third of the suite that ran is exactly the false green a gate is bought
+    /// to prevent. (The two stop paths disagree about the evidence, too: an
+    /// abandoned run clears its verdicts, a graceful one keeps them.)
+    fn not_measured(required: f64) -> Gate {
+        Gate {
+            required,
+            actual: None,
+            compared: 0,
+            passed: false,
+            note: format!(
+                "the run was stopped before it finished, so its accuracy was not held to the required {}%",
+                percent_text_bare(required)
+            ),
+        }
+    }
+
+    /// How to print the two figures so the sentence cannot contradict itself.
+    ///
+    /// At one decimal place a 94.96% prints as "95.0%", and "accuracy 95.0% —
+    /// UNDER the required 95.0%" is an unanswerable bug report. So the shown
+    /// precision is the *smallest* one at which the two numbers, as printed,
+    /// still order the way the verdict says they do.
+    fn phrase(actual: f64, required: f64, passed: bool) -> (String, String) {
+        for places in PERCENT_DECIMALS..=6 {
+            let (a, r) = (format!("{actual:.places$}"), format!("{required:.places$}"));
+            let agrees = match (a.parse::<f64>(), r.parse::<f64>()) {
+                (Ok(a), Ok(r)) => (a >= r) == passed,
+                _ => false,
+            };
+            if agrees {
+                return (a, r);
+            }
+        }
+        // Unreachable for any real report (it would take ~10^7 scored rows for
+        // a single wrong answer to vanish at six places), but a gate that
+        // panicked on the arithmetic would be worse than one that over-prints.
+        (format!("{actual:.6}"), format!("{required:.6}"))
+    }
+}
+
+/// Did `correct` out of `compared` meet the threshold?
+///
+/// Decided in integers, because neither side of the question is a float. The
+/// run's score is a ratio of two counts, and the threshold is a decimal
+/// somebody typed — but `(23 / 40) * 100.0` is `57.49999999999999`, so a run
+/// that got exactly the 57.5% it was asked for failed the gate, and
+/// [`Gate::phrase`] then printed the only sentence it could: "57.500000% —
+/// UNDER the required 57.500000%". Blocking a release over the last bit of a
+/// `f64` is the one failure mode a gate cannot have.
+///
+/// So the threshold is put back into the decimal it was written as — `57.5`
+/// becomes 575 hundredths of a percent — and the comparison is a
+/// cross-multiplication of exact integers:
+///
+/// ```text
+/// correct / compared >= significand / (100 * 10^scale)
+/// ```
+///
+/// This also subsumes the whole-row special case that used to guard
+/// `--fail-under 100`: with a significand of 100 and no decimals it reduces to
+/// `correct >= compared`, which is "every scored row was right" said exactly.
+///
+/// The `f64` is kept for *display* only, where being out by 10^-14 cannot
+/// mislead anyone.
+fn meets(correct: usize, compared: usize, required: f64) -> bool {
+    let exact = decimal(required)
+        .and_then(|(sig, scale)| Some((sig, 10u128.checked_pow(scale)?)))
+        .and_then(|(sig, pow)| {
+            let lhs = (correct as u128).checked_mul(100)?.checked_mul(pow)?;
+            let rhs = sig.checked_mul(compared as u128)?;
+            Some(lhs >= rhs)
+        });
+    // A threshold no decimal can describe (an infinity, a NaN) never reaches
+    // here — `percentage` rejects those on the command line — and the integers
+    // cannot overflow `u128` for any run that fits in memory. The float
+    // comparison is kept as the answer of last resort rather than a panic:
+    // whatever else is wrong, the gate still returns a verdict.
+    exact.unwrap_or_else(|| {
+        let actual = if compared == 0 {
+            0.0
+        } else {
+            correct as f64 / compared as f64 * 100.0
+        };
+        actual >= required
+    })
+}
+
+/// A threshold as the decimal it was written as: an integer significand and
+/// the number of decimal places, so `57.5` is `(575, 1)`.
+///
+/// Recovered from the `f64` rather than carried alongside it from the command
+/// line. Rust prints a float as the *shortest* decimal that round-trips to the
+/// same value, which — for anything a person types as a percentage — is the
+/// decimal they typed: `57.5` prints as `57.5`, never as
+/// `57.499999999999996`. Display never uses exponent notation, and a threshold
+/// is range-checked to 0–100 at the point of parsing, so the text here is
+/// always plain digits with at most one point.
+fn decimal(percent: f64) -> Option<(u128, u32)> {
+    let text = format!("{percent}");
+    let (whole, frac) = text.split_once('.').unwrap_or((text.as_str(), ""));
+    Some((format!("{whole}{frac}").parse().ok()?, frac.len() as u32))
+}
+
+/// A `--require-net-gain` gate: whether the run improved on its baseline by as
+/// much as the caller demanded.
+///
+/// The question `--fail-under` cannot answer. An accuracy threshold is an
+/// absolute floor, and a suite that has climbed well above it can break rows
+/// for months without ever reaching it -- a run at 98% that breaks three of a
+/// hundred rows still clears `--fail-under 95` comfortably, and the only
+/// evidence that anything went wrong is a number nobody is comparing against
+/// last week's. This gate is on the *change*: rows fixed minus rows regressed,
+/// counted exactly as the `Trend` column counts them, over the rows that were
+/// scored on both sides.
+///
+/// It also needs no maintenance, which is the other half of why it catches
+/// things a floor does not. An accuracy threshold has to be raised by hand as a
+/// suite improves or it quietly stops meaning anything, and raising it is
+/// nobody's job; "do not go backwards" keeps its meaning at every level of
+/// quality.
+#[derive(Debug, Clone, PartialEq)]
+struct NetGain {
+    /// The minimum net improvement demanded. Zero is "no net regression"; a
+    /// negative value lets that many net regressions through.
+    required: i64,
+    /// `fixed - regressed`, or `None` when no row was scored on both sides.
+    net: Option<i64>,
+    /// The counts behind the figure, for the event stream.
+    movement: Option<Movement>,
+    passed: bool,
+    /// The one-line explanation, shared by the summary and the event stream so
+    /// the two can never disagree about why a deploy was blocked.
+    note: String,
+}
+
+impl NetGain {
+    fn measure(result: &ReportResult, required: i64) -> NetGain {
+        match Metrics::gate_movement(result) {
+            Some(m) => {
+                // Whole rows on both sides, so there is no arithmetic here to
+                // be imprecise about -- unlike the accuracy gate, which had to
+                // be taught not to fail a run for landing exactly on its
+                // threshold.
+                let net = m.fixed as i64 - m.regressed as i64;
+                let passed = net >= required;
+                NetGain {
+                    required,
+                    net: Some(net),
+                    movement: Some(m),
+                    passed,
+                    note: format!(
+                        "{} fixed, {} regressed — {}, {} the required {}",
+                        m.fixed,
+                        m.regressed,
+                        net_text(net),
+                        if passed { "at or above" } else { "BELOW" },
+                        required_text(required)
+                    ),
+                }
+            }
+            // The report declares a baseline (checked before the run) and not
+            // one row reached it with a truth on both sides: the comparison
+            // never happened. As with `--fail-under`, that is a broken run
+            // rather than a quality miss -- see [`deliver`].
+            None => NetGain {
+                required,
+                net: None,
+                movement: None,
+                passed: false,
+                note: format!(
+                    "no row was scored against a baseline, so there is no movement to hold to the required {}",
+                    required_text(required)
+                ),
+            },
+        }
+    }
+
+    /// The gate on a run that was stopped, for the same reason
+    /// [`Gate::not_measured`] exists: the rows that happened to finish are not
+    /// the run the caller meant to gate on, and "passed" over a third of a
+    /// suite is exactly the false green a gate is bought to prevent.
+    fn not_measured(required: i64) -> NetGain {
+        NetGain {
+            required,
+            net: None,
+            movement: None,
+            passed: false,
+            note: format!(
+                "the run was stopped before it finished, so its movement was not held to the required {}",
+                required_text(required)
+            ),
+        }
+    }
+}
+
+/// A net movement in prose: the sentence reads about a run, not about a signed
+/// integer, and `-3` in the middle of one is a number a reader has to stop and
+/// decode.
+fn net_text(net: i64) -> String {
+    match net {
+        0 => "level".to_string(),
+        n if n > 0 => format!("a net gain of {n}"),
+        n => format!("a net loss of {}", -n),
+    }
+}
+
+/// A `--require-net-gain` threshold in prose.
+fn required_text(required: i64) -> String {
+    match required {
+        0 => "break-even".to_string(),
+        n if n > 0 => format!("net gain of {n}"),
+        n => format!("floor of {n}"),
+    }
+}
+
+/// A threshold as it is written in the summary: the shared percentage
+/// rendering, without the `%` (the sentences around it supply their own).
+fn percent_text_bare(percent: f64) -> String {
+    percent_text(percent).trim_end_matches('%').to_string()
+}
+
+/// A `--fail-under` gate was not met: the run itself was fine, and the answers
+/// were not good enough.
+///
+/// Its own code because the two call for different responses. 1 says the run
+/// broke and is worth retrying; this says the run worked perfectly and the API
+/// is wrong, which no retry will fix. Only ever returned in place of 0 — see
+/// the precedence in [`deliver`].
+pub const EXIT_GATE_FAILED: i32 = 5;
 
 /// The run finished, but some steps never ran because something they depended
 /// on failed. Documented in the README; changing it is a breaking change for
@@ -1338,12 +1761,24 @@ impl Progress {
                 // Carried even here, so every `run_finished` has one shape and
                 // a consumer can read the same keys whatever ended the run.
                 "interrupted": false,
+                "dry_run": false,
                 "partial": false,
                 "rows_completed": serde_json::Value::Null,
                 "rows_planned": serde_json::Value::Null,
+                "rows_ok": 0,
+                "rows_failed": 0,
                 "warnings": warnings,
                 "skipped": [],
                 "errors": errors,
+                // Null for the same reason as the gate below: nothing ran, so
+                // there is nothing to have scored and nothing to have moved.
+                "scored": serde_json::Value::Null,
+                "movement": serde_json::Value::Null,
+                // Null rather than absent: nothing ran, so no gate was ever
+                // evaluated, and a consumer reading the same key on every
+                // `run_finished` must not have to treat a missing key as a
+                // pass. (`--fail-under` may well have been asked for.)
+                "gate": serde_json::Value::Null,
             }),
         );
         1
@@ -1472,7 +1907,14 @@ impl Progress {
     /// would mean publishing a number the process then contradicts. A consumer
     /// therefore has one terminal event to wait for, and the code on it is the
     /// code it will get.
-    fn run_finished(&self, result: &ReportResult, exit_code: i32, setup_warnings: &[String]) {
+    fn run_finished(
+        &self,
+        result: &ReportResult,
+        exit_code: i32,
+        setup_warnings: &[String],
+        gate: Option<&Gate>,
+        net_gain: Option<&NetGain>,
+    ) {
         // The validation warnings are folded in with the run's own: a consumer
         // asked what it should be told about this run, and "which phase raised
         // it" is not a distinction it can act on. In the human mode they were
@@ -1482,6 +1924,63 @@ impl Progress {
             .iter()
             .chain(result.warnings.iter())
             .collect();
+        // Counted over the rows that actually ran: a projected row of a dry
+        // run, or one a stopped run never reached, has neither succeeded nor
+        // failed, and folding those into `rows_ok` would report a run that was
+        // abandoned after two rows as thirty-eight clean ones.
+        let ran = result.rows.len() - result.pending.len();
+        let rows_failed = result
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(r, row)| !result.pending.contains(r) && !row.errors.is_empty())
+            .count();
+        let rows_ok = ran - rows_failed;
+        // Projection-independent, exactly as the gate is: these answer how the
+        // run went, not what the table shows, so a `# columns:` directive that
+        // hides a column cannot change them. See `Metrics::gate_rollup`.
+        let scored = Metrics::gate_rollup(result)
+            .filter(|m| m.compared > 0)
+            .map(|m| {
+                serde_json::json!({
+                    "compared": m.compared,
+                    "correct": m.correct,
+                    "incorrect": m.incorrect,
+                    // A percentage, unrounded, to match `gate.actual` — the two
+                    // are the same number and a consumer comparing them must not
+                    // find them disagreeing by a tenth.
+                    "accuracy": m.accuracy().map(|a| a * 100.0),
+                })
+            });
+        // One object holding everything known about the comparison: the counts,
+        // and the verdict where `--require-net-gain` asked for one. The verdict
+        // is carried *here* rather than beside the accuracy gate because it is
+        // read off these very numbers, and a consumer that found them in two
+        // places would have to decide which to believe.
+        //
+        // Null only when there is nothing to say at all: no baseline, and no
+        // gate that was asked for and could not be measured. A stopped or
+        // baseline-less run under the gate still gets an object, with null
+        // counts and the note saying why — the same shape as `gate`, so one
+        // key can be read on every `run_finished`.
+        let moved = net_gain
+            .and_then(|n| n.movement)
+            .or_else(|| Metrics::gate_movement(result));
+        let movement = (moved.is_some() || net_gain.is_some()).then(|| {
+            let mut obj = serde_json::json!({
+                "fixed": moved.map(|m| m.fixed),
+                "regressed": moved.map(|m| m.regressed),
+                "still_wrong": moved.map(|m| m.still_wrong),
+                "unchanged": moved.map(|m| m.unchanged),
+            });
+            if let (Some(n), Some(map)) = (net_gain, obj.as_object_mut()) {
+                map.insert("required_net_gain".into(), serde_json::json!(n.required));
+                map.insert("net_gain".into(), serde_json::json!(n.net));
+                map.insert("passed".into(), serde_json::json!(n.passed));
+                map.insert("note".into(), serde_json::json!(n.note));
+            }
+            obj
+        });
         self.emit(
             "run_finished",
             serde_json::json!({
@@ -1492,12 +1991,38 @@ impl Progress {
                 // told to stop; `partial` says the report it produced is
                 // therefore short, with the counts to say by how much.
                 "interrupted": exit_code == EXIT_INTERRUPTED,
+                // Nothing was sent: the rows below are projected. Stated on
+                // the terminal event as well as on `plan` because a consumer
+                // that joined late, or that keeps only the last event, must
+                // not read a preview as a run.
+                "dry_run": result.dry_run,
                 "partial": result.partial.is_some(),
                 "rows_completed": result.partial.map(|p| p.rows_completed),
                 "rows_planned": result.partial.map(|p| p.rows_planned),
+                "rows_ok": rows_ok,
+                "rows_failed": rows_failed,
                 "warnings": warnings,
                 "skipped": result.skipped,
                 "errors": result.errors,
+                // The run's own arithmetic, so a caller gating on quality does
+                // not have to parse the report it just wrote — and reads the
+                // same figures the gate was decided on. Both are `null` rather
+                // than zeroed when there is nothing to report: a run with no
+                // ground truth has not scored 0%, and one with no baseline has
+                // not "stayed still".
+                "scored": scored,
+                "movement": movement,
+                // Present only when `--fail-under` asked for one, so a consumer
+                // can tell "the gate passed" from "there was no gate" — the
+                // difference between a checked deploy and an unchecked one.
+                "gate": gate.map(|g| serde_json::json!({
+                    "metric": "accuracy",
+                    "required": g.required,
+                    "actual": g.actual,
+                    "compared": g.compared,
+                    "passed": g.passed,
+                    "note": g.note,
+                })),
             }),
         );
         // After the emit, not before — this is the one event the latch must
@@ -1780,6 +2305,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             false,
             None,
             false,
@@ -1791,6 +2317,72 @@ mod tests {
         assert_eq!(lines.next(), Some("Status"), "header row");
         // One projected row exists (the dry cell value is a placeholder).
         assert!(lines.next().is_some(), "one projected row expected");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The complaint this exists for: a dry run used to write a file that
+    /// looked exactly like a real one — every planned row scored against its
+    /// ground truth, `Correct: incorrect` on all of them because the response
+    /// cells were blank, and a footer asserting "Accuracy 0.0%" for a run that
+    /// sent nothing. The file has to say what it is, and must not pretend to
+    /// have measured anything.
+    #[test]
+    fn a_dry_run_report_is_marked_and_carries_no_verdicts_or_accuracy() {
+        let dir = temp_dir("drymark");
+        let coll = dir.join("api.hurl");
+        fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
+        let report = dir.join("r.trail");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\n\
+             REPORT REQUEST Ping WITH\n    status: status TRUTH \"200\"\nEND\n",
+        )
+        .unwrap();
+        let csv_out = dir.join("out.csv");
+        let json_out = dir.join("out.json");
+
+        let code = run(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            vec![
+                csv_out.to_string_lossy().into_owned(),
+                json_out.to_string_lossy().into_owned(),
+            ],
+            true, // dry-run: no HTTP
+            Vec::new(),
+            None,
+            ParamValues::new(),
+            Gates::default(),
+            false,
+            None,
+            false,
+        );
+        assert_eq!(code, 0, "dry run should succeed");
+
+        let csv = fs::read_to_string(&csv_out).unwrap();
+        assert_eq!(
+            csv.lines().last(),
+            Some("DRY RUN,no requests were sent - these rows are projected rather than measured"),
+            "the file says what it is: {csv:?}"
+        );
+        assert!(
+            !csv.contains("incorrect"),
+            "nothing was run, so nothing is wrong: {csv:?}"
+        );
+        assert!(
+            !csv.contains(crate::report::metrics::ACCURACY_LABEL),
+            "and nothing was measured: {csv:?}"
+        );
+
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json_out).unwrap()).unwrap();
+        assert_eq!(v["dry_run"], serde_json::json!(true));
+        assert!(
+            v.get("metrics").is_none(),
+            "no metrics object for a run that measured nothing: {v}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1830,6 +2422,7 @@ mod tests {
                 Vec::new(),
                 None,
                 params,
+                Gates::default(),
                 false,
                 None,
                 false,
@@ -1888,6 +2481,7 @@ mod tests {
             Vec::new(),
             None,
             params,
+            Gates::default(),
             false,
             None,
             false,
@@ -1931,6 +2525,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             false,
             None,
             false,
@@ -1978,6 +2573,7 @@ mod tests {
                 Vec::new(),
                 None,
                 ParamValues::new(),
+                Gates::default(),
                 false,
                 None,
                 false,
@@ -2037,6 +2633,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             false,
             None,
             false,
@@ -2077,6 +2674,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             false,
             None,
             false,
@@ -2124,6 +2722,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             false,
             None,
             false,
@@ -2152,6 +2751,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             false,
             None,
             false,
@@ -2182,6 +2782,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             false,
             None,
             false,
@@ -2231,6 +2832,7 @@ mod tests {
                 Vec::new(),
                 None,
                 ParamValues::new(),
+                Gates::default(),
                 false,
                 None,
                 false,
@@ -2277,6 +2879,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             false,
             None,
             false,
@@ -2307,6 +2910,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             false,
             None,
             false,
@@ -2376,7 +2980,7 @@ mod tests {
             &RowSlots::new(&[]),
         );
         progress.output_written("out.json", "json", None);
-        progress.run_finished(&ReportResult::default(), 0, &[]);
+        progress.run_finished(&ReportResult::default(), 0, &[], None, None);
 
         let lines = log.lock().unwrap().clone();
         let events: Vec<String> = lines
@@ -2524,7 +3128,7 @@ mod tests {
             "",
             &RowSlots::new(&[]),
         );
-        progress.run_finished(&ReportResult::default(), 0, &[]);
+        progress.run_finished(&ReportResult::default(), 0, &[], None, None);
     }
 
     /// The flag is wired all the way through and changes nothing about the
@@ -2552,6 +3156,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             true, // --progress-json
             None,
             false,
@@ -2604,6 +3209,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             progress,
             Control::for_test(),
         );
@@ -2677,6 +3283,7 @@ mod tests {
             Vec::new(),
             None,
             params,
+            Gates::default(),
             progress,
             Control::for_test(),
         );
@@ -2731,6 +3338,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             progress,
             Control::for_test(),
         );
@@ -2851,6 +3459,875 @@ mod tests {
         (coll, report)
     }
 
+    /// A report result scored `correct` right out of `correct + incorrect`,
+    /// which is all [`Gate::measure`] reads.
+    fn scored(correct: usize, incorrect: usize) -> ReportResult {
+        let mut res = ReportResult::default();
+        let verdicts = [
+            (crate::report::model::Verdict::Correct, correct),
+            (crate::report::model::Verdict::Incorrect, incorrect),
+        ];
+        for (verdict, n) in verdicts {
+            for _ in 0..n {
+                let r = res.rows.len();
+                let mut row = crate::report::model::ReportRow::default();
+                row.cells.insert(
+                    crate::report::compare::CORRECT_COLUMN.to_string(),
+                    verdict.as_str().to_string(),
+                );
+                res.rows.push(row);
+                // The roll-up is read off the rows; the map only has to be
+                // non-empty for the run to count as scored at all.
+                res.verdicts.insert((r, "status".to_string()), verdict);
+            }
+        }
+        res
+    }
+
+    /// The bug the gate was bought to prevent, in its purest form: 1999 of 2000
+    /// is 99.95%, which *displays* as 100.0%. Rounding before the comparison
+    /// let `--fail-under 100` — "nothing may fail" — wave a failure through.
+    #[test]
+    fn a_hundred_percent_gate_counts_rows_rather_than_rounding() {
+        let g = Gate::measure(&scored(1999, 1), 100.0);
+        assert!(!g.passed, "one row was wrong: {}", g.note);
+        assert!(g.note.contains("99.95"), "and the note says so: {}", g.note);
+
+        let clean = Gate::measure(&scored(2000, 0), 100.0);
+        assert!(clean.passed, "{}", clean.note);
+        assert!(clean.note.contains("100.0%"), "{}", clean.note);
+    }
+
+    /// The other half of the same fix: comparing unrounded means a 94.96% now
+    /// fails a 95% gate, so the sentence must not round it to "95.0% — UNDER
+    /// the required 95.0%", which is an unanswerable bug report.
+    #[test]
+    fn a_gate_never_prints_a_figure_that_contradicts_its_verdict() {
+        let g = Gate::measure(&scored(2374, 126), 95.0);
+        assert!(!g.passed, "94.96% is under 95%: {}", g.note);
+        assert!(
+            g.note.contains("94.96") && g.note.contains("UNDER"),
+            "the printed figure must be visibly under the threshold: {}",
+            g.note
+        );
+
+        // And a threshold with more precision than the display: 95.04% is over
+        // 95.0% as shown, and under the threshold that was actually demanded.
+        let fine = Gate::measure(&scored(9504, 496), 95.04);
+        assert!(fine.passed, "{}", fine.note);
+        let just_under = Gate::measure(&scored(9503, 497), 95.04);
+        assert!(!just_under.passed, "{}", just_under.note);
+        assert!(
+            just_under.note.contains("95.03") && just_under.note.contains("95.04"),
+            "both figures are printed at the precision that separates them: {}",
+            just_under.note
+        );
+    }
+
+    /// A run that scored exactly what was asked of it passes. `23 / 40` is
+    /// 57.5% in arithmetic and `57.49999999999999` in `f64`, so comparing the
+    /// computed percentage blocked a release for getting precisely the number
+    /// it was told to get -- and said so in the only words it had: "57.500000%
+    /// -- UNDER the required 57.500000%".
+    #[test]
+    fn a_run_that_exactly_meets_its_threshold_is_not_failed_by_the_last_bit() {
+        let g = Gate::measure(&scored(23, 17), 57.5);
+        assert!(g.passed, "23 of 40 is exactly 57.5%: {}", g.note);
+        assert!(g.note.contains("at or above"), "{}", g.note);
+        // The sentence is readable, not the six-decimal shape the contradiction
+        // used to force.
+        assert!(!g.note.contains("57.500000"), "{}", g.note);
+
+        // The exactness has to cut both ways, or it is just a looser gate.
+        let under = Gate::measure(&scored(22, 18), 57.5);
+        assert!(!under.passed, "22 of 40 is 55%: {}", under.note);
+    }
+
+    /// The same question asked of every threshold shape there is: a tie must
+    /// pass, and one row fewer must not. Each of these has a different
+    /// floating-point accident behind it -- some decimals round up when they
+    /// become a `f64` and some round down, so a cross-multiplication done in
+    /// floats fails one direction or the other depending on the number typed.
+    #[test]
+    fn a_threshold_is_held_to_the_decimal_it_was_written_as() {
+        // (threshold, rows scored, rows right for an exact tie)
+        let cases = [
+            (57.5, 40usize, 23usize),
+            (2.6, 500, 13),
+            (95.1, 1000, 951),
+            (33.0, 300, 99),
+            (0.1, 1000, 1),
+            (8.2, 500, 41),
+            (57.35, 2000, 1147),
+            (100.0, 2000, 2000),
+            (0.0, 10, 0),
+        ];
+        for (required, compared, tie) in cases {
+            let g = Gate::measure(&scored(tie, compared - tie), required);
+            assert!(
+                g.passed,
+                "{tie} of {compared} meets {required}%: {}",
+                g.note
+            );
+            if tie > 0 {
+                let g = Gate::measure(&scored(tie - 1, compared - tie + 1), required);
+                assert!(
+                    !g.passed,
+                    "{} of {compared} does not meet {required}%: {}",
+                    tie - 1,
+                    g.note
+                );
+            }
+        }
+    }
+
+    /// A report result in which `fixed` rows improved on the baseline,
+    /// `regressed` rows got worse and `unchanged` landed where they were --
+    /// which is all [`NetGain::measure`] reads, by way of `row_trend`.
+    fn moved(fixed: usize, regressed: usize, unchanged: usize) -> ReportResult {
+        use crate::report::model::Trend;
+        let mut res = scored(fixed + unchanged, regressed);
+        let runs = [
+            (Trend::Fixed, fixed),
+            (Trend::Regressed, regressed),
+            (Trend::Unchanged, unchanged),
+        ];
+        let mut r = 0;
+        for (trend, n) in runs {
+            for _ in 0..n {
+                res.trends.insert((r, "status".to_string()), trend);
+                r += 1;
+            }
+        }
+        res
+    }
+
+    /// The gate `--fail-under` cannot be. A suite sitting at 97% has three
+    /// points of room above a 95% floor, and can spend them a row at a time
+    /// without the floor ever noticing -- which is precisely how a suite ends
+    /// up at 95%.
+    #[test]
+    fn a_movement_gate_catches_the_slide_an_accuracy_floor_sits_above() {
+        let slipped = moved(0, 3, 97);
+        assert!(
+            Gate::measure(&slipped, 95.0).passed,
+            "97% clears a 95% floor, three broken rows and all"
+        );
+        let n = NetGain::measure(&slipped, 0);
+        assert!(!n.passed, "three rows went backwards: {}", n.note);
+        assert!(
+            n.note.contains("0 fixed") && n.note.contains("3 regressed"),
+            "the note says what moved: {}",
+            n.note
+        );
+
+        // Break-even passes: the threshold is "do not go backwards", not "get
+        // better every time", which no suite can promise. Trading a fix for a
+        // regression is deliberately allowed through at 0 -- a run that wants
+        // to be told about churn asks for a net gain of 1.
+        assert!(NetGain::measure(&moved(1, 1, 10), 0).passed);
+        assert!(NetGain::measure(&moved(2, 1, 10), 0).passed);
+        assert!(!NetGain::measure(&moved(1, 2, 10), 0).passed);
+        assert!(!NetGain::measure(&moved(3, 3, 10), 1).passed);
+    }
+
+    /// The threshold is a number of rows, so it can also demand progress, or
+    /// tolerate a little regression -- and each shape has to read as a sentence
+    /// about a run rather than as a signed integer in the middle of one.
+    #[test]
+    fn a_movement_threshold_says_in_words_what_it_asked_for() {
+        let demanding = NetGain::measure(&moved(2, 0, 10), 5);
+        assert!(!demanding.passed, "{}", demanding.note);
+        assert!(
+            demanding.note.contains("net gain of 2") && demanding.note.contains("BELOW"),
+            "{}",
+            demanding.note
+        );
+
+        let tolerant = NetGain::measure(&moved(0, 2, 10), -2);
+        assert!(tolerant.passed, "two net regressions were allowed for");
+        assert!(
+            tolerant.note.contains("a net loss of 2"),
+            "{}",
+            tolerant.note
+        );
+
+        let level = NetGain::measure(&moved(1, 1, 10), 0);
+        assert!(level.note.contains("level"), "{}", level.note);
+        assert!(level.note.contains("break-even"), "{}", level.note);
+    }
+
+    /// A gate measured on nothing is a broken run, not a quality miss -- the
+    /// same rule the accuracy gate follows, and for the same reason: a
+    /// comparison that never happened is not a comparison that went well.
+    #[test]
+    fn a_movement_gate_with_nothing_to_compare_is_not_a_pass() {
+        let n = NetGain::measure(&scored(10, 0), 0);
+        assert!(!n.passed);
+        assert!(n.net.is_none(), "there is no figure, not a figure of zero");
+
+        let stopped = NetGain::not_measured(0);
+        assert!(!stopped.passed);
+        assert!(stopped.net.is_none());
+        assert!(stopped.note.contains("stopped"), "{}", stopped.note);
+    }
+
+    /// A run that was stopped is not given a verdict at all: the figure would
+    /// be drawn from whichever rows happened to finish, and the two stop paths
+    /// do not even agree about which those are.
+    #[test]
+    fn a_stopped_run_gets_no_gate_verdict() {
+        let g = Gate::not_measured(95.0);
+        assert!(!g.passed && g.actual.is_none());
+        assert!(g.note.contains("stopped"), "{}", g.note);
+    }
+
+    /// Nothing scored is a broken run, not a quality miss — [`deliver`] turns
+    /// this into exit 1 rather than exit 5.
+    #[test]
+    fn a_gate_with_nothing_scored_is_unmeasured_rather_than_failed() {
+        let g = Gate::measure(&ReportResult::default(), 95.0);
+        assert_eq!(g.actual, None);
+        assert_eq!(g.compared, 0);
+        assert!(!g.passed);
+    }
+
+    /// `--fail-under`, the reason it exists: the run was faultless — every
+    /// request sent, every response read — and the answers were wrong. Nothing
+    /// in the exit code said so before, so a post-deploy check could go green
+    /// against a service that got every question wrong.
+    #[test]
+    fn a_run_below_the_required_accuracy_fails_the_gate() {
+        let dir = temp_dir("under");
+        let port = answering_server(200);
+        let coll = dir.join("api.hurl");
+        fs::write(
+            &coll,
+            format!("# Ping\nGET http://127.0.0.1:{port}/ping\nHTTP 200\n"),
+        )
+        .unwrap();
+        let report = dir.join("r.trail");
+        // The service answers 200; the report says it should answer 201.
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\n\
+             REPORT REQUEST Ping WITH\n    status: status TRUTH \"201\"\nEND\n",
+        )
+        .unwrap();
+
+        let (progress, log) = capturing();
+        let code = run_with_progress(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            None,
+            ParamValues::new(),
+            Gates {
+                fail_under: Some(95.0),
+                ..Gates::default()
+            },
+            progress,
+            Control::for_test(),
+        );
+        assert_eq!(code, EXIT_GATE_FAILED, "0% accuracy is under 95%");
+
+        let finished: serde_json::Value = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|e| e["event"] == "run_finished")
+            .expect("the terminal event");
+        assert_eq!(finished["exit_code"], serde_json::json!(EXIT_GATE_FAILED));
+        let gate = &finished["gate"];
+        assert_eq!(gate["required"], serde_json::json!(95.0));
+        assert_eq!(gate["actual"], serde_json::json!(0.0));
+        assert_eq!(gate["compared"], serde_json::json!(1));
+        assert_eq!(gate["passed"], serde_json::json!(false));
+        // The run itself was clean: the gate is the only thing that failed, and
+        // a caller must be able to tell that from a broken API.
+        assert!(
+            finished["errors"].as_array().is_some_and(|e| e.is_empty()),
+            "nothing went wrong with the run: {finished}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_run_that_meets_the_threshold_passes_and_says_so() {
+        let dir = temp_dir("over");
+        let port = answering_server(200);
+        let coll = dir.join("api.hurl");
+        fs::write(
+            &coll,
+            format!("# Ping\nGET http://127.0.0.1:{port}/ping\nHTTP 200\n"),
+        )
+        .unwrap();
+        let report = dir.join("r.trail");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\n\
+             REPORT REQUEST Ping WITH\n    status: status TRUTH \"200\"\nEND\n",
+        )
+        .unwrap();
+
+        let (progress, log) = capturing();
+        let code = run_with_progress(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            None,
+            ParamValues::new(),
+            Gates {
+                fail_under: Some(95.0),
+                ..Gates::default()
+            },
+            progress,
+            Control::for_test(),
+        );
+        assert_eq!(code, 0, "100% clears 95%");
+
+        let finished: serde_json::Value = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|e| e["event"] == "run_finished")
+            .expect("the terminal event");
+        // Reported even when it passes: "the gate passed" and "there was no
+        // gate" are different facts about a deploy.
+        assert_eq!(finished["gate"]["passed"], serde_json::json!(true));
+        assert_eq!(finished["gate"]["actual"], serde_json::json!(100.0));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The terminal event carries the run's own arithmetic, so a caller gating
+    /// on quality does not have to parse the report it just wrote -- and reads
+    /// the same figures the gate was decided on, rather than a second opinion
+    /// that can drift from it.
+    #[test]
+    fn the_terminal_event_carries_the_runs_own_figures() {
+        let dir = temp_dir("figures");
+        let port = answering_server(200);
+        let coll = dir.join("api.hurl");
+        fs::write(
+            &coll,
+            format!("# Ping\nGET http://127.0.0.1:{port}/ping\nHTTP 200\n"),
+        )
+        .unwrap();
+        let report = dir.join("r.trail");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\n\
+             REPORT REQUEST Ping WITH\n    status: status TRUTH \"200\"\nEND\n",
+        )
+        .unwrap();
+
+        let (progress, log) = capturing();
+        let code = run_with_progress(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            None,
+            ParamValues::new(),
+            Gates::default(),
+            progress,
+            Control::for_test(),
+        );
+        assert_eq!(code, 0);
+
+        let finished: serde_json::Value = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|e| e["event"] == "run_finished")
+            .expect("the terminal event");
+        assert_eq!(finished["rows"], serde_json::json!(1));
+        assert_eq!(finished["rows_ok"], serde_json::json!(1));
+        assert_eq!(finished["rows_failed"], serde_json::json!(0));
+        let scored = &finished["scored"];
+        assert_eq!(scored["compared"], serde_json::json!(1));
+        assert_eq!(scored["correct"], serde_json::json!(1));
+        assert_eq!(scored["incorrect"], serde_json::json!(0));
+        // A percentage, to match `gate.actual`: the same number said the same
+        // way, so a consumer comparing the two cannot find them disagreeing.
+        assert_eq!(scored["accuracy"], serde_json::json!(100.0));
+        // Nothing to compare against, so nothing has moved -- said as null
+        // rather than as four zeroes, which would claim the run held steady.
+        assert_eq!(finished["movement"], serde_json::Value::Null);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The gate end to end: a run that broke a row its baseline had right exits
+    /// 5, and the terminal event carries the verdict beside the counts it was
+    /// drawn from. The run itself is faultless -- every request sent, every
+    /// response read -- which is exactly the shape a caller must be able to
+    /// tell from a broken API.
+    #[test]
+    fn a_run_that_went_backwards_fails_the_movement_gate() {
+        let dir = temp_dir("regressed");
+        let port = answering_server(200);
+        let coll = dir.join("api.hurl");
+        fs::write(
+            &coll,
+            format!("# Ping\nGET http://127.0.0.1:{port}/ping\nHTTP 200\n"),
+        )
+        .unwrap();
+        // The snapshot answered 201, which is what the report asks for; this
+        // run answers 200. One row, right last time and wrong now.
+        fs::write(
+            dir.join("prev.baseline"),
+            serde_json::json!({
+                "version": 2,
+                "rows": [{"key": [], "cells": {"Ping.status": "201"}}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let report = dir.join("r.trail");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\n# baseline: prev.baseline\n\
+             REPORT REQUEST Ping WITH\n    status: status TRUTH \"201\"\nEND\n",
+        )
+        .unwrap();
+
+        let (progress, log) = capturing();
+        let code = run_with_progress(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            None,
+            ParamValues::new(),
+            Gates {
+                net_gain: Some(0),
+                ..Gates::default()
+            },
+            progress,
+            Control::for_test(),
+        );
+        assert_eq!(code, EXIT_GATE_FAILED, "a row went backwards");
+
+        let finished: serde_json::Value = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|e| e["event"] == "run_finished")
+            .expect("the terminal event");
+        let movement = &finished["movement"];
+        assert_eq!(movement["regressed"], serde_json::json!(1));
+        assert_eq!(movement["fixed"], serde_json::json!(0));
+        assert_eq!(movement["net_gain"], serde_json::json!(-1));
+        assert_eq!(movement["required_net_gain"], serde_json::json!(0));
+        assert_eq!(movement["passed"], serde_json::json!(false));
+        assert!(
+            movement["note"]
+                .as_str()
+                .is_some_and(|n| n.contains("BELOW")),
+            "the verdict is explained where it is reported: {finished}"
+        );
+        assert!(
+            finished["errors"].as_array().is_some_and(|e| e.is_empty()),
+            "nothing went wrong with the run itself: {finished}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A report that scores nothing is refused before anything is sent, for the
+    /// same reason `--fail-under` is: the alternatives are a long run thrown
+    /// away, or a gate that waves every deploy through while measuring nothing.
+    #[test]
+    fn a_movement_gate_is_refused_when_there_is_nothing_to_compare() {
+        let dir = temp_dir("nogain");
+        let port = answering_server(200);
+        let coll = dir.join("api.hurl");
+        fs::write(
+            &coll,
+            format!("# Ping\nGET http://127.0.0.1:{port}/ping\nHTTP 200\n"),
+        )
+        .unwrap();
+
+        // Scored, but against no baseline: there is a right answer and nothing
+        // to have moved from.
+        let scored_only = dir.join("scored.trail");
+        fs::write(
+            &scored_only,
+            "# name: r\n# collection: api.hurl\n\
+             REPORT REQUEST Ping WITH\n    status: status TRUTH \"200\"\nEND\n",
+        )
+        .unwrap();
+        // And the other half: no truth at all, so no row can be right or wrong
+        // on either side.
+        let unscored = dir.join("unscored.trail");
+        fs::write(
+            &unscored,
+            "# name: r\n# collection: api.hurl\nREPORT REQUEST Ping\n",
+        )
+        .unwrap();
+
+        for (path, expected) in [
+            (&scored_only, "nothing to compare against"),
+            (&unscored, "nothing to measure"),
+        ] {
+            let (progress, log) = capturing();
+            let code = run_with_progress(
+                Some(coll.to_string_lossy().into_owned()),
+                Vec::new(),
+                path.to_string_lossy().into_owned(),
+                Vec::new(),
+                false,
+                Vec::new(),
+                None,
+                ParamValues::new(),
+                Gates {
+                    net_gain: Some(0),
+                    ..Gates::default()
+                },
+                progress,
+                Control::for_test(),
+            );
+            assert_eq!(code, 1, "refused rather than run");
+            let text = log.lock().unwrap().join("\n");
+            assert!(
+                text.contains(expected) && text.contains("--require-net-gain"),
+                "the refusal says which half is missing: {text}"
+            );
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A gate needs something to measure. Refused up front rather than at the
+    /// end, because the two alternatives are both traps: a long run thrown
+    /// away, or — worse — a threshold that quietly passes every deploy because
+    /// there was never anything to hold it to.
+    #[test]
+    fn a_gate_on_a_report_that_scores_nothing_is_refused() {
+        let dir = temp_dir("nogate");
+        let coll = dir.join("api.hurl");
+        fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
+        let report = dir.join("r.trail");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\nREPORT REQUEST Ping\n",
+        )
+        .unwrap();
+
+        let (progress, log) = capturing();
+        let code = run_with_progress(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            None,
+            ParamValues::new(),
+            Gates {
+                fail_under: Some(95.0),
+                ..Gates::default()
+            },
+            progress,
+            Control::for_test(),
+        );
+        assert_eq!(code, 1, "a gate with nothing to measure is an error");
+        let text = log.lock().unwrap().join("\n");
+        assert!(text.contains("TRUTH"), "and says what is missing: {text}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A server that answers every request with `status` and a tiny body, for
+    /// the tests about what a *failing* run does. One thread per connection,
+    /// like `stopping_server`, and it lives as long as the process — a test
+    /// binary that exits is the only teardown it needs.
+    fn answering_server(status: u16) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = listener.accept() {
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf);
+                    let body = "{\"ok\":false}";
+                    let resp = format!(
+                        "HTTP/1.1 {status} Nope\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                    let _ = sock.flush();
+                });
+            }
+        });
+        port
+    }
+
+    /// A server that fails its first `bad` requests and answers 200 after —
+    /// the shape a `[Options] retry` exists for, and the shape a cold start,
+    /// a rolling deploy or a just-scaled instance really has.
+    fn flaky_server(bad: usize) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = listener.accept() {
+                let seen = seen.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf);
+                    let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let status = if n < bad { 503 } else { 200 };
+                    let body = "{\"ok\":true}";
+                    let resp = format!(
+                        "HTTP/1.1 {status} S\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                    let _ = sock.flush();
+                });
+            }
+        });
+        port
+    }
+
+    /// The whole point of `[Options] retry`. Hurl hands back *every* attempt
+    /// and marks the superseded ones; reading the first one meant a request
+    /// that failed twice and then succeeded was reported as a failed run — so
+    /// a retry, the one thing written to absorb a cold start, made a green
+    /// deploy red.
+    #[test]
+    fn a_request_that_succeeds_on_retry_is_a_clean_run() {
+        let dir = temp_dir("retry");
+        let port = flaky_server(2);
+        let coll = dir.join("api.hurl");
+        fs::write(
+            &coll,
+            format!(
+                "# Ping\nGET http://127.0.0.1:{port}/ping\n\
+                 [Options]\nretry: 5\nretry-interval: 10\nHTTP 200\n"
+            ),
+        )
+        .unwrap();
+        let report = dir.join("r.trail");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\nREPORT REQUEST Ping\n",
+        )
+        .unwrap();
+
+        let (progress, log) = capturing();
+        let code = run_with_progress(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            None,
+            ParamValues::new(),
+            Gates::default(),
+            progress,
+            Control::for_test(),
+        );
+        assert_eq!(code, 0, "the third attempt answered 200");
+
+        let events: Vec<serde_json::Value> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let row = events
+            .iter()
+            .find(|e| e["event"] == "row_completed")
+            .expect("a row event");
+        assert_eq!(row["ok"], serde_json::json!(true), "{row}");
+        assert!(
+            row["errors"].as_array().is_some_and(|e| e.is_empty()),
+            "no error survived the retry: {row}"
+        );
+        let finished = events
+            .iter()
+            .find(|e| e["event"] == "run_finished")
+            .expect("the terminal event");
+        assert!(
+            finished["errors"].as_array().is_some_and(|e| e.is_empty()),
+            "{finished}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A step that failed *above* a loop is a failure of every row inside it:
+    /// the rows ran against a login that never happened. They used to stream
+    /// `ok: true` — each row reported only the errors raised while it was the
+    /// current row — so a dashboard watching the rows saw a clean run whose
+    /// terminal event then said otherwise.
+    #[test]
+    fn rows_inherit_the_failure_of_the_step_above_them() {
+        let dir = temp_dir("inherit");
+        let bad = answering_server(500);
+        let coll = dir.join("api.hurl");
+        fs::write(
+            &coll,
+            format!(
+                "# Setup\nGET http://127.0.0.1:{bad}/login\nHTTP 200\n\n\
+                 # Ping\nGET http://127.0.0.1:{bad}/ping/{{{{X}}}}\nHTTP *\n"
+            ),
+        )
+        .unwrap();
+        let report = dir.join("r.trail");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\n\
+             REPORT REQUEST Setup\n\
+             FOR X IN [\"a\", \"b\"]\n    REPORT REQUEST Ping\nEND\n",
+        )
+        .unwrap();
+
+        let (progress, log) = capturing();
+        let code = run_with_progress(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            None,
+            ParamValues::new(),
+            Gates::default(),
+            progress,
+            Control::for_test(),
+        );
+        assert_eq!(code, 1, "the run failed");
+
+        let events: Vec<serde_json::Value> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let rows: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["event"] == "row_completed")
+            .collect();
+        assert!(!rows.is_empty(), "some row ran: {events:?}");
+        for row in &rows {
+            assert_eq!(
+                row["ok"],
+                serde_json::json!(false),
+                "every row is downstream of the failed setup: {row}"
+            );
+            assert!(
+                row["errors"].as_array().is_some_and(|e| !e.is_empty()),
+                "and says which failure it inherited: {row}"
+            );
+        }
+        // The run's own list still holds the failure exactly once: inheritance
+        // widens the *attribution*, it does not duplicate the error.
+        let finished = events
+            .iter()
+            .find(|e| e["event"] == "run_finished")
+            .expect("the terminal event");
+        assert_eq!(
+            finished["errors"].as_array().map(Vec::len),
+            Some(1),
+            "one failure, reported once: {finished}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The gate, end to end: a deploy check whose request comes back 500 must
+    /// fail the pipeline step. Before this, the reason lived only in the row's
+    /// `.Error` cell — the process exited 0, the stream said `ok: true`, and a
+    /// post-deploy smoke test went green against a broken service.
+    #[test]
+    fn a_report_whose_request_failed_exits_non_zero_and_says_which_row() {
+        let dir = temp_dir("gate");
+        let port = answering_server(500);
+        let coll = dir.join("api.hurl");
+        fs::write(
+            &coll,
+            format!("# Ping\nGET http://127.0.0.1:{port}/ping\nHTTP 200\n"),
+        )
+        .unwrap();
+        let report = dir.join("r.trail");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\nREPORT REQUEST Ping\n",
+        )
+        .unwrap();
+
+        let (progress, log) = capturing();
+        let code = run_with_progress(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            None,
+            ParamValues::new(),
+            Gates::default(),
+            progress,
+            Control::for_test(),
+        );
+        assert_eq!(code, 1, "a broken API fails the run");
+
+        let events: Vec<serde_json::Value> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let row = events
+            .iter()
+            .find(|e| e["event"] == "row_completed")
+            .expect("a row event");
+        assert_eq!(row["ok"], serde_json::json!(false), "the row is not clean");
+        assert!(
+            row["errors"].as_array().is_some_and(|e| !e.is_empty()),
+            "and carries why: {row}"
+        );
+        let finished = events
+            .iter()
+            .find(|e| e["event"] == "run_finished")
+            .expect("the terminal event");
+        assert_eq!(finished["ok"], serde_json::json!(false));
+        assert_eq!(finished["exit_code"], serde_json::json!(1));
+        assert!(
+            finished["errors"].as_array().is_some_and(|e| !e.is_empty()),
+            "the stream says what broke: {finished}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// The whole promise of a stop: the rows that finished are written, the
     /// report says it is short and by how much, and the exit code says the run
     /// was told to stop rather than that the API is broken.
@@ -2872,6 +4349,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             progress,
             control,
         );
@@ -2937,6 +4415,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             progress,
             control,
         );
@@ -2994,6 +4473,7 @@ mod tests {
             Vec::new(),
             None,
             ParamValues::new(),
+            Gates::default(),
             progress,
             control,
         );

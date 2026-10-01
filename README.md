@@ -28,6 +28,54 @@ all three.
 
 ## Install
 
+### Prebuilt binaries
+
+The quickest route, and the one that needs no Rust toolchain and none of the
+[build prerequisites](#build-prerequisites) below. Download from the [latest
+release](https://github.com/jhobern/paperboy/releases/latest), unpack, and put
+`paperboy` somewhere on your `PATH`.
+
+| File | Platform |
+| --- | --- |
+| `paperboy-<version>-linux-x86_64.tar.gz` | Linux x86-64 — glibc 2.35+ (Ubuntu 22.04+, Debian 12+, Fedora 36+) |
+| `paperboy-<version>-macos-arm64.tar.gz` | macOS, Apple Silicon |
+| `paperboy-<version>-windows-x86_64.zip` | Windows x86-64 |
+| `paperboy-<version>-linux-x86_64-headless.tar.gz` | Linux x86-64, headless runner only |
+
+Every file except `-headless` is the *same* binary in all three modes: it runs
+`-c` headless, the terminal UI, and `--gui`. There is no separate GUI download,
+and choosing the full build costs nothing if you never open it — the graphical
+front-end loads its display libraries only when `--gui` is passed, so the binary
+still runs on a machine that has none.
+
+The Linux archives also need the system `libxml2` (`libxml2.so.2`), which
+every desktop distribution installs and a minimal container image does not —
+if that is where you are heading, use the image below. The macOS and Windows
+builds link libxml2 in and need nothing. RHEL 9 and Rocky/Alma 9 ship glibc
+2.34 and so are *not* covered by the Linux archive; build from source or use
+the container there.
+
+Each release publishes `SHA256SUMS` beside the archives:
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+### Container
+
+For CI images and anywhere a slim base has no system libxml2 — which the Linux
+binaries above need:
+
+```sh
+docker run --rm -v "$PWD:/work" ghcr.io/jhobern/paperboy -c collection.hurl
+```
+
+The image is the headless build, so it takes the same arguments and writes the
+same reports as any other PaperBoy; `/work` is its working directory, which is
+why the mount above is all the setup there is.
+
+### From source
+
 ```sh
 cargo install paperboy --locked                       # terminal UI + headless runner
 cargo install paperboy --locked --features gui        # …and the graphical UI
@@ -52,6 +100,9 @@ arguments and writes the same reports; only the interactive front-end is
 missing, and running it with no arguments says so rather than doing nothing.
 
 ### Build prerequisites
+
+Only when building from source — the [prebuilt
+binaries](#prebuilt-binaries) and the container need none of this.
 
 Five things Cargo can't fetch for you:
 
@@ -104,8 +155,16 @@ than it does on Unix, so in order:
    git clone https://github.com/microsoft/vcpkg C:\vcpkg
    C:\vcpkg\bootstrap-vcpkg.bat
    setx VCPKG_ROOT C:\vcpkg
-   vcpkg install libxml2:x64-windows-static-md
+   C:\vcpkg\vcpkg install libxml2:x64-windows-static-md
    ```
+
+   `vcpkg.exe` is called by its full path on purpose: bootstrapping builds it
+   inside the tree and adds nothing to `PATH`, so a bare `vcpkg install` in the
+   shell that just ran the bootstrap fails with "not recognized". In PowerShell
+   that is true even from inside `C:\vcpkg` — unlike `cmd`, PowerShell does not
+   search the current directory, so there it is `.\vcpkg install …`. If your
+   tree is somewhere with a space in the path, quote it (`"C:\Program
+   Files\vcpkg\vcpkg" install …`) and, in PowerShell, put `&` in front.
 
    The triplet is the part worth reading twice. `x64-windows-static-md` is a
    static libxml2 built against the *dynamic* CRT, which is what Rust's MSVC
@@ -118,15 +177,49 @@ than it does on Unix, so in order:
 3. **LLVM, Strawberry Perl and NASM:**
 
    ```bat
-   winget install LLVM.LLVM StrawberryPerl.StrawberryPerl NASM.NASM
+   winget install --id LLVM.LLVM -e --accept-package-agreements --accept-source-agreements
+   winget install --id StrawberryPerl.StrawberryPerl -e --accept-package-agreements --accept-source-agreements
+   winget install --id NASM.NASM -e --accept-package-agreements --accept-source-agreements
    ```
 
-   or `choco install llvm strawberryperl nasm`. LLVM supplies `libclang.dll`
+   One package per line, with the agreement prompts pre-answered, so the block
+   can be pasted in one go: a tool that stops to ask something reads the next
+   pasted line as the answer and quietly swallows a command. (`winget install
+   A B C` also works, on v1.5 and later.) Or `choco install llvm strawberryperl
+   nasm -y`, from an **Administrator** prompt. LLVM supplies `libclang.dll`
    for bindgen — if it isn't found, point at it with
    `setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"`. Perl and NASM are for the
    vendored OpenSSL build (`perl Configure`, then NASM for the crypto
    assembly), and **NASM's installer does not add itself to `PATH`**, which
    OpenSSL needs it to be — so add `C:\Program Files\NASM` yourself.
+
+4. **A placeholder icon for `hurl`'s build script.** This one is an upstream
+   bug rather than a missing tool, and it stops the build outright:
+
+   ```powershell
+   $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+   $dir = Join-Path $cargoHome "registry\src\bin\windows"
+   New-Item -ItemType Directory -Force -Path $dir | Out-Null
+   Copy-Item paperboy.ico (Join-Path $dir "logo.ico")   # any .ico will do
+   ```
+
+   `hurl` 8.0.1 embeds a Windows icon from `../../bin/windows/logo.ico`, a path
+   that only resolves inside hurl's own git checkout; the published crate ships
+   nothing outside its own directory, so `rc.exe` reports `RC2135: file not
+   found` and the build script panics. It is not conditional, so **no Windows
+   build of anything depending on `hurl` 8.0.1 can succeed without this**.
+   `rc.exe` resolves the path from the build script's working directory, which
+   Cargo sets to the package root, so `../../` lands in `registry\src` — hence
+   the command above. The icon is linked into the finished executable, so use
+   one you are happy to see on `paperboy.exe`.
+
+   [Upstream has fixed it](https://github.com/Orange-OpenSource/hurl/issues/5207)
+   by skipping the icon when the file is absent, but the fix is unreleased and
+   8.0.1 is still the newest crate. PaperBoy's own `build.rs` cannot paper over
+   it: Cargo runs a dependency's build script before its dependent's, so hurl's
+   has already failed by the time ours would run. **The prebuilt Windows binary
+   is built this way and is unaffected** — this applies only to building from
+   source.
 
 `build.rs` checks all of this before the build starts and names the triplet and
 the tree it actually looked in, so a wrong `VCPKG_ROOT` reads as one line rather
@@ -731,7 +824,8 @@ apply, resolved relative to the report. `-e` is repeatable: each file is named
 by its stem and becomes selectable in an `ENVS` loop, so `-e prod.vars -e
 staging.vars` satisfies `FOR … IN ENVS BASELINE("prod"), COMPARISON("staging")`;
 the first is also the base variable layer. `-o`'s extension picks the format
-(`.csv`, `.json`, `.html`, `.xlsx`, `.pdf`), `-` writes CSV to stdout, and
+(`.csv`, `.json`, `.html`, `.xlsx`, `.pdf`, or `.xml` for JUnit), `-` writes CSV
+to stdout, and
 omitting it derives the filename from the report's own headers.
 
 `-o` is repeatable, and every file comes from **one** run of the requests — the
@@ -761,11 +855,93 @@ than a value that silently does nothing. A `PARAM` with no default *requires*
 a `--param`, since there is nothing to fall back on.
 
 Exit codes are a contract for callers: `0` ran clean, `1` a setup error or a
-run with per-row errors, `3` some steps were skipped because something they
-depended on failed, `4` the run was stopped before it finished (see [Stopping a
-run](#stopping-a-run-ctrl-c---grace---stop-on-stdin)), `130` a stop that was
-repeated and so forced, and `2` (clap's) means the command line itself was
-wrong. Progress goes to stderr, so `-o -` leaves stdout clean for a pipe.
+run in which something failed — a request that did not come back, an assertion
+that did not hold — `3` some steps were skipped because something they depended
+on failed, `4` the run was stopped before it finished (see [Stopping a
+run](#stopping-a-run-ctrl-c---grace---stop-on-stdin)), `5` a `--fail-under` or
+`--require-net-gain` gate was not met, `130` a stop that was repeated and so forced, and `2`
+(clap's) means the command line itself was wrong. Progress goes to stderr, so
+`-o -` leaves stdout clean for a pipe.
+
+#### In a pipeline (`--fail-under`, `--require-net-gain`, JUnit)
+
+A report is a deploy check as much as it is a document, and a pipeline reads
+one thing: the exit code. Two failures are worth telling apart.
+
+*The run broke.* A request that never came back, or that failed its
+assertions, fails the run — exit `1`, the same as `paperboy -c`. The row still
+appears in the report with its error in the cell, because the point of a report
+is to show every case rather than stop at the first, but the process does not
+claim success.
+
+*The answers were wrong.* Everything was sent and read, and the API's answers
+did not match the ground truth. That run is faultless by every measure above,
+and `--fail-under` is what turns it into a failed pipeline step:
+
+```sh
+paperboy -r post-deploy.trail --fail-under 95 -o results.xml
+```
+
+The gate is measured on the whole run's `Correct` roll-up — the per-row verdict,
+over the rows that had a `TRUTH` to compare against — and fails the run with
+exit `5` when it comes out below the threshold. Rows with no ground truth are
+not counted as wrong: they were never asked. The comparison is made on the
+unrounded figure, so `--fail-under 100` means *every scored row was right*
+rather than "right to one decimal place"; where the rounded figure would
+contradict the verdict, the summary prints both numbers to the precision that
+separates them (`accuracy 94.96% — UNDER the required 95.00%`). A report that
+scores no column at all has nothing to gate on and is refused *before* anything
+is sent, rather than passing every deploy on no evidence; `--dry-run` and
+`--postman-import` are refused for the same reason. If a run that declared a
+`TRUTH` nevertheless scores nothing, that is a broken run and exits `1`: there
+is no accuracy to hold to a threshold. A run that was **stopped** (exit `4`) is
+not given a gate verdict at all — the figure would be drawn from whichever rows
+happened to finish. `5` is its own code because the two failures call for
+different responses: `1` is worth retrying, `5` never is.
+
+*The answers got worse.* An accuracy floor is an absolute line, and a suite
+that has climbed well above it can break rows for months without ever reaching
+it — a run at 98% that breaks three rows in a hundred still clears
+`--fail-under 95` comfortably. `--require-net-gain` gates on the *change*
+instead, against the baseline the report already compares with:
+
+```sh
+paperboy -r nightly.trail -e prod.vars -e staging.vars --require-net-gain 0
+```
+
+It counts rows the way the `Trend` column does — rows fixed minus rows
+regressed, over the rows scored on **both** sides — and fails the run with exit
+`5` when that comes out below the number given. `0` is "do not go backwards",
+which is the usual one and needs no maintenance as the suite improves; a
+positive number demands progress, and a negative one is a tolerance
+(`--require-net-gain -2` lets two net regressions through). Trading a fix for a
+regression passes at `0`; a run that wants to hear about churn asks for `1`.
+
+The two gates can be used together and share exit `5`: either one failing is
+enough. `--require-net-gain` needs both halves of the comparison it is named
+after — something to be right or wrong about (a `TRUTH`) and something to have
+been right or wrong about last time (an `ENVS BASELINE(…)/COMPARISON(…)` clause
+or a `# baseline:` snapshot) — and a report missing either is refused before
+anything is sent, exactly as `--fail-under` is. A run that was stopped, or one
+where no row reached a baseline with a truth on both sides, gets no verdict:
+that is a broken run (exit `1`), not a quality miss.
+
+`-o results.xml` writes **JUnit XML**, which is what makes a run show up as
+test results in a CI UI rather than as a file nobody opens: one `<testcase>` per
+row, named by the row's key so a case keeps its identity between runs, with a
+failed request as `<error>`, a wrong answer as `<failure>` carrying both sides
+of the comparison, and a dry run's cases as `<skipped>`. Each case gets exactly
+one of those, in that order of seniority — a row whose request failed is an
+`<error>` even if its answer was also wrong, because the stricter JUnit schemas
+allow a case one outcome and a case counted twice makes every consumer's
+arithmetic disagree; the demoted verdict is written into the case's
+`<system-out>` rather than lost. Run errors that belong to no row (an empty
+glob, a producer that failed before any row existed) and the run's caveats
+become one extra case, so a run that produced nothing *because* something was
+wrong is never a green suite of zero tests — and so the caveats are visible in
+the CI systems that only read output attached to a case. It is an ordinary `-o`, so one run can write
+`-o results.xml -o report.html` and give the pipeline its verdict and a human
+the detail.
 
 #### Watching a run from another program (`--progress-json`)
 
@@ -783,7 +959,7 @@ paperboy -r nightly.trail -o out.json --progress-json 2>events.ndjson
 {"event":"row_started","schema":1,"path":"0.0","row_index":0}
 {"event":"row_completed","schema":1,"path":"0.0","row_index":0,"ok":true,"target":null,"cells":{"Case":"a","Status":"200"},"errors":[],"withheld":[]}
 {"event":"output_written","schema":1,"path":"out.json","format":"json","ok":true,"error":null}
-{"event":"run_finished","schema":1,"ok":true,"exit_code":0,"rows":2,"interrupted":false,"partial":null,"rows_completed":null,"rows_planned":null,"warnings":[],"skipped":[],"errors":[]}
+{"event":"run_finished","schema":1,"ok":true,"exit_code":0,"rows":2,"interrupted":false,"dry_run":false,"partial":null,"rows_completed":null,"rows_planned":null,"rows_ok":2,"rows_failed":0,"warnings":[],"skipped":[],"errors":[],"scored":{"compared":2,"correct":2,"incorrect":0,"accuracy":100.0},"movement":null,"gate":null}
 ```
 
 `plan` arrives once, after the projection pass and before a single request is
@@ -797,7 +973,25 @@ collapse an `ENVS` comparison, the index of its row in a `-o out.json` report.
 That is what makes the live grid and the finished file explicitly linkable: a
 consumer can keep progress cheap and read the full values from the report at
 the end. `run_finished` is the last line and carries the exit code the process
-is about to use.
+is about to use. With `--fail-under` it also carries a `gate` object
+(`{"metric":"accuracy","required":95.0,"actual":92.4,"compared":250,
+"passed":false,"note":"…"}`), and `null` without one — so a consumer can tell a
+gate that passed from a deploy nobody checked.
+
+It also carries the run's own arithmetic, so a caller gating on quality itself
+does not have to parse the report it just wrote: `rows_ok`/`rows_failed` beside
+`rows` (counted over the rows that actually ran — a projected or never-reached
+row is neither), a `scored` object (`{"compared":250,"correct":231,
+"incorrect":19,"accuracy":92.4}`, the same unrounded percentage `gate.actual`
+reports), and a `movement` object (`{"fixed":3,"regressed":1,"still_wrong":2,
+"unchanged":244}`) against the report's baseline. Both are deliberately `null`
+rather than zeroed when there is nothing to report: a run with no ground truth
+has not scored 0%, and one with no baseline has not held steady. These read the
+run rather than the table, so a `# columns:` directive that hides a column
+cannot change them. With `--require-net-gain`, `movement` also carries that
+gate's verdict — `required_net_gain`, `net_gain`, `passed` and `note` — beside
+the counts it was drawn from, rather than in a second place that could drift
+from them.
 
 The stream stays cheap deliberately: `DETAIL` and `IMAGE` columns — the ones the
 report itself marks as drill-down content, a raw response body among them — are
@@ -823,6 +1017,17 @@ runs at all.)
 `row_started`/`row_completed` pair per projected row, cells and all — without
 sending a request. It is the cheap way for a consumer to draw the grid, or to
 check its own parsing, before committing to a real run.
+
+A dry run's report file is a **plan, and says so**. Its rows are the ones the
+run would produce with the response columns blank, so every format carries the
+caveat in the same idiom a stopped run's `PARTIAL` uses: a `DRY RUN` banner
+above the HTML, `"dry_run": true` at the top level of the JSON (and on
+`run_finished`, beside the existing key on `plan`), a final `DRY RUN,…` record
+in the CSV, a bold row under the XLSX summary, the PDF title. Nothing in it is
+scored either: a ground-truth verdict reads `untested` rather than `incorrect`,
+a comparison `Result` reads `not run (dry run)` rather than claiming the
+candidate matched its baseline, and there are no metrics at all — a preview has
+no accuracy, not an accuracy of 0%.
 
 #### Stopping a run (Ctrl-C, `--grace`, `--stop-on-stdin`)
 
@@ -1078,6 +1283,8 @@ collection file, not a fixture directory that `FOR … IN FILES` reads.
 | `0`  | Everything ran and every assertion passed. |
 | `1`  | Something failed: a request, an assertion, or the report itself. |
 | `3`  | Steps were skipped because something they depended on failed. |
+| `4`  | The run was stopped before it finished. |
+| `5`  | A `--fail-under` or `--require-net-gain` gate was not met: the run was clean, the answers were not good enough. |
 
 `3` implies `1` — a skip only ever follows a failure — and says the run is
 additionally incomplete, so a pipeline that only cares about pass/fail can

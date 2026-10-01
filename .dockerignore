@@ -1,0 +1,12 @@
+# `target` is the whole point of this file: it is gigabytes of host-built
+# artifacts that the image would copy in only to ignore, and copying it also
+# risks a stale binary being present in the build context.
+target/
+.git/
+.github/
+docs/
+examples/
+*.md
+!README.md
+Dockerfile
+.dockerignore
