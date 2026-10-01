@@ -37,7 +37,7 @@ release](https://github.com/jhobern/paperboy/releases/latest), unpack, and put
 
 | File | Platform |
 | --- | --- |
-| `paperboy-<version>-linux-x86_64.tar.gz` | Linux x86-64 — glibc 2.35+ (Ubuntu 22.04+, Debian 12+, RHEL 9+) |
+| `paperboy-<version>-linux-x86_64.tar.gz` | Linux x86-64 — glibc 2.35+ (Ubuntu 22.04+, Debian 12+, Fedora 36+) |
 | `paperboy-<version>-macos-arm64.tar.gz` | macOS, Apple Silicon |
 | `paperboy-<version>-windows-x86_64.zip` | Windows x86-64 |
 | `paperboy-<version>-linux-x86_64-headless.tar.gz` | Linux x86-64, headless runner only |
@@ -47,6 +47,13 @@ Every file except `-headless` is the *same* binary in all three modes: it runs
 and choosing the full build costs nothing if you never open it — the graphical
 front-end loads its display libraries only when `--gui` is passed, so the binary
 still runs on a machine that has none.
+
+The Linux archives also need the system `libxml2` (`libxml2.so.2`), which
+every desktop distribution installs and a minimal container image does not —
+if that is where you are heading, use the image below. The macOS and Windows
+builds link libxml2 in and need nothing. RHEL 9 and Rocky/Alma 9 ship glibc
+2.34 and so are *not* covered by the Linux archive; build from source or use
+the container there.
 
 Each release publishes `SHA256SUMS` beside the archives:
 

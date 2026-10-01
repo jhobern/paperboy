@@ -35,6 +35,12 @@ RUN cargo build --release --locked --no-default-features
 
 FROM debian:bookworm-slim
 
+# `image.source` is what links the package to the repository on GitHub, which
+# is also what makes its README and licence visible on the package page.
+LABEL org.opencontainers.image.source="https://github.com/jhobern/paperboy" \
+      org.opencontainers.image.description="PaperBoy headless API runner" \
+      org.opencontainers.image.licenses="MIT"
+
 # Two packages, both load-bearing:
 #
 #   libxml2          the binary links it dynamically; without it the process

@@ -319,13 +319,24 @@ fn stray_vcpkg_tree() -> Option<PathBuf> {
         .find(|root| root.join("vcpkg.exe").is_file())
 }
 
+/// Whether `cmd` would mangle this path if it were passed unquoted.
+///
+/// A space is the obvious one and the only one most people meet, but it is not
+/// the only character `cmd` acts on: `C:\dev&tools\vcpkg` is a legal directory
+/// whose `&` ends the command and starts a new one, and `^`, `(`, `)`, `,`, `;`
+/// and `=` are separators or escapes in the same way. Quoting on spaces alone
+/// produces advice that looks right and silently runs something else.
+fn needs_quoting(path: &str) -> bool {
+    path.chars().any(|c| " \t&()^%!,;=".contains(c))
+}
+
 /// A Windows path as a command argument, quoted only when it has to be.
 ///
 /// Quoting unconditionally would be simpler but reads badly in advice meant to
 /// be copied: most users see no spaces and a quoted `"C:\vcpkg"` invites the
 /// question of whether the quotes are part of the path.
 fn quoted(path: &str) -> String {
-    if path.contains(' ') {
+    if needs_quoting(path) {
         format!("\"{path}\"")
     } else {
         path.to_string()
@@ -745,7 +756,7 @@ fn install_hint() -> Hint {
             }
         };
         let exe = format!("{}\\vcpkg", root.trim_end_matches('\\'));
-        if exe.contains(' ') {
+        if needs_quoting(&exe) {
             // A quoted path is what `cmd` needs and all PowerShell will do with
             // it is print it back: a bare quoted string is an expression there,
             // not a command. There is no one spelling that works in both, so

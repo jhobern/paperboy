@@ -168,11 +168,15 @@ jobs:
       # macOS has pkgconf but no discoverable libxml2 -- the system copy lives
       # inside the SDK and moves between Xcode releases. Homebrew's is keg-only,
       # so it has to be pointed at explicitly rather than assumed on the path.
+      # `LIBXML2_STATIC` matches what release.yml does, so the configuration
+      # that ships is the one under test. Without it this job would prove a
+      # dynamically linked build works and the release would link differently.
       - name: Install libxml2 (Homebrew)
         if: runner.os == 'macOS'
         run: |
           brew install libxml2
           echo "PKG_CONFIG_PATH=$(brew --prefix libxml2)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LIBXML2_STATIC=1" >> "$GITHUB_ENV"
 
       # `-D warnings` matches the Linux matrix. Platform-gated code (clipboard
       # and terminal handling differ per OS) has never been under it before, so
