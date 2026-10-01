@@ -131,6 +131,29 @@ jobs:
           choco install nasm -y --no-progress
           echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
 
+      # hurl 8.0.1's build script embeds a Windows icon from
+      # `../../bin/windows/logo.ico`, a path relative to hurl's own git
+      # checkout. The crates.io package ships nothing outside its own
+      # directory, so on Windows `rc.exe` fails with RC2135 and the build
+      # script panics -- hurl as a library simply cannot be built on Windows
+      # from crates.io. Upstream fixed it by guarding the path
+      # (Orange-OpenSource/hurl#5207, merged 2026-09-14) but has not released
+      # it; 8.0.1 is still the newest crate.
+      #
+      # rc.exe resolves that relative path from the build script's working
+      # directory, which Cargo sets to the package root -- so `../../` lands in
+      # `registry/src`, and putting a file there is enough to satisfy it. We
+      # supply *our own* icon rather than fetching hurl's: the resource is
+      # linked into the final executable, so hurl's logo would otherwise become
+      # paperboy.exe's icon. Remove this once hurl 8.1.0 is out.
+      - name: Work around hurl's unreachable Windows icon (hurl#5207)
+        if: runner.os == 'Windows'
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+          $dir = Join-Path $cargoHome "registry\src\bin\windows"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item "assets\windows\paperboy.ico" (Join-Path $dir "logo.ico") -Force
+
       # Homebrew's libxml2 is keg-only (`provided_by_macos`), and a normal link
       # against it bakes an `/opt/homebrew/...` path into the binary -- which
       # exists on this runner and on no user's Mac. `LIBXML2_STATIC` makes

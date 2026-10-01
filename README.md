@@ -193,6 +193,34 @@ than it does on Unix, so in order:
    assembly), and **NASM's installer does not add itself to `PATH`**, which
    OpenSSL needs it to be — so add `C:\Program Files\NASM` yourself.
 
+4. **A placeholder icon for `hurl`'s build script.** This one is an upstream
+   bug rather than a missing tool, and it stops the build outright:
+
+   ```powershell
+   $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+   $dir = Join-Path $cargoHome "registry\src\bin\windows"
+   New-Item -ItemType Directory -Force -Path $dir | Out-Null
+   Copy-Item paperboy.ico (Join-Path $dir "logo.ico")   # any .ico will do
+   ```
+
+   `hurl` 8.0.1 embeds a Windows icon from `../../bin/windows/logo.ico`, a path
+   that only resolves inside hurl's own git checkout; the published crate ships
+   nothing outside its own directory, so `rc.exe` reports `RC2135: file not
+   found` and the build script panics. It is not conditional, so **no Windows
+   build of anything depending on `hurl` 8.0.1 can succeed without this**.
+   `rc.exe` resolves the path from the build script's working directory, which
+   Cargo sets to the package root, so `../../` lands in `registry\src` — hence
+   the command above. The icon is linked into the finished executable, so use
+   one you are happy to see on `paperboy.exe`.
+
+   [Upstream has fixed it](https://github.com/Orange-OpenSource/hurl/issues/5207)
+   by skipping the icon when the file is absent, but the fix is unreleased and
+   8.0.1 is still the newest crate. PaperBoy's own `build.rs` cannot paper over
+   it: Cargo runs a dependency's build script before its dependent's, so hurl's
+   has already failed by the time ours would run. **The prebuilt Windows binary
+   is built this way and is unaffected** — this applies only to building from
+   source.
+
 `build.rs` checks all of this before the build starts and names the triplet and
 the tree it actually looked in, so a wrong `VCPKG_ROOT` reads as one line rather
 than as a link error several minutes later.

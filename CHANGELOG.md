@@ -275,6 +275,21 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   on what the bucket is called and clicking it still returns exactly the rows
   it counted.
 
+- **Windows builds get past `hurl`'s unreachable icon, and `paperboy.exe` now
+  has an icon of its own.** `hurl` 8.0.1's build script embeds a Windows icon
+  from `../../bin/windows/logo.ico` — a path that resolves only inside hurl's
+  own git checkout, and the published crate ships nothing outside its own
+  directory. It is not conditional, so every Windows build of anything
+  depending on it ends at `RC2135: file not found` and a panicked build script;
+  `cargo install paperboy` on Windows could not have worked, which nothing had
+  noticed because nothing had ever compiled PaperBoy on Windows. Upstream has
+  fixed it (hurl#5207) but not released it. The release and CI builds supply
+  the file the build script is reaching for, and supply **PaperBoy's** icon
+  rather than fetching hurl's, since the resource is linked into the finished
+  executable and would otherwise put the Hurl logo on `paperboy.exe`. Building
+  from source needs the same one-line workaround until hurl 8.1.0, and the
+  README gives it; the prebuilt binary is unaffected.
+
 ## [0.6.5] - 2026-09-23
 
 ### Fixed
