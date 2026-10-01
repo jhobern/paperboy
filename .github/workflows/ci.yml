@@ -188,18 +188,52 @@ jobs:
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           Copy-Item "assets\windows\paperboy.ico" (Join-Path $dir "logo.ico") -Force
 
-      # macOS has pkgconf but no discoverable libxml2 -- the system copy lives
-      # inside the SDK and moves between Xcode releases. Homebrew's is keg-only,
-      # so it has to be pointed at explicitly rather than assumed on the path.
-      # `LIBXML2_STATIC` matches what release.yml does, so the configuration
-      # that ships is the one under test. Without it this job would prove a
-      # dynamically linked build works and the release would link differently.
-      - name: Install libxml2 (Homebrew)
+      # macOS bundles libxml2 in the dyld shared cache on every install, and the
+      # SDK ships its headers and a linker stub -- but no pkg-config file, so
+      # `libxml`'s pkg-config probe cannot find the one copy that is guaranteed
+      # to be present. Synthesising the `.pc` is what makes that copy usable:
+      # the binary then links `/usr/lib/libxml2.2.dylib`, a path every Mac has,
+      # and the archive needs nothing installed. `xcrun` keeps this correct as
+      # the SDK moves between Xcode releases.
+      #
+      # The previous approach -- Homebrew's keg-only libxml2 plus
+      # `LIBXML2_STATIC` -- was a no-op, and silently so. Homebrew's bottle
+      # ships no `libxml2.a` at all, and pkg-config-rs only emits `static=`
+      # when it can see one in the `-L` directory; finding none it falls back
+      # to an ordinary dynamic link without warning. The build then succeeds
+      # having baked in an `/opt/homebrew` path that exists on this runner and
+      # on no user's Mac, which is exactly what 0.7.0's first attempt shipped.
+      # Supplying an `.a` would not have rescued it either: Apple's linker has
+      # no `-Bstatic`, so `-lxml2` against a directory holding both files picks
+      # the dylib regardless, and forcing the archive means linking it by
+      # absolute path.
+      #
+      # Kept identical to release.yml's step on purpose: if they drift, this job
+      # proves one linking arrangement works and the release ships another.
+      - name: Point pkg-config at the macOS SDK's libxml2
         if: runner.os == 'macOS'
         run: |
-          brew install libxml2
-          echo "PKG_CONFIG_PATH=$(brew --prefix libxml2)/lib/pkgconfig" >> "$GITHUB_ENV"
-          echo "LIBXML2_STATIC=1" >> "$GITHUB_ENV"
+          set -euo pipefail
+          # `pkg-config` is a build tool here, not a link dependency: installing
+          # it from Homebrew has no bearing on what the binary ends up linking.
+          command -v pkg-config >/dev/null || brew install pkg-config
+          sdk="$(xcrun --show-sdk-path)"
+          header="$sdk/usr/include/libxml2/libxml/xmlversion.h"
+          version="$(awk -F'"' '/define LIBXML_DOTTED_VERSION/ {print $2}' "$header")"
+          if [ -z "$version" ]; then
+            echo "::error::no LIBXML_DOTTED_VERSION in $header"
+            exit 1
+          fi
+          echo "using the SDK's libxml2 $version from $sdk"
+          mkdir -p "$RUNNER_TEMP/pkgconfig"
+          cat > "$RUNNER_TEMP/pkgconfig/libxml-2.0.pc" <<PC
+          Name: libxml2
+          Description: libxml2 from the macOS SDK
+          Version: $version
+          Libs: -lxml2
+          Cflags: -I$sdk/usr/include/libxml2
+          PC
+          echo "PKG_CONFIG_PATH=$RUNNER_TEMP/pkgconfig" >> "$GITHUB_ENV"
 
       # `-D warnings` matches the Linux matrix. Platform-gated code (clipboard
       # and terminal handling differ per OS) has never been under it before, so

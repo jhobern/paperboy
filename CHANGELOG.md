@@ -81,8 +81,8 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   `--gui`. It also puts the build prerequisites under test rather than under
   documentation: the Windows job installs libxml2 from vcpkg with the
   `-static-md` triplet Rust's MSVC target needs and adds the NASM that
-  OpenSSL's assembler requires, and the macOS job points `pkg-config` at
-  Homebrew's keg-only libxml2.
+  OpenSSL's assembler requires, and the macOS job builds against the libxml2
+  macOS itself ships, exactly as the release does.
 
 - **`run_finished` carries the run's own figures.** A caller gating on quality
   itself had to parse the report the run had just written — or re-derive the
@@ -310,6 +310,24 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   executable and would otherwise put the Hurl logo on `paperboy.exe`. Building
   from source needs the same one-line workaround until hurl 8.1.0, and the
   README gives it; the prebuilt binary is unaffected.
+
+- **The macOS build runs on a Mac that has never seen Homebrew.** The released
+  binary was linked against Homebrew's keg-only libxml2, baking an
+  `/opt/homebrew/opt/libxml2/lib/libxml2.16.dylib` path into it — a location
+  present on the build machine and on no user's Mac, where it would have failed
+  at launch with a missing library. It was meant to be linked statically, and
+  the build asked for exactly that — but Homebrew's bottle contains no
+  `libxml2.a` at all, and pkg-config only emits a static directive when it can
+  see one, falling back to an ordinary dynamic link without warning. The
+  setting had therefore never done anything. Supplying the archive would not
+  have helped either: Apple's linker has no `-Bstatic`, so a `-lxml2` against a
+  directory holding both files takes the `.dylib` regardless. macOS ships
+  libxml2 itself, but the SDK carries only its
+  headers and a linker stub and no `pkg-config` file, so nothing could find the
+  copy that is guaranteed to be there; the build now writes that file and links
+  `/usr/lib/libxml2.2.dylib`, a path every Mac has. The release gate no longer
+  only rejects a Homebrew path but requires the system one, so a build that
+  silently stops linking libxml2 cannot read as a pass.
 
 ## [0.6.5] - 2026-09-23
 
