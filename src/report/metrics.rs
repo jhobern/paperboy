@@ -87,6 +87,50 @@ pub struct ConfusionMatrix {
     pub counts: Vec<Vec<usize>>,
 }
 
+impl Metrics {
+    /// The metrics of a run nothing has been scored in yet: every
+    /// ground-truthed column at zero, with its confusion matrix (where `# labels:`
+    /// declares the axis) all zeroes, and the row roll-up when `with_overall`.
+    /// `None` when no column carries a truth.
+    ///
+    /// For a live view to lay its summary out before the first row lands,
+    /// rather than have it appear under the reader when it does.
+    pub fn empty(
+        columns: &[OutputColumn],
+        labels: &LabelMap,
+        with_overall: bool,
+    ) -> Option<Metrics> {
+        let zero = |header: &str, matrix: Option<ConfusionMatrix>| ColumnMetrics {
+            header: header.to_string(),
+            total: 0,
+            compared: 0,
+            correct: 0,
+            incorrect: 0,
+            matrix,
+        };
+        let out: Vec<ColumnMetrics> = columns
+            .iter()
+            .filter(|c| c.truth.is_some())
+            .map(|c| {
+                let axis = labels.classes().to_vec();
+                let matrix = (!axis.is_empty()).then(|| ConfusionMatrix {
+                    counts: vec![vec![0; axis.len()]; axis.len()],
+                    axis,
+                });
+                zero(&c.header, matrix)
+            })
+            .collect();
+        if out.is_empty() {
+            return None;
+        }
+        Some(Metrics {
+            columns: out,
+            overall: with_overall.then(|| zero(super::compare::CORRECT_COLUMN, None)),
+            movement: None,
+        })
+    }
+}
+
 impl ConfusionMatrix {
     /// The largest count in the matrix — the denominator a heatmap shades
     /// against. Zero for an empty matrix.
@@ -162,10 +206,12 @@ pub struct Movement {
 }
 
 impl Movement {
-    /// Whether anything moved at all. A run where every row landed where it did
-    /// last time can say so in one line instead of four zeroes.
+    /// Whether rows were compared and none of them moved. A run where every
+    /// row landed where it did last time can say so in one line instead of
+    /// four zeroes. A live run that hasn't compared anything *yet* has not
+    /// stayed still — it shows its zeroes, in the places they will fill in.
     pub fn is_still(&self) -> bool {
-        self.fixed == 0 && self.regressed == 0
+        self.fixed == 0 && self.regressed == 0 && self.unchanged + self.still_wrong > 0
     }
 }
 

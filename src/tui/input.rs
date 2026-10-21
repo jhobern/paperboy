@@ -1169,12 +1169,15 @@ impl TuiApp {
         // Reuse the same column-width computation as the renderer so the click
         // lands on the right column.
         let x_off = (col as usize).saturating_sub(area.x as usize);
-        let widths = result_column_widths(result, &header, &visible);
+        let widths =
+            result_column_widths(result, &header, &visible, self.reports[idx].shown_sort());
         let n_cols = widths.len();
         if n_cols == 0 {
             return false;
         }
-        let show_icons = self.reports[idx].run_progress.is_some();
+        // Always present for a run's grid (see the draw code), so a click maps
+        // to the same column whether or not a run is going.
+        let show_icons = true;
         let col_offset = self.reports[idx].results_col_offset;
         let clicked_col = grid_col_at_x(&widths, x_off, show_icons, col_offset).min(n_cols - 1);
         let new_cell = (data_row, clicked_col);
@@ -4340,7 +4343,17 @@ impl TuiApp {
             // Confirmed a "Save As" over an existing file.
             ConfirmAction::Overwrite(save) => {
                 if let Some(path) = self.pending_save_path.take() {
-                    self.do_file_action(save, &path.to_string_lossy());
+                    match save {
+                        // Exports write through their own path, not a file
+                        // action (see `browser_commit_save`).
+                        FileAction::SaveReportCsvChooseFolder => {
+                            self.write_active_report_csv(&path)
+                        }
+                        FileAction::SaveReportBaselineChooseFolder => {
+                            self.write_active_report_baseline(&path)
+                        }
+                        _ => self.do_file_action(save, &path.to_string_lossy()),
+                    }
                 }
             }
             ConfirmAction::DeleteEnv(idx) => self.delete_global_env(idx),
@@ -4370,6 +4383,7 @@ impl TuiApp {
             },
             // Confirmed discarding unexported report results: start the rerun.
             ConfirmAction::RerunReport => self.start_active_report_run(),
+            ConfirmAction::ResumeReport => self.resume_active_report(),
         }
     }
 
@@ -4773,7 +4787,9 @@ impl TuiApp {
                     file.set_extension("csv");
                 }
                 let path = dir.join(file);
-                self.write_active_report_csv(&path);
+                if !self.confirm_overwrite_first(action, &path) {
+                    self.write_active_report_csv(&path);
+                }
             }
             FileAction::SaveReportBaselineChooseFolder => {
                 let mut file = std::path::PathBuf::from(&name);
@@ -4781,7 +4797,9 @@ impl TuiApp {
                     file.set_extension("baseline");
                 }
                 let path = dir.join(file);
-                self.write_active_report_baseline(&path);
+                if !self.confirm_overwrite_first(action, &path) {
+                    self.write_active_report_baseline(&path);
+                }
             }
             FileAction::SaveReportChooseFolder => {
                 let mut file = std::path::PathBuf::from(&name);
@@ -4801,6 +4819,22 @@ impl TuiApp {
             }
             _ => {}
         }
+    }
+
+    /// Ask before writing `action`'s output over an existing `path`: returns
+    /// `true` (having put up the confirmation) when it exists, so the caller
+    /// writes nothing yet. Confirming routes back through
+    /// [`ConfirmAction::Overwrite`].
+    fn confirm_overwrite_first(&mut self, action: FileAction, path: &std::path::Path) -> bool {
+        if !path.exists() {
+            return false;
+        }
+        self.pending_save_path = Some(path.to_path_buf());
+        self.overlay = Some(Overlay::Confirm {
+            action: ConfirmAction::Overwrite(action),
+            sel: 1,
+        });
+        true
     }
 
     pub(crate) fn save_as_path(&mut self, action: FileAction, path: &str) {
@@ -6097,6 +6131,16 @@ impl TuiApp {
     }
 
     fn confirm_key_handler(&mut self, key: KeyEvent, action: ConfirmAction, sel: usize) {
+        // Resuming a stopped run is a choice between two ways forward, not a
+        // yes/no: No starts again from scratch, and only Esc does neither.
+        if action == ConfirmAction::ResumeReport
+            && (matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'))
+                || (key.code == KeyCode::Enter && sel == 1))
+        {
+            self.overlay = None;
+            self.start_active_report_run();
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
             KeyCode::Char('n') | KeyCode::Char('N') => self.overlay = None,

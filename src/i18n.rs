@@ -162,6 +162,9 @@ strings! {
     view_hurl_label => "Hurl", "Hurl", "Hurl";
     confirm_exit_q => "Quit PaperBoy?", "Quitter PaperBoy\u{a0}?", "Afslut PaperBoy?";
     confirm_clear_q => "Close all collections? This removes all tabs and requests.", "Fermer toutes les collections\u{a0}? Cela supprime tous les onglets et requêtes.", "Luk alle samlinger? Dette fjerner alle faner og anmodninger.";
+    gui_report_export_replace => "Replace", "Remplacer", "Erstat";
+    gui_report_export_saved_in => "Saved in: {dir}", "Enregistré dans : {dir}", "Gemmes i: {dir}";
+    gui_picker_already_open => "A file chooser is already open — finish with it first (it may be behind this window)", "Un sélecteur de fichiers est déjà ouvert — terminez-le d'abord (il est peut-être derrière cette fenêtre)", "En filvælger er allerede åben — afslut den først (den kan ligge bag dette vindue)";
     confirm_overwrite_q => "\"{f}\" already exists. Overwrite it?", "«\u{a0}{f}\u{a0}» existe déjà. L'écraser\u{a0}?", "«{f}» findes allerede. Overskriv den?";
     confirm_revert_request_q => "Revert \"{r}\" to its last saved version? In-memory edits will be discarded.", "Rétablir «\u{a0}{r}\u{a0}» à sa dernière version enregistrée\u{a0}? Les modifications en mémoire seront perdues.", "Gendan «{r}» til sidst gemte version? Ændringer i hukommelsen går tabt.";
     confirm_revert_file_q => "Revert \"{f}\" to its last saved version? Every unsaved edit to it will be discarded.", "Rétablir «\u{a0}{f}\u{a0}» à sa dernière version enregistrée\u{a0}? Toutes les modifications non enregistrées seront perdues.", "Gendan «{f}» til sidst gemte version? Alle ikke-gemte ændringer går tabt.";
@@ -779,6 +782,19 @@ strings! {
     report_running => "Running report… (r to cancel)", "Exécution du rapport… (r pour annuler)", "Kører rapport… (r for at annullere)";
     report_running_progress => "Running report… {done}/{total} (r to cancel)", "Exécution du rapport… {done}/{total} (r pour annuler)", "Kører rapport… {done}/{total} (r for at annullere)";
     report_run_stopped => "Run stopped — partial results kept", "Exécution interrompue — résultats partiels conservés", "Kørsel stoppet — delvise resultater beholdt";
+    report_rerun_row => "Re-run this row", "Relancer cette ligne", "Kør denne række igen";
+    report_row_rerunning => "Re-running row…", "Relance de la ligne…", "Kører rækken igen…";
+    report_row_rerun_done => "Re-run finished — results updated", "Relance terminée — résultats mis à jour", "Genkørslen er færdig — resultaterne er opdateret";
+    report_row_rerun_still_failing => "Re-run finished, but it failed again ({n} error(s))", "Relance terminée, mais elle a de nouveau échoué ({n} erreur(s))", "Genkørslen er færdig, men fejlede igen ({n} fejl)";
+    report_rerun_unqueue => "Don't re-run when the run finishes", "Ne pas relancer à la fin de l'exécution", "Kør ikke igen, når kørslen er færdig";
+    report_rerun_not_back_yet => "this row hasn't come back yet", "cette ligne n'est pas encore revenue", "denne række er ikke kommet tilbage endnu";
+    report_rerun_queued_hint => "Will re-run as soon as the current re-run lands", "Sera relancée dès que la relance en cours aura abouti", "Køres igen, så snart den igangværende genkørsel er færdig";
+    report_rerun_already_running => "this row is re-running now", "cette ligne est en cours de relance", "denne række køres igen nu";
+    report_rerun_queued_next => "{n} row(s) will re-run next", "{n} ligne(s) seront relancées ensuite", "{n} række(r) køres igen bagefter";
+    report_row_rerun_lost => "The re-run produced no matching row; the original is unchanged", "La relance n'a produit aucune ligne correspondante ; l'originale est inchangée", "Genkørslen gav ingen tilsvarende række; den oprindelige er uændret";
+    report_row_rerun_blocked => "Can't re-run row:", "Impossible de relancer la ligne :", "Kan ikke køre rækken igen:";
+    report_rerun_blocked_running => "wait for the current run to finish", "attendez la fin de l'exécution en cours", "vent til den nuværende kørsel er færdig";
+    report_rerun_blocked_partial => "only rows of a finished run can be re-run", "seules les lignes d'une exécution terminée peuvent être relancées", "kun rækker fra en færdig kørsel kan køres igen";
     status_request_reverted => "request reverted to last saved", "requête rétablie à la dernière sauvegarde", "anmodning gendannet til sidst gemte";
     status_file_reverted => "file reverted to last saved:", "fichier rétabli à la dernière sauvegarde :", "fil gendannet til sidst gemte:";
     status_env_reverted => "reverted to last saved:", "rétabli à la dernière sauvegarde :", "gendannet til sidst gemte:";
@@ -1456,6 +1472,9 @@ strings! {
     gui_report_alias_hint => "alias", "alias", "alias";
     gui_report_view_results => "Results", "Résultats", "Resultater";
     gui_report_run => "Run", "Exécuter", "Kør";
+    gui_report_resume => "Resume", "Reprendre", "Genoptag";
+    gui_report_resume_tooltip => "Run the rows that hadn't come back when the run was stopped, and finish the report", "Exécuter les lignes qui n'étaient pas revenues à l'arrêt, et terminer le rapport", "Kør de rækker, der ikke var kommet tilbage, da kørslen blev stoppet, og gør rapporten færdig";
+    confirm_resume_q => "Resume the stopped run where it left off? (y) Resume · (n) Start again from scratch", "Reprendre l'exécution interrompue là où elle s'était arrêtée ? (y) Reprendre · (n) Tout recommencer", "Genoptag den stoppede kørsel, hvor den slap? (y) Genoptag · (n) Start forfra";
     gui_report_stop => "Stop", "Arrêter", "Stop";
     gui_report_export => "Export…", "Exporter…", "Eksportér…";
     gui_report_open_export => "Open", "Ouvrir", "Åbn";
@@ -1467,7 +1486,7 @@ strings! {
     // `{c}` is substituted with the expander caret *glyph* at draw time: the
     // GUI draws its icons from the Phosphor icon font, which a bare Unicode
     // triangle written here is not in -- it came out as a tofu box.
-    gui_report_cell_hint => "Click a row marked {c} to open its details, or any other cell to inspect its full value", "Cliquez sur une ligne marquée {c} pour ouvrir ses détails, ou sur toute autre cellule pour voir sa valeur complète", "Klik på en række markeret med {c} for at åbne dens detaljer, eller på en anden celle for at se dens fulde værdi";
+    gui_report_sort_hint => "Click to sort: ascending, descending, then back to run order", "Cliquez pour trier : croissant, décroissant, puis retour à l'ordre d'exécution", "Klik for at sortere: stigende, faldende og derefter tilbage til kørselsrækkefølgen";
     gui_report_cell_copy_full => "Copy full value", "Copier la valeur complète", "Kopiér fuld værdi";
     // The tooltip on a results column's drag handle. Both gestures are named
     // because the reset — double-click to hand the column back to the automatic
@@ -1478,8 +1497,10 @@ strings! {
     // no language -- so the in-app bar labels its own buttons from here.
     report_filter_all => "All", "Tout", "Alle";
     report_filter_differences => "Differences", "Différences", "Forskelle";
+    report_filter_correct => "Correct", "Correctes", "Rigtige";
     report_filter_incorrect => "Incorrect", "Incorrect", "Forkerte";
     report_filter_regressions => "Regressions", "Régressions", "Regressioner";
+    report_filter_waiting => "Waiting for pair", "En attente de la paire", "Venter på par";
     report_filter_improvements => "Improvements", "Améliorations", "Forbedringer";
     report_find_placeholder => "Find in rows…", "Rechercher dans les lignes…", "Søg i rækker…";
     report_rows_shown => "{shown} of {total} rows", "{shown} lignes sur {total}", "{shown} af {total} rækker";
@@ -1499,6 +1520,7 @@ strings! {
     // help overlay rather than repeated here on every screen.
     report_filter_title => "Filter: {f}, {r}", "Filtre\u{a0}: {f}, {r}", "Filter: {f}, {r}";
     report_metric_compared => "Compared", "Comparés", "Sammenlignet";
+    report_metric_correct => "Correct", "Correctes", "Rigtige";
     report_metric_incorrect => "Incorrect", "Incorrects", "Forkerte";
     report_metric_accuracy => "Accuracy", "Exactitude", "Nøjagtighed";
     // How a run moved against its baseline. Accuracy alone can't tell two 98%
@@ -1515,6 +1537,8 @@ strings! {
     report_matrix_all_matched => "Every scored row matched its ground truth.", "Chaque ligne évaluée correspond à sa vérité terrain.", "Alle bedømte rækker matchede deres sandhed.";
     help_report_matrix_cell => "Show the rows this count is made of", "Afficher les lignes qui composent ce total", "Vis de rækker, dette tal består af";
     help_report_filter => "Show only the rows this filter selects", "N'afficher que les lignes sélectionnées par ce filtre", "Vis kun de rækker, dette filter vælger";
+    help_report_sort => "Sort the results by the cursor's column: ascending, descending, run order", "Trier les résultats par la colonne du curseur : croissant, décroissant, ordre d'exécution", "Sortér resultaterne efter markørens kolonne: stigende, faldende, kørselsrækkefølge";
+    help_report_rerun_row => "Re-run the cursor's row and update it in place (e.g. after a transient failure)", "Relancer la ligne du curseur et la mettre à jour sur place (par ex. après une panne passagère)", "Kør markørens række igen og opdatér den på stedet (f.eks. efter en forbigående fejl)";
     // Git remote flow (used by remote.rs).
     gui_git_repo_url => "Repository URL", "URL du dépôt", "Lager-URL";
     gui_git_token => "Access token (optional)", "Jeton d'accès (facultatif)", "Adgangstoken (valgfrit)";
@@ -2286,6 +2310,23 @@ pub enum Status {
     /// rows are retained in the results grid; unstarted rows remain as skeleton
     /// placeholders. The user can view, save, or export the partial output.
     ReportRunStopped,
+    /// One row of a finished report is being re-run in the background.
+    ReportRowRerunning,
+    /// A row re-run finished and its fresh result replaced the old one;
+    /// `errors` is how many errors the fresh row carries (0 = it succeeded).
+    ReportRowRerunDone {
+        errors: usize,
+    },
+    /// A row re-run finished but produced no row matching the one asked for,
+    /// so nothing was replaced.
+    ReportRowRerunLost,
+    /// A row re-run was refused; holds the (translated) reason.
+    ReportRowRerunBlocked(String),
+    /// The queue of rows to re-run as soon as the re-run in flight lands
+    /// changed; `rows` is how many are on it now.
+    ReportRowRerunQueued {
+        rows: usize,
+    },
     /// The selected request was reverted to its last-saved on-disk version,
     /// discarding its in-memory edits. Holds the HTTP method for the message.
     RequestReverted(String),
@@ -2593,6 +2634,16 @@ impl Status {
                 .replace("{done}", &done.to_string())
                 .replace("{total}", &total.to_string()),
             Status::ReportRunStopped => s.report_run_stopped.to_string(),
+            Status::ReportRowRerunning => s.report_row_rerunning.to_string(),
+            Status::ReportRowRerunDone { errors: 0 } => s.report_row_rerun_done.to_string(),
+            Status::ReportRowRerunDone { errors } => s
+                .report_row_rerun_still_failing
+                .replace("{n}", &errors.to_string()),
+            Status::ReportRowRerunLost => s.report_row_rerun_lost.to_string(),
+            Status::ReportRowRerunBlocked(why) => format!("{} {why}", s.report_row_rerun_blocked),
+            Status::ReportRowRerunQueued { rows } => {
+                s.report_rerun_queued_next.replace("{n}", &rows.to_string())
+            }
             Status::RequestReverted(method) => format!("{method} {}", s.status_request_reverted),
             Status::FileReverted(name) => format!("{} {name}", s.status_file_reverted),
             Status::EnvReverted(name) => format!("{} {name}", s.status_env_reverted),

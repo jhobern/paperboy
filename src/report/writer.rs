@@ -3511,8 +3511,8 @@ mod tests {
             !html.contains(">Regressions</button>"),
             "and one that could only ever select nothing is not: {html}"
         );
-        // "All" is filter 0, "Incorrect" filter 1, and only the second row is
-        // in it.
+        // "All" is filter 0, "Correct" 1 and "Incorrect" 2: the first row is
+        // in Correct, the second in Incorrect.
         let rows: Vec<&str> = html
             .match_indices("data-f=\"")
             .map(|(i, _)| {
@@ -3520,7 +3520,7 @@ mod tests {
                 &rest[..rest.find('"').unwrap()]
             })
             .collect();
-        assert_eq!(rows, vec!["0", "0 1"], "{html}");
+        assert_eq!(rows, vec!["0 1", "0 2"], "{html}");
     }
 
     /// The single highest-value interaction of the tool this is modelled on:
@@ -3562,11 +3562,11 @@ mod tests {
         );
         // The empty Pass/Fail cell is not: clicking it could only ever empty
         // the table.
-        // Two buttons plus the two cells that counted something; the empty
-        // Pass/Fail cell is not pickable, since clicking it could only ever
-        // empty the table.
+        // Three buttons (All, Correct, Incorrect) plus the two cells that
+        // counted something; the empty Pass/Fail cell is not pickable, since
+        // clicking it could only ever empty the table.
         let picks = html.matches("data-i=\"").count();
-        assert_eq!(picks, 4, "{html}");
+        assert_eq!(picks, 5, "{html}");
     }
 
     /// When a comparison kept the baseline row, a JSON detail column is shown

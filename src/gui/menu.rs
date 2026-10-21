@@ -714,7 +714,7 @@ pub fn show_dialog(app: &mut GuiApp, ctx: &egui::Context) {
             unsaved_close_tab_dialog(app, ctx, ci, name, count)
         }
         Dialog::WorkspaceReload { ci, reload } => workspace_reload_dialog(app, ctx, ci, *reload),
-        Dialog::ExportResults { path } => export_results_dialog(app, ctx, path),
+        Dialog::ExportResults { path, replace } => export_results_dialog(app, ctx, path, replace),
         Dialog::RevertToSaved {
             ci,
             path,
@@ -828,7 +828,8 @@ fn probe_builder_dialog(
                         steady_rows(ui);
                         for (i, probe) in rows.iter().enumerate() {
                             let row = super::probe::subject_row(probe);
-                            let widget = ui.selectable_label(
+                            let widget = super::widgets::selectable_row(
+                                ui,
                                 i == builder.selected,
                                 egui::RichText::new(row).monospace(),
                             );
@@ -952,7 +953,8 @@ fn probe_builder_dialog(
                         steady_rows(ui);
                         for (i, verb) in builder.verbs.iter().enumerate() {
                             let row = super::probe::verb_row(&probe.subject, verb, &strings);
-                            let widget = ui.selectable_label(
+                            let widget = super::widgets::selectable_row(
+                                ui,
                                 i == builder.selected_verb,
                                 egui::RichText::new(row).monospace(),
                             );
@@ -1509,7 +1511,12 @@ fn revert_to_saved_dialog(
 /// dialog lists and nothing more — so it sat in the far corner appearing to do
 /// nothing. Browse… still hands off to the native picker for people who want to
 /// go looking for a folder.
-fn export_results_dialog(app: &mut GuiApp, ctx: &egui::Context, mut path: String) {
+fn export_results_dialog(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    mut path: String,
+    mut replace: bool,
+) {
     let title = app.strings.gui_save_results_title;
     let (lbl_export, lbl_cancel, lbl_browse, lbl_format) = (
         app.strings.gui_report_export_go,
@@ -1517,8 +1524,15 @@ fn export_results_dialog(app: &mut GuiApp, ctx: &egui::Context, mut path: String
         app.strings.gui_browse,
         app.strings.gui_report_export_format,
     );
+    let (lbl_replace, exists_msg, saved_in) = (
+        app.strings.gui_report_export_replace,
+        app.strings.confirm_overwrite_q,
+        app.strings.gui_report_export_saved_in,
+    );
     let mut act = ExportChoice::Keep;
     let theme_dim = app.theme.dim;
+    let theme_warn = app.theme.pending;
+    let before = path.clone();
     let answered = modal(ctx, title, |ui| {
         ui.horizontal(|ui| {
             ui.colored_label(theme_dim, lbl_format);
@@ -1531,8 +1545,7 @@ fn export_results_dialog(app: &mut GuiApp, ctx: &egui::Context, mut path: String
                 .selected_text(format_label(&current))
                 .show_ui(ui, |ui| {
                     for ext in crate::report::writer::OUTPUT_EXTENSIONS {
-                        if ui
-                            .selectable_label(ext == current, format_label(ext))
+                        if super::widgets::selectable_row(ui, ext == current, format_label(ext))
                             .clicked()
                             && ext != current
                         {
@@ -1547,6 +1560,27 @@ fn export_results_dialog(app: &mut GuiApp, ctx: &egui::Context, mut path: String
                 .hint_text(".csv / .json / .html / .xlsx"),
         );
         let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        // Where the file goes, spelt out: a long path doesn't fit the field,
+        // and the folder is the part that gets cut off.
+        let folder = std::path::Path::new(&path)
+            .parent()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        ui.colored_label(theme_dim, saved_in.replace("{dir}", &folder));
+        // The warning line is always laid out, empty until it has something to
+        // say, so the buttons under it don't jump when it appears.
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        ui.colored_label(
+            theme_warn,
+            if replace {
+                exists_msg.replace("{f}", &name)
+            } else {
+                String::new()
+            },
+        );
         ui.horizontal(|ui| {
             if ui.button(lbl_browse).clicked() {
                 act = ExportChoice::Browse;
@@ -1555,12 +1589,18 @@ fn export_results_dialog(app: &mut GuiApp, ctx: &egui::Context, mut path: String
                 if ui.button(lbl_cancel).clicked() {
                     act = ExportChoice::Cancel;
                 }
-                if ui.button(lbl_export).clicked() || entered {
+                let go = if replace { lbl_replace } else { lbl_export };
+                if ui.button(go).clicked() || entered {
                     act = ExportChoice::Write;
                 }
             });
         });
     });
+    // A changed name is a new question: whatever was asked about the old one
+    // no longer applies.
+    if path != before {
+        replace = false;
+    }
     // A frame egui never drew is not an answer: keep the dialog armed.
     if answered.inner.is_none() {
         act = ExportChoice::Keep;
@@ -1568,10 +1608,19 @@ fn export_results_dialog(app: &mut GuiApp, ctx: &egui::Context, mut path: String
     if answered.dismissed {
         act = ExportChoice::Cancel;
     }
+    // Never write over a file without asking: the first press on a name that
+    // exists only says so, and the button becomes Replace.
+    if matches!(act, ExportChoice::Write) && !replace && std::path::Path::new(&path).exists() {
+        app.dialog = Some(Dialog::ExportResults {
+            path,
+            replace: true,
+        });
+        return;
+    }
     match act {
-        ExportChoice::Keep => app.dialog = Some(Dialog::ExportResults { path }),
+        ExportChoice::Keep => app.dialog = Some(Dialog::ExportResults { path, replace }),
         ExportChoice::Cancel => {}
-        ExportChoice::Browse => save_via_picker(app, SaveKind::ReportResults),
+        ExportChoice::Browse => browse_for_export(app, path),
         ExportChoice::Write => {
             match export_report_results(app, &path) {
                 Ok(()) => {
@@ -1581,11 +1630,43 @@ fn export_results_dialog(app: &mut GuiApp, ctx: &egui::Context, mut path: String
                 // it: the fix is nearly always a word in that name.
                 Err(e) => {
                     app.session.status = Some(crate::i18n::Status::Error(e));
-                    app.dialog = Some(Dialog::ExportResults { path });
+                    app.dialog = Some(Dialog::ExportResults { path, replace });
                 }
             }
         }
     }
+}
+
+/// Open the native save chooser from the Export dialog, *where the dialog was
+/// pointing*: in the folder of the path in its field, with that file name.
+/// Seeding it from anywhere else showed one folder in the chooser while
+/// Export wrote to another.
+fn browse_for_export(app: &mut GuiApp, field: String) {
+    let p = std::path::Path::new(&field);
+    let dir = p.parent().filter(|d| d.is_dir()).map(Path::to_path_buf);
+    let default_name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "results.csv".into());
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    let filters = super::filepick::owned_filters(&report_result_filters(ext));
+    if app.pending_pick.is_some() {
+        // Leave the dialog up: `request_pick` says why nothing opened.
+        app.dialog = Some(Dialog::ExportResults {
+            path: field.clone(),
+            replace: false,
+        });
+    }
+    let title = app.strings.gui_save_results_title;
+    app.request_pick(
+        super::filepick::PickKind::Save {
+            default_name,
+            filters,
+        },
+        title,
+        dir.as_deref(),
+        PickAction::ExportResults { field },
+    );
 }
 
 /// What [`export_results_dialog`] decided this frame.
@@ -1961,6 +2042,12 @@ pub enum PickAction {
     },
     /// Where to keep a workspace just downloaded from a git remote.
     GitWorkspaceDir,
+    /// Browse… from the Export results dialog. Carries what the dialog's
+    /// path field held, so cancelling the chooser hands the dialog back as it
+    /// was rather than losing it.
+    ExportResults {
+        field: String,
+    },
 }
 
 /// Collect a finished file dialog, if one has finished, and act on it. Called
@@ -2025,6 +2112,29 @@ pub fn poll_pending_pick(app: &mut GuiApp) {
         }
         PickAction::GitWorkspaceDir => {
             super::remote::apply_picked_workspace_dir(app, picked);
+            return;
+        }
+        PickAction::ExportResults { field } => {
+            match picked {
+                // The native chooser has already asked about replacing an
+                // existing file, so the pick is written as it stands.
+                Some(path) => {
+                    if let Err(e) = export_report_results(app, &path.to_string_lossy()) {
+                        app.session.status = Some(crate::i18n::Status::Error(e));
+                        app.dialog = Some(Dialog::ExportResults {
+                            path: path.to_string_lossy().into_owned(),
+                            replace: false,
+                        });
+                    }
+                }
+                None => {
+                    app.dialog = Some(Dialog::ExportResults {
+                        path: field,
+                        replace: false,
+                    })
+                }
+            }
+            app.session.save();
             return;
         }
         _ => {}
@@ -2189,7 +2299,6 @@ fn save_title(app: &GuiApp, kind: SaveKind) -> &'static str {
         SaveKind::Collection => app.strings.gui_save_collection_title,
         SaveKind::Environment(_) => app.strings.gui_save_environment_title,
         SaveKind::Response => app.strings.gui_save_response_title,
-        SaveKind::ReportResults => app.strings.gui_save_results_title,
         SaveKind::ReportBaseline => app.strings.gui_save_baseline_title,
         SaveKind::Report => app.strings.gui_save_report_title,
     }
@@ -2292,21 +2401,6 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
             .and_then(|e| e.path.as_ref())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        // A results export defaults to the format the report's `# output:`
-        // directive declares (CSV when it declares none), beside the report --
-        // the same name the terminal UI suggests, `{time}` token included. The
-        // dialog can still be pointed at any of the other formats.
-        SaveKind::ReportResults => app
-            .report_editor
-            .as_ref()
-            .map(|e| {
-                crate::report::writer::export_path(
-                    &e.report,
-                    &crate::report::writer::report_output_extension(&e.report),
-                )
-            })
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default(),
         // A baseline snapshot is named the same way, so a report's results file
         // and its snapshot sit side by side under one stem.
         SaveKind::ReportBaseline => app
@@ -2342,20 +2436,12 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
             SaveKind::Collection => "collection.hurl".into(),
             SaveKind::Environment(_) => "environment.vars".into(),
             SaveKind::Response => "response.txt".into(),
-            SaveKind::ReportResults => "results.csv".into(),
             SaveKind::ReportBaseline => "report.baseline".into(),
             SaveKind::Report => "report.trail".into(),
         });
-    let result_filters = report_result_filters(
-        std::path::Path::new(&current)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default(),
-    );
     let filters: &[super::filepick::Filter] = match kind {
         SaveKind::Collection => &[("Hurl", &["hurl"]), ("All files", &["*"])],
         SaveKind::Environment(_) => &[("Vars", &["vars"]), ("All files", &["*"])],
-        SaveKind::ReportResults => &result_filters,
         SaveKind::ReportBaseline => &[("Baseline", &["baseline"]), ("All files", &["*"])],
         SaveKind::Report => &[("PaperTrail", &["trail"]), ("All files", &["*"])],
         SaveKind::Response => &[("All files", &["*"])],
@@ -2373,11 +2459,6 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
 
 /// Write the given kind to `path`, returning a user-facing error on failure.
 fn apply_save(app: &mut GuiApp, kind: SaveKind, path: &Path) -> Result<(), String> {
-    let path_str = path.to_string_lossy();
-    // Report results export writes format-specific bytes (chosen by extension).
-    if matches!(kind, SaveKind::ReportResults) {
-        return export_report_results(app, &path_str);
-    }
     if matches!(kind, SaveKind::ReportBaseline) {
         return save_report_baseline(app, path);
     }
@@ -2395,7 +2476,7 @@ fn apply_save(app: &mut GuiApp, kind: SaveKind, path: &Path) -> Result<(), Strin
             .find(|e| e.id == id)
             .map(|e| e.to_vars_text()),
         SaveKind::Response => Some(app.session.response.lock().unwrap().body.to_string()),
-        SaveKind::ReportResults | SaveKind::ReportBaseline | SaveKind::Report => None,
+        SaveKind::ReportBaseline | SaveKind::Report => None,
     };
     let text = content.ok_or_else(|| app.strings.gui_nothing_to_save.to_string())?;
     std::fs::write(path, text).map_err(|e| {
@@ -2419,10 +2500,7 @@ fn apply_save(app: &mut GuiApp, kind: SaveKind, path: &Path) -> Result<(), Strin
                 e.path = Some(path.to_path_buf());
             }
         }
-        SaveKind::Response
-        | SaveKind::ReportResults
-        | SaveKind::ReportBaseline
-        | SaveKind::Report => {}
+        SaveKind::Response | SaveKind::ReportBaseline | SaveKind::Report => {}
     }
     app.session.save();
     Ok(())
@@ -2445,7 +2523,7 @@ fn export_report_results(app: &mut GuiApp, path: &str) -> Result<(), String> {
     // A run in flight and a run never started both leave `result` empty, but
     // they are different problems: one is "wait", the other is "press Run".
     // "Nothing to save" told the reader neither.
-    let result = ed.result.as_ref().ok_or_else(|| {
+    let result = ed.exportable_result().ok_or_else(|| {
         if ed.is_running() {
             app.strings.report_export_still_running.to_string()
         } else {
@@ -2457,7 +2535,7 @@ fn export_report_results(app: &mut GuiApp, path: &str) -> Result<(), String> {
         .as_ref()
         .map(|f| f.header.clone())
         .unwrap_or_default();
-    let bytes = writer.write(result, &header)?;
+    let bytes = writer.write(&result, &header)?;
     std::fs::write(path, bytes).map_err(|e| {
         format!(
             "{} {}",
@@ -3279,6 +3357,142 @@ mod tests {
             Some(path.to_string_lossy().as_ref()),
             "and the file it wrote is the one Open would hand to the desktop"
         );
+    }
+
+    /// Browse… from the Export dialog writes where the chooser says, and a
+    /// cancelled chooser hands the dialog back as it was.
+    #[test]
+    fn browsing_from_the_export_dialog_writes_the_pick_or_returns_to_the_dialog() {
+        use crate::report::model::{ReportResult, ReportRow};
+        let mut app = app();
+        let mut ed = crate::gui::report_editor::ReportEditor::new(
+            crate::gui::report_editor::ReportOrigin::Session(0),
+            crate::report::Report::scratch("r"),
+        );
+        let mut result = ReportResult::default();
+        result.column_order = vec!["Time".to_string()];
+        result.rows.push(ReportRow {
+            cells: [("Time".to_string(), "100".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+        ed.result = Some(result);
+        app.report_editor = Some(ed);
+        let dir = std::env::temp_dir().join(format!("pb_gui_browse_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let field = dir.join("r.csv").to_string_lossy().into_owned();
+
+        // Cancelled: the dialog comes back with what it held.
+        browse_for_export(&mut app, field.clone());
+        assert!(app.pending_pick.is_some());
+        poll_pending_pick(&mut app);
+        assert!(app.pending_pick.is_none(), "the chooser slot is free again");
+        assert!(matches!(
+            &app.dialog,
+            Some(Dialog::ExportResults { path, .. }) if *path == field
+        ));
+
+        // Picked: written there, and the dialog is done.
+        app.dialog = None;
+        let picked = dir.join("elsewhere.csv");
+        app.pending_pick = Some(super::super::filepick::resolved(
+            PickAction::ExportResults {
+                field: field.clone(),
+            },
+            Some(picked.clone()),
+        ));
+        poll_pending_pick(&mut app);
+        let written = std::fs::read_to_string(&picked).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(written.contains("Time"), "{written:?}");
+        assert!(app.dialog.is_none());
+    }
+
+    /// Asking for a second chooser while one is open says so, rather than
+    /// doing nothing — the open one may well be behind the window.
+    #[test]
+    fn a_second_chooser_while_one_is_open_says_why_nothing_opened() {
+        let mut app = app();
+        app.pending_pick = Some(super::super::filepick::resolved(
+            PickAction::PostmanDest,
+            None,
+        ));
+        browse_for_export(&mut app, "/tmp/r.csv".to_string());
+        assert!(matches!(
+            &app.session.status,
+            Some(crate::i18n::Status::Error(m)) if m == app.strings.gui_picker_already_open
+        ));
+        assert!(
+            matches!(app.dialog, Some(Dialog::ExportResults { .. })),
+            "and the Export dialog stays up"
+        );
+    }
+
+    /// Exporting onto a file that already exists asks first: the first press
+    /// only says so and turns the button into Replace; the file is written by
+    /// the second.
+    #[test]
+    fn exporting_over_an_existing_file_asks_before_replacing_it() {
+        use crate::gui::probe_test_support::{Painted, click_events, dialog_frame, themed_ctx};
+        use crate::report::model::{ReportResult, ReportRow};
+
+        let mut app = app();
+        let mut ed = crate::gui::report_editor::ReportEditor::new(
+            crate::gui::report_editor::ReportOrigin::Session(0),
+            crate::report::Report::scratch("r"),
+        );
+        let mut result = ReportResult::default();
+        result.column_order = vec!["Time".to_string()];
+        result.rows.push(ReportRow {
+            cells: [("Time".to_string(), "100".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+        ed.result = Some(result);
+        app.report_editor = Some(ed);
+        let dir = std::env::temp_dir().join(format!("pb_gui_export_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.csv");
+        std::fs::write(&path, "precious").unwrap();
+        app.dialog = Some(Dialog::ExportResults {
+            path: path.to_string_lossy().into_owned(),
+            replace: false,
+        });
+
+        let ctx = themed_ctx();
+        let button = |painted: &Painted, label: &str| {
+            painted
+                .iter()
+                .find(|(_, g)| g.text() == label)
+                .map(|(pos, g)| *pos + g.size() / 2.0)
+                .unwrap_or_else(|| panic!("no {label:?} button"))
+        };
+        let press = |app: &mut GuiApp, label: &str| {
+            dialog_frame(app, &ctx, vec![]);
+            let painted = dialog_frame(app, &ctx, vec![]);
+            let (down, up) = click_events(button(&painted, label), egui::PointerButton::Primary);
+            dialog_frame(app, &ctx, down);
+            dialog_frame(app, &ctx, up);
+        };
+
+        let (export, replace) = (
+            app.strings.gui_report_export_go,
+            app.strings.gui_report_export_replace,
+        );
+        press(&mut app, export);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "precious");
+        assert!(matches!(
+            app.dialog,
+            Some(Dialog::ExportResults { replace: true, .. })
+        ));
+
+        press(&mut app, replace);
+        let written = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(written.contains("Time"), "{written:?}");
+        assert!(app.dialog.is_none());
     }
 
     /// Saving a baseline writes a snapshot the report engine can load straight

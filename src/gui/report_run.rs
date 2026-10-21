@@ -43,6 +43,15 @@ pub enum RunUpdate {
     Row(Box<ReportRow>),
     /// The authoritative finalized result, replacing the streamed grid at the end.
     Done(ReportResult),
+    /// A row re-run's finalized result, to be spliced into the grid's rows
+    /// `rows` (see [`crate::report::rerun::splice`]) rather than replacing it.
+    Rerun {
+        rows: Vec<usize>,
+        fresh: ReportResult,
+    },
+    /// A row re-run started while the run was still going: its fresh raw rows
+    /// for the live grid, and the same rows finished, for the run's end.
+    LiveRerun(Box<crate::report::rerun::LiveRerun>),
 }
 
 /// The live state of a row's slot in the streamed grid (drives its status icon
@@ -55,6 +64,9 @@ pub enum RowState {
     Running,
     /// Its real result has streamed in — cells filled, drawn normally.
     Finished,
+    /// Part of a finished result, with nothing happening to it: drawn
+    /// normally, with nothing in the status column.
+    Idle,
 }
 
 /// Per-run streaming bookkeeping: one [`RowState`] per skeleton row plus the
@@ -64,6 +76,29 @@ pub struct RunProgress {
     pub index: HashMap<Vec<(usize, usize)>, usize>,
     pub done: usize,
     pub total: usize,
+    /// Set while this is a row re-run over a finished result rather than a
+    /// whole run: the grid stays a finished one (filters, metrics and sorting
+    /// remain), and only the rows being re-run are drawn as running.
+    pub rerun: bool,
+}
+
+impl RunProgress {
+    /// The progress of re-running rows `rows` of a finished `total`-row grid.
+    pub fn rerun(total: usize, rows: &[usize]) -> Self {
+        let mut states = vec![RowState::Idle; total];
+        for &r in rows {
+            if let Some(s) = states.get_mut(r) {
+                *s = RowState::Running;
+            }
+        }
+        RunProgress {
+            states,
+            index: HashMap::new(),
+            done: 0,
+            total: rows.len(),
+            rerun: true,
+        }
+    }
 }
 
 /// What identifies a report's run across the editor being closed and reopened.
@@ -106,6 +141,14 @@ pub struct ParkedRun {
     /// because they are what produced it -- and because retyping them after a
     /// trip to another tab would be a poor reward for having answered once.
     pub params: crate::report::params::ParamValues,
+    /// What the result was actually run with, and the flow it was run from —
+    /// what re-running one of its rows has to reproduce.
+    pub result_params: Vec<(String, String)>,
+    pub result_flow: Option<crate::report::flow::ReportFlow>,
+    /// The parameter values that flow was run with (see the editor's field).
+    pub result_run_params: crate::report::params::ParamValues,
+    /// Rows picked to re-run once the run in flight has finished.
+    pub queued_reruns: Vec<crate::report::rerun::RowRef>,
     /// Which tab was open when the editor was put away, and whether it already
     /// had results to show at the time.
     ///
@@ -132,12 +175,18 @@ impl ParkedRun {
         let Some(handle) = self.run.as_mut() else {
             return false;
         };
-        if matches!(
-            drain(handle, &mut self.result, &mut self.progress),
-            Drained::Disconnected
-        ) {
-            self.run = None;
-            return false;
+        match drain(handle, &mut self.result, &mut self.progress) {
+            Drained::Disconnected => {
+                self.run = None;
+                return false;
+            }
+            // Rows changed while nobody was looking: whatever was exported
+            // describes the table as it was.
+            Drained::Rerun { replaced, .. } if !replaced.is_empty() => {
+                self.results_exported = false;
+                self.last_export = None;
+            }
+            _ => {}
         }
         if handle.finished() {
             self.run = None;
@@ -155,6 +204,25 @@ pub struct RunHandle {
     /// Set once a terminal [`RunUpdate::Done`] has been folded in, so the editor
     /// knows the run is over even before the sender disconnects.
     finished: bool,
+    /// Rows re-run while the run was still going, each on a worker of its own
+    /// (see [`RunHandle::rerun_live`]). Carried by the handle so they travel
+    /// with the run when its editor is put away, and drained beside it.
+    side: Vec<SideRerun>,
+    /// Re-runs that landed while the run was going, finished, waiting for the
+    /// run's own result: it was made from the rows they replaced, so each is
+    /// spliced into it as it arrives, or it would put the old answers back.
+    held: Vec<(Vec<crate::report::rerun::RowRef>, ReportResult)>,
+}
+
+/// One row re-run in flight beside a run.
+struct SideRerun {
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<RunUpdate>,
+    /// The rows it re-runs, by identity: the grid they are in may be the
+    /// finished one by the time the answer comes back.
+    refs: Vec<crate::report::rerun::RowRef>,
+    /// Grid rows drawn as running for it, put back when it ends.
+    marked: Vec<usize>,
 }
 
 impl RunHandle {
@@ -163,6 +231,54 @@ impl RunHandle {
     /// still finishes, but no new ones start). The partial grid is retained.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+        for side in &self.side {
+            side.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Re-run the rows at `paths` straight away, beside the run in flight —
+    /// someone who spots a wrong row mid-run wants its answer now, not at the
+    /// end. `refs` names them for mapping onto the finished result; `marked`
+    /// are the grid rows to draw as running meanwhile.
+    pub fn rerun_live(
+        &mut self,
+        inputs: ReportRunInputs,
+        paths: Vec<Vec<(usize, usize)>>,
+        refs: Vec<crate::report::rerun::RowRef>,
+        marked: Vec<usize>,
+    ) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_live_rerun(inputs, paths, cancel.clone(), tx);
+        self.side.push(SideRerun {
+            cancel,
+            rx,
+            refs,
+            marked,
+        });
+    }
+
+    /// Whether row re-runs started during the run are still out.
+    #[cfg(test)]
+    pub(crate) fn rerunning_live(&self) -> bool {
+        !self.side.is_empty()
+    }
+
+    /// A side re-run wired to a caller-driven sender, for tests.
+    #[cfg(test)]
+    pub(crate) fn side_for_test(
+        &mut self,
+        refs: Vec<crate::report::rerun::RowRef>,
+        marked: Vec<usize>,
+    ) -> std::sync::mpsc::Sender<RunUpdate> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.side.push(SideRerun {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+            refs,
+            marked,
+        });
+        tx
     }
 
     /// The shared cancel flag, so a test can watch it after the handle itself
@@ -177,9 +293,10 @@ impl RunHandle {
         self.cancel.load(Ordering::Relaxed)
     }
 
-    /// Whether the run has delivered its terminal `Done` (or the worker is gone).
+    /// Whether the run has delivered its terminal `Done` (or the worker is
+    /// gone) and no row re-run started during it is still out.
     pub fn finished(&self) -> bool {
-        self.finished
+        self.finished && self.side.is_empty()
     }
 }
 
@@ -188,7 +305,7 @@ impl Drop for RunHandle {
     /// the run so no detached worker keeps firing real HTTP requests. A run that
     /// already finished is unaffected (the flag is simply set on a dead worker).
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel();
     }
 }
 
@@ -201,6 +318,8 @@ pub(crate) fn test_handle() -> (RunHandle, std::sync::mpsc::Sender<RunUpdate>) {
         cancel: Arc::new(AtomicBool::new(false)),
         rx,
         finished: false,
+        side: Vec::new(),
+        held: Vec::new(),
     };
     (handle, tx)
 }
@@ -310,7 +429,175 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
         cancel,
         rx,
         finished: false,
+        side: Vec::new(),
+        held: Vec::new(),
     }
+}
+
+/// Spawn a background re-run of rows `rows` (whose structural paths are
+/// `paths`) of a finished run of `inputs`, returning a [`RunHandle`] that
+/// delivers a single [`RunUpdate::Rerun`] to splice into the grid.
+///
+/// Nothing streams: the rows being re-run are already on screen, and a
+/// comparison row's fresh value only exists once both of its sides have been
+/// collapsed again, so there is no partial answer worth showing.
+pub fn spawn_rerun(
+    inputs: ReportRunInputs,
+    paths: Vec<Vec<(usize, usize)>>,
+    rows: Vec<usize>,
+) -> RunHandle {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_worker = cancel.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let ReportRunInputs {
+            flow,
+            entries,
+            helpers,
+            base_vars,
+            named_envs,
+            root,
+            file_root,
+            language,
+            params,
+        } = inputs;
+        let strings = crate::i18n::Strings::mapped(&language, super::icons::drawable);
+        let runner = CancellableRunner {
+            inner: LiveRunner { file_root },
+            cancel: cancel_worker,
+        };
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &helpers,
+            base_vars,
+            named_envs,
+            root,
+            runner: &runner,
+            strings: &strings,
+            params,
+            sink: None,
+            shuffle: None,
+            cancel: None,
+        };
+        let fresh = crate::report::rerun::rerun_rows(&flow, &ctx, &paths);
+        let _ = tx.send(RunUpdate::Rerun { rows, fresh });
+    });
+    RunHandle {
+        cancel,
+        rx,
+        finished: false,
+        side: Vec::new(),
+        held: Vec::new(),
+    }
+}
+
+/// Spawn the resumption of a stopped run: produce the rows still pending in
+/// `prior` (the grid the stop left), streaming each into its slot exactly as a
+/// run does, then deliver the whole grid finalized (see
+/// [`crate::report::rerun::resume`]). No skeleton: the grid is already there.
+pub fn spawn_resume(inputs: ReportRunInputs, prior: ReportResult) -> RunHandle {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_worker = cancel.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let ReportRunInputs {
+            flow,
+            entries,
+            helpers,
+            base_vars,
+            named_envs,
+            root,
+            file_root,
+            language,
+            params,
+        } = inputs;
+        let strings = crate::i18n::Strings::mapped(&language, super::icons::drawable);
+        let runner = CancellableRunner {
+            inner: LiveRunner { file_root },
+            cancel: cancel_worker,
+        };
+        let row_tx = Mutex::new(tx.clone());
+        let sink = move |ev: RowEvent| {
+            if let Ok(tx) = row_tx.lock() {
+                let msg = match ev {
+                    RowEvent::Started(path) => RunUpdate::RowStarted(path.to_vec()),
+                    RowEvent::Completed { row, .. } => RunUpdate::Row(Box::new(row.clone())),
+                };
+                let _ = tx.send(msg);
+            }
+        };
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &helpers,
+            base_vars,
+            named_envs,
+            root,
+            runner: &runner,
+            strings: &strings,
+            params,
+            sink: Some(&sink),
+            shuffle: None,
+            cancel: None,
+        };
+        let result = crate::report::rerun::resume(&flow, &ctx, prior);
+        let _ = tx.send(RunUpdate::Done(result));
+    });
+    RunHandle {
+        cancel,
+        rx,
+        finished: false,
+        side: Vec::new(),
+        held: Vec::new(),
+    }
+}
+
+/// The worker for [`RunHandle::rerun_live`].
+fn spawn_live_rerun(
+    inputs: ReportRunInputs,
+    paths: Vec<Vec<(usize, usize)>>,
+    cancel: Arc<AtomicBool>,
+    tx: std::sync::mpsc::Sender<RunUpdate>,
+) {
+    // A test must not send real requests: the re-run resolves as a worker
+    // that went away, which is a path worth exercising anyway.
+    #[cfg(test)]
+    {
+        let _ = (inputs, paths, cancel, tx);
+    }
+    #[cfg(not(test))]
+    thread::spawn(move || {
+        let ReportRunInputs {
+            flow,
+            entries,
+            helpers,
+            base_vars,
+            named_envs,
+            root,
+            file_root,
+            language,
+            params,
+        } = inputs;
+        let strings = crate::i18n::Strings::mapped(&language, super::icons::drawable);
+        let runner = CancellableRunner {
+            inner: LiveRunner { file_root },
+            cancel,
+        };
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &helpers,
+            base_vars,
+            named_envs,
+            root,
+            runner: &runner,
+            strings: &strings,
+            params,
+            sink: None,
+            shuffle: None,
+            cancel: None,
+        };
+        let fresh = crate::report::rerun::rerun_live(&flow, &ctx, &paths);
+        let _ = tx.send(RunUpdate::LiveRerun(Box::new(fresh)));
+    });
 }
 
 /// The outcome of draining a run's channel this frame, so the caller can update
@@ -322,6 +609,12 @@ pub enum Drained {
     Progress { done: usize, total: usize },
     /// The run finished normally with this many rows / errors.
     Done { rows: usize, errors: usize },
+    /// A row re-run finished: the rows it replaced (empty when it matched
+    /// none, or was stopped) and how many errors those rows now carry.
+    Rerun { replaced: Vec<usize>, errors: usize },
+    /// A row re-run started mid-run landed in the live grid: the raw rows it
+    /// replaced and how many errors they carry.
+    LiveRerun { replaced: Vec<usize>, errors: usize },
     /// The worker disconnected without a terminal `Done` (panic / editor race).
     Disconnected,
 }
@@ -336,24 +629,118 @@ pub fn drain(
     progress: &mut Option<RunProgress>,
 ) -> Drained {
     let mut outcome = Drained::Idle;
+    // The run's end, if it came this call. It outranks whatever a side re-run
+    // reports in the same call: the caller's end-of-run bookkeeping (resetting
+    // a drill-down opened on the live grid's numbering, the run's status) must
+    // not be skipped because a re-run happened to land beside it.
+    let mut run_done: Option<Drained> = None;
     loop {
         match handle.rx.try_recv() {
             Ok(update) => {
                 if let Some(step) = apply(handle, update, result, progress) {
-                    outcome = step;
+                    if matches!(step, Drained::Done { .. }) {
+                        run_done = Some(step);
+                    } else {
+                        outcome = step;
+                    }
                 }
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
-                *progress = None;
                 if !handle.finished {
+                    *progress = None;
                     return Drained::Disconnected;
                 }
                 break;
             }
         }
     }
-    outcome
+    let mut i = 0;
+    while i < handle.side.len() {
+        match handle.side[i].rx.try_recv() {
+            Ok(RunUpdate::LiveRerun(fresh)) => {
+                let side = handle.side.remove(i);
+                if let Some(step) = land_live_rerun(handle, side, *fresh, result, progress) {
+                    outcome = step;
+                }
+            }
+            Ok(_) | Err(TryRecvError::Empty) => i += 1,
+            // The worker died without answering: put its rows back as they were.
+            // Once the run is over its marks name live-grid rows, a numbering the
+            // finished grid doesn't share, so the progress is rebuilt instead.
+            Err(TryRecvError::Disconnected) => {
+                let side = handle.side.remove(i);
+                if handle.finished {
+                    *progress = result
+                        .as_ref()
+                        .and_then(|res| progress_after_run(handle, res));
+                } else {
+                    unmark(&side, progress);
+                }
+            }
+        }
+    }
+    run_done.unwrap_or(outcome)
+}
+
+/// Put the rows a side re-run drew as running back to settled.
+fn unmark(side: &SideRerun, progress: &mut Option<RunProgress>) {
+    if let Some(p) = progress.as_mut() {
+        let settled = if p.rerun {
+            RowState::Idle
+        } else {
+            RowState::Finished
+        };
+        for &r in &side.marked {
+            if p.states.get(r) == Some(&RowState::Running) {
+                p.states[r] = settled;
+            }
+        }
+    }
+}
+
+/// The progress to show once the run is over but row re-runs started during
+/// it are still out: those rows running, the rest settled.
+fn progress_after_run(handle: &RunHandle, res: &ReportResult) -> Option<RunProgress> {
+    if handle.side.is_empty() {
+        return None;
+    }
+    let refs: Vec<_> = handle.side.iter().flat_map(|s| s.refs.clone()).collect();
+    let rows = crate::report::rerun::rows_after_finalize(&refs, res);
+    Some(RunProgress::rerun(res.rows.len(), &rows))
+}
+
+/// Fold a landed side re-run in: into the live grid while the run is going
+/// (holding its finished rows for the run's end), straight into the finished
+/// result once the run is over.
+fn land_live_rerun(
+    handle: &mut RunHandle,
+    side: SideRerun,
+    fresh: crate::report::rerun::LiveRerun,
+    result: &mut Option<ReportResult>,
+    progress: &mut Option<RunProgress>,
+) -> Option<Drained> {
+    if side.cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let res = result.as_mut()?;
+    let errors_in = |res: &ReportResult, rows: &[usize]| -> usize {
+        rows.iter()
+            .map(|&r| res.rows[r].errors.len() + res.baseline_errors.get(&r).map_or(0, Vec::len))
+            .sum()
+    };
+    if res.finalized {
+        let rows = crate::report::rerun::rows_after_finalize(&side.refs, res);
+        let replaced = crate::report::rerun::splice(res, &fresh.finished, &rows);
+        let errors = errors_in(res, &replaced);
+        *progress = progress_after_run(handle, res);
+        return Some(Drained::Rerun { replaced, errors });
+    }
+    let replaced = crate::report::rerun::splice_live(res, &fresh.raw);
+    let errors = errors_in(res, &replaced);
+    unmark(&side, progress);
+    handle.held.push((side.refs, fresh.finished));
+    Some(Drained::LiveRerun { replaced, errors })
 }
 
 /// Fold one update into the grid state (see [`drain`]).
@@ -387,6 +774,7 @@ fn apply(
                 index,
                 done: 0,
                 total,
+                rerun: false,
             });
             Some(Drained::Progress { done: 0, total })
         }
@@ -434,10 +822,44 @@ fn apply(
                     errors: result.as_ref().map(|r| r.errors.len()).unwrap_or(0),
                 });
             }
+            let mut finalized = finalized;
+            // The run's result was made from the rows re-run during it; put
+            // their fresh answers back in.
+            for (refs, fresh) in std::mem::take(&mut handle.held) {
+                let rows = crate::report::rerun::rows_after_finalize(&refs, &finalized);
+                crate::report::rerun::splice(&mut finalized, &fresh, &rows);
+            }
             let rows = finalized.rows.len();
             let errors = finalized.errors.len();
+            *progress = progress_after_run(handle, &finalized);
             *result = Some(finalized);
             Some(Drained::Done { rows, errors })
+        }
+        // Side re-runs answer on their own channels (see `drain`).
+        RunUpdate::LiveRerun(_) => None,
+        RunUpdate::Rerun { rows, fresh } => {
+            handle.finished = true;
+            *progress = None;
+            if cancelled {
+                return Some(Drained::Rerun {
+                    replaced: Vec::new(),
+                    errors: 0,
+                });
+            }
+            let Some(res) = result.as_mut() else {
+                return Some(Drained::Rerun {
+                    replaced: Vec::new(),
+                    errors: 0,
+                });
+            };
+            let replaced = crate::report::rerun::splice(res, &fresh, &rows);
+            let errors = replaced
+                .iter()
+                .map(|&r| {
+                    res.rows[r].errors.len() + res.baseline_errors.get(&r).map_or(0, Vec::len)
+                })
+                .sum();
+            Some(Drained::Rerun { replaced, errors })
         }
     }
 }
@@ -508,6 +930,7 @@ mod tests {
             index: Default::default(),
             done: 0,
             total: 2,
+            rerun: false,
         });
 
         let mut finalized = ReportResult::default();
@@ -555,5 +978,213 @@ mod tests {
             Some("")
         );
         assert!(handle.finished());
+    }
+
+    fn side(key: &str, role: crate::report::model::RowRole, path: usize, v: &str) -> ReportRow {
+        ReportRow {
+            key: vec![key.to_string()],
+            role,
+            comparison: Some("c".to_string()),
+            path: vec![(0, 0), (1, path)],
+            cells: [("v".to_string(), v.to_string())].into_iter().collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A row re-run mid-run replaces both raw sides in the live grid at once,
+    /// and its answer survives the run's own result, which was made from the
+    /// rows it replaced.
+    #[test]
+    fn a_live_rerun_lands_now_and_outlives_the_runs_own_result() {
+        use crate::report::model::RowRole::{Baseline, Candidate};
+        use crate::report::rerun::{LiveRerun, RowRef};
+        let (mut handle, main) = test_handle();
+        let live = ReportResult {
+            rows: vec![
+                side("a", Baseline, 0, "old"),
+                side("a", Candidate, 1, "old"),
+            ],
+            ..Default::default()
+        };
+        let mut result = Some(live.clone());
+        let mut progress = Some(RunProgress {
+            states: vec![RowState::Running, RowState::Running],
+            index: Default::default(),
+            done: 2,
+            total: 2,
+            rerun: false,
+        });
+        let tx = handle.side_for_test(vec![RowRef::of(&live.rows[1])], vec![0, 1]);
+        assert!(!handle.finished(), "a re-run is out");
+
+        let finished_row = side("a", Candidate, 1, "new");
+        tx.send(RunUpdate::LiveRerun(Box::new(LiveRerun {
+            raw: ReportResult {
+                rows: vec![
+                    side("a", Baseline, 0, "new"),
+                    side("a", Candidate, 1, "new"),
+                ],
+                ..Default::default()
+            },
+            finished: ReportResult {
+                rows: vec![finished_row],
+                finalized: true,
+                ..Default::default()
+            },
+        })))
+        .unwrap();
+        assert!(matches!(
+            drain(&mut handle, &mut result, &mut progress),
+            Drained::LiveRerun { ref replaced, .. } if replaced.len() == 2
+        ));
+        let res = result.as_ref().unwrap();
+        assert!(res.rows.iter().all(|r| r.cells["v"] == "new"));
+        assert_eq!(
+            progress.as_ref().unwrap().states,
+            vec![RowState::Finished, RowState::Finished]
+        );
+
+        // The run finishes with a result made from the old rows.
+        main.send(RunUpdate::Done(ReportResult {
+            rows: vec![side("a", Candidate, 1, "old")],
+            finalized: true,
+            ..Default::default()
+        }))
+        .unwrap();
+        drain(&mut handle, &mut result, &mut progress);
+        assert_eq!(result.as_ref().unwrap().rows[0].cells["v"], "new");
+        assert!(handle.finished());
+        assert!(progress.is_none());
+    }
+
+    /// A re-run that outlasts the run lands straight in the finished result,
+    /// and the run counts as over only once it has.
+    #[test]
+    fn a_live_rerun_landing_after_the_run_goes_into_the_finished_result() {
+        use crate::report::model::RowRole::{Baseline, Candidate};
+        use crate::report::rerun::{LiveRerun, RowRef};
+        let (mut handle, main) = test_handle();
+        let live = ReportResult {
+            rows: vec![
+                side("a", Baseline, 0, "old"),
+                side("a", Candidate, 1, "old"),
+            ],
+            ..Default::default()
+        };
+        let mut result = Some(live.clone());
+        let mut progress = None;
+        let tx = handle.side_for_test(vec![RowRef::of(&live.rows[0])], vec![0, 1]);
+        main.send(RunUpdate::Done(ReportResult {
+            rows: vec![side("a", Candidate, 1, "old")],
+            finalized: true,
+            ..Default::default()
+        }))
+        .unwrap();
+        drain(&mut handle, &mut result, &mut progress);
+        assert!(!handle.finished(), "the re-run is still out");
+        assert_eq!(
+            progress.as_ref().map(|p| p.states.clone()),
+            Some(vec![RowState::Running]),
+            "the baseline's re-run shows on the row it was folded into"
+        );
+
+        tx.send(RunUpdate::LiveRerun(Box::new(LiveRerun {
+            raw: ReportResult::default(),
+            finished: ReportResult {
+                rows: vec![side("a", Candidate, 1, "new")],
+                finalized: true,
+                ..Default::default()
+            },
+        })))
+        .unwrap();
+        assert!(matches!(
+            drain(&mut handle, &mut result, &mut progress),
+            Drained::Rerun { ref replaced, .. } if *replaced == vec![0]
+        ));
+        assert_eq!(result.as_ref().unwrap().rows[0].cells["v"], "new");
+        assert!(handle.finished());
+        assert!(progress.is_none());
+    }
+
+    /// The run's end and a side re-run read in the same drain: the drain
+    /// reports the end (the caller has bookkeeping to do for it), and the
+    /// re-run's answer still lands.
+    #[test]
+    fn a_runs_end_is_not_hidden_by_a_rerun_landing_beside_it() {
+        use crate::report::model::RowRole::{Baseline, Candidate};
+        use crate::report::rerun::{LiveRerun, RowRef};
+        let (mut handle, main) = test_handle();
+        let live = ReportResult {
+            rows: vec![
+                side("a", Baseline, 0, "old"),
+                side("a", Candidate, 1, "old"),
+            ],
+            ..Default::default()
+        };
+        let mut result = Some(live.clone());
+        let mut progress = None;
+        let tx = handle.side_for_test(vec![RowRef::of(&live.rows[1])], vec![0, 1]);
+        main.send(RunUpdate::Done(ReportResult {
+            rows: vec![side("a", Candidate, 1, "old")],
+            finalized: true,
+            ..Default::default()
+        }))
+        .unwrap();
+        tx.send(RunUpdate::LiveRerun(Box::new(LiveRerun {
+            raw: ReportResult::default(),
+            finished: ReportResult {
+                rows: vec![side("a", Candidate, 1, "new")],
+                finalized: true,
+                ..Default::default()
+            },
+        })))
+        .unwrap();
+        assert!(matches!(
+            drain(&mut handle, &mut result, &mut progress),
+            Drained::Done { .. }
+        ));
+        assert_eq!(result.as_ref().unwrap().rows[0].cells["v"], "new");
+        assert!(handle.finished());
+    }
+
+    /// A row re-run's answer goes into the row it was asked for, and the grid
+    /// around it is left as it was — rows, progress and all.
+    #[test]
+    fn a_rerun_splices_its_row_into_the_finished_grid() {
+        let (mut handle, tx) = test_handle();
+        let finished = ReportResult {
+            column_order: vec!["status".to_string()],
+            rows: vec![row(vec![(0, 0)], "200"), row(vec![(0, 1)], "503")],
+            ..Default::default()
+        };
+        let mut result = Some(finished);
+        let mut progress = Some(RunProgress::rerun(2, &[1]));
+        assert_eq!(
+            progress.as_ref().unwrap().states,
+            vec![RowState::Idle, RowState::Running]
+        );
+
+        let fresh = ReportResult {
+            rows: vec![row(vec![(0, 1)], "200")],
+            ..Default::default()
+        };
+        tx.send(RunUpdate::Rerun {
+            rows: vec![1],
+            fresh,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            drain(&mut handle, &mut result, &mut progress),
+            Drained::Rerun { ref replaced, errors: 0 } if *replaced == vec![1]
+        ));
+        assert!(progress.is_none());
+        assert!(handle.finished());
+        let res = result.as_ref().unwrap();
+        assert_eq!(res.rows.len(), 2);
+        assert_eq!(
+            res.rows[1].cells.get("status").map(String::as_str),
+            Some("200")
+        );
     }
 }

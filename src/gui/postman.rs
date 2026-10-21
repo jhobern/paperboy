@@ -510,9 +510,12 @@ fn draw_connect(
                 .selected_text(w.key_source.source_label(s))
                 .show_ui(ui, |ui| {
                     for src in KeySource::ALL {
-                        if ui
-                            .selectable_label(src == w.key_source, src.source_label(s))
-                            .clicked()
+                        if super::widgets::selectable_row(
+                            ui,
+                            src == w.key_source,
+                            src.source_label(s),
+                        )
+                        .clicked()
                         {
                             w.key_source = src;
                         }
@@ -663,7 +666,7 @@ fn draw_pick_workspace(
                 };
                 let row = ui.horizontal(|ui| {
                     let label = format!("{chev} {} {name}", super::icons::FOLDER);
-                    let hit = ui.selectable_label(selected == i, label);
+                    let hit = super::widgets::selectable_row(ui, selected == i, label);
                     // The spinner sits *after* the row so it can't shift the
                     // name sideways when it appears and vanishes.
                     if busy {
@@ -941,13 +944,15 @@ fn draw_preview_list(
                     // Only one fetch runs at a time, so the rest go quiet
                     // rather than queueing calls the user can't see.
                     let can = is_open || pending.is_none();
-                    let hit = ui.add_enabled(
-                        can,
-                        egui::Button::selectable(
-                            is_open,
-                            egui::RichText::new(label).color(colors.text),
-                        ),
-                    );
+                    let hit = ui
+                        .add_enabled_ui(can, |ui| {
+                            super::widgets::selectable_row(
+                                ui,
+                                is_open,
+                                egui::RichText::new(label).color(colors.text),
+                            )
+                        })
+                        .inner;
                     if busy {
                         ui.spinner();
                     }

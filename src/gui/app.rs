@@ -105,7 +105,10 @@ pub enum Dialog {
     /// dropdown appeared to do nothing. Here the format and the name are the
     /// same decision, sat next to each other, and changing one rewrites the
     /// other. The native picker is still a Browse… away.
-    ExportResults { path: String },
+    /// `replace` is set once Export was pressed on a name that already exists:
+    /// the dialog then says so and its button replaces the file — a second,
+    /// deliberate press — until the name is changed.
+    ExportResults { path: String, replace: bool },
     /// A restored Workspace tab's downloaded folder has vanished since the
     /// last session (typically `/tmp` swept between restarts). Offers to
     /// redownload it, pinned to the exact commit it recorded.
@@ -183,8 +186,6 @@ pub enum SaveKind {
     /// Save the Global Environment with this id to a `.vars` file.
     Environment(u64),
     Response,
-    /// Export the open report editor's last run results (format by extension).
-    ReportResults,
     /// Save the open report editor's last run as a `.baseline` snapshot, for a
     /// later run to diff against via `BASELINE(FILE(…))`.
     ReportBaseline,
@@ -1589,7 +1590,13 @@ impl GuiApp {
         dir: Option<&std::path::Path>,
         action: super::menu::PickAction,
     ) {
+        // One chooser at a time. Saying so beats doing nothing: a chooser
+        // can open behind the window, and a button that silently stops working
+        // reads as a broken one.
         if self.pending_pick.is_some() {
+            self.session.status = Some(crate::i18n::Status::Error(
+                self.strings.gui_picker_already_open.to_string(),
+            ));
             return;
         }
         // A caller's own seed wins — it knows the field's current value, or the

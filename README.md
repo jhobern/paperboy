@@ -318,6 +318,7 @@ Press `?` or `F1` for the full, current key list. The essentials:
 | `[` / `]`, `PageUp`/`PageDown` | Previous / next tab |
 | `Ctrl+Shift+←`/`→` | Reorder the active tab |
 | `x` / `u` | Delete / undo — requests, tabs and environments each keep their own undo stack |
+| `o` / `x` (report results) | Sort by the cursor's column / re-run the cursor's row — see [Reading a report's results](#reading-a-reports-results) |
 | `/` | Find a request anywhere in the collection (whole tree on a Workspace tab) |
 | `Alt+↑`/`↓` | Reorder requests — the order `Alt+F5` and the CLI follow |
 | `m` / `c` | Move / copy a request to another collection in the workspace |
@@ -467,6 +468,45 @@ for X11) if they aren't already there, and never touches them again — so you
 can customise them. The shell may need a rescan (log out, or restart it) to
 notice. Delete both and relaunch to regenerate, which is also how you refresh
 `Exec=` after moving the binary.
+
+## Reading a report's results
+
+A finished — or a still-running — report shows its rows in a **Results** grid,
+with a filter bar, a summary and, for a ground-truthed report, a confusion
+matrix. Both front-ends behave the same way:
+
+- **Sorting is by column.** Click a header in the GUI, or press `o` on a column
+  in the terminal UI: ascending, then descending, then back to run order.
+  Numbers sort as numbers, text naturally (`img2` before `img10`), and empty
+  cells always sink to the bottom. It works mid-run too — rows still on their
+  way have nothing to sort by, so they wait at the bottom. Sorting is a view:
+  exports keep the run's order.
+- **A single row can be re-run**, which is what a transient failure asks for —
+  a dropped connection, a momentary 503 — where re-running the whole report is
+  the only other fix, and where in a comparison the bad row reads as a
+  regression that never happened. Right-click the row and choose **Re-run this
+  row** in the GUI, or press `x` on it in the terminal UI. Only that row's loop
+  iterations go again (both sides of a comparison row), with the parameters the
+  result was run with, and the fresh answer replaces the old one in place —
+  `Result`, `Correct`, `Trend`, the statistics footer and the error list
+  included. A re-run uses the report *as it was when the result was produced*,
+  so editing the script afterwards doesn't strand the result. During a run, a
+  row that has already come back re-runs straight away beside the run; while a
+  re-run is going, further rows are queued (↻) and go as the next batch.
+- **Stopping a run keeps everything that came back** — rows, summary, matrix,
+  filters and sorting — and the run can be **resumed**: the **Resume** button
+  beside Run in the GUI, or `r` on the stopped run in the terminal UI (`y`
+  resumes, `n` starts again from scratch). Resuming runs only the rows that
+  hadn't come back, into their places, and finishes the report as a whole run
+  would. A stopped run's partial rows can't be re-run individually; resume it
+  instead.
+- **Filters and metrics are live.** Differences, Correct, Incorrect,
+  Regressions, Improvements and the confusion-matrix cells (`/` in the terminal
+  UI) all select from the rows that have come back, judged as the finished
+  report will judge them. Accuracy, Fixed/Regressed and every matrix cell are
+  there from the first frame and fill in as rows arrive. A case with only one
+  side back yet isn't counted as a difference — it has its own **Waiting for
+  pair** filter while the run goes.
 
 ## Environments and secrets
 

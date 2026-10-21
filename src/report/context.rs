@@ -470,6 +470,16 @@ pub fn diagnostics_fingerprint(
     h.finish()
 }
 
+/// The directory a run of `flow` resolves relative paths against — producer
+/// globs, `FILE(…)` roles, a `# baseline:` snapshot: `# root:` if the report
+/// sets one, else the report file's own directory.
+pub fn run_root(flow: &ReportFlow, report_path: Option<&Path>) -> Option<PathBuf> {
+    match flow.header.root() {
+        Some(r) if !r.trim().is_empty() => Some(resolve_ref_path(report_path, r)),
+        _ => report_path.and_then(|p| p.parent()).map(Path::to_path_buf),
+    }
+}
+
 /// Assemble the fully-owned [`ReportRunInputs`] for `flow` (bound to a loaded
 /// collection). `Err` with a user-facing key when the flow isn't bound to a
 /// loaded collection. Mirrors the terminal UI's `build_report_run_inputs`.
@@ -516,13 +526,7 @@ pub fn report_run_inputs(
         .iter()
         .map(|e| (e.name.clone(), flatten_env(e)))
         .collect();
-    // Relative producer paths resolve against `# root:` if set, else the report
-    // file's own directory.
-    let report_dir = report_path.and_then(|p| p.parent()).map(Path::to_path_buf);
-    let root = match flow.header.root() {
-        Some(r) if !r.trim().is_empty() => Some(resolve_ref_path(report_path, r)),
-        _ => report_dir,
-    };
+    let root = run_root(flow, report_path);
     // The live runner is rooted at the bound collection's directory so relative
     // form-file paths in its requests resolve as they would by hand.
     let collection_path: Option<PathBuf> = match ci {

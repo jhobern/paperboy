@@ -1294,12 +1294,18 @@ fn draw_save(
             // tag is never overwritten — so it is a visible toggle rather than
             // something inferred from the name.
             ui.horizontal(|ui| {
-                ui.selectable_value(
+                super::widgets::selectable_value(
+                    ui,
                     &mut flow.target_kind,
                     SaveTargetKind::Branch,
                     s.gui_git_branches,
                 );
-                ui.selectable_value(&mut flow.target_kind, SaveTargetKind::Tag, s.gui_git_tags);
+                super::widgets::selectable_value(
+                    ui,
+                    &mut flow.target_kind,
+                    SaveTargetKind::Tag,
+                    s.gui_git_tags,
+                );
             });
             ui.add_space(4.0);
             ui.colored_label(
@@ -1324,8 +1330,7 @@ fn draw_save(
                     .selected_text(s.gui_git_existing_branch)
                     .show_ui(ui, |ui| {
                         for (i, branch) in branches.iter().enumerate() {
-                            if ui
-                                .selectable_label(save.selected_branch == i, branch)
+                            if super::widgets::selectable_row(ui, save.selected_branch == i, branch)
                                 .clicked()
                             {
                                 save.selected_branch = i;

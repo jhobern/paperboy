@@ -788,6 +788,9 @@ pub(crate) enum ConfirmAction {
     /// active report tab. Raised only when [`ReportTab::results_exported`] is
     /// false and no run is in flight (#2).
     RerunReport,
+    /// `r` on a stopped run: Yes resumes it from where it stopped, `n` starts
+    /// again from scratch, Esc does neither.
+    ResumeReport,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1415,6 +1418,10 @@ pub struct TuiApp {
     /// [`Self::poll_report_run_updates`]. A report runs on its own thread so the
     /// whole app stays responsive during a long run.
     pub(crate) pending_report_runs: Vec<(u64, Receiver<crate::tui::reports::ReportRunUpdate>)>,
+    /// Row re-runs started while their report's run was still going, each on
+    /// a thread of its own. Kept apart from [`Self::pending_report_runs`]: a
+    /// re-run finishing must not read as the run itself finishing.
+    pub(crate) live_reruns: Vec<crate::tui::reports::LiveRerunInFlight>,
     /// Cancel flags for the reports currently running, keyed by report id (a
     /// process-unique identity that survives tab reordering). The background
     /// worker's runner checks this between requests and short-circuits when it
@@ -1647,6 +1654,7 @@ impl Default for TuiApp {
             help_query: String::new(),
             quit: false,
             pending_report_runs: Vec::new(),
+            live_reruns: Vec::new(),
             running_reports: std::collections::HashMap::new(),
             new_report_seed_dir: None,
             browser_origin_dir: None,

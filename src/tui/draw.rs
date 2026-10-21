@@ -5265,6 +5265,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         .replace("{n}", &n.to_string())
                 }
                 ConfirmAction::RerunReport => s.confirm_rerun_report_q.to_string(),
+                ConfirmAction::ResumeReport => s.confirm_resume_q.to_string(),
             };
             draw_confirm_popup(
                 f,
@@ -5476,6 +5477,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("^↑ / ^↓ (grid)", s.help_report_grid_page),
                             ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
                             ("/ (report)", s.help_report_filter),
+                            ("o (grid)", s.help_report_sort),
+                            ("x (grid)", s.help_report_rerun_row),
                             ("Ctrl+E (report)", s.help_report_export),
                             ("Ctrl+O (report)", s.help_report_open_export),
                             ("B (report)", s.help_report_baseline),

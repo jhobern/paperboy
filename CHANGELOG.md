@@ -8,6 +8,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.7.1] - 2026-10-21
+
+### Added
+
+- **Re-run a single row of a finished report.** A transient failure — a dropped
+  connection, a momentary 503 — used to leave one row wrong, and in a comparison
+  it read as a regression or an improvement that never happened; the only fix
+  was to re-run everything. Right-click a row in the GUI results grid and choose
+  **Re-run this row**, or press **`x`** on it in the terminal UI. Only that
+  row's loop iterations are sent again (both sides of a comparison row), with
+  the parameters the result was run with, and the fresh answer replaces the old
+  one in place — `Result`, `Correct`, `Trend`, the statistics footer and the
+  error list included. The re-run uses the report as it was when the result
+  was produced, so editing the script afterwards doesn't strand the result.
+  **While a run is going**, a row that has already come back re-runs straight
+  away, beside the run, and its fresh answer replaces both sides in the grid as
+  soon as it lands — and survives the run's own result. While a *re-run* is
+  going, further rows are queued (↻) and go as the next batch the moment it
+  lands. A row filter that re-runs leave selecting nothing
+  switches back to All. Not offered on a stopped run's partial grid.
+- **The filter buttons are there from the start.** They used to appear one by
+  one as rows turned up that matched them, shuffling the bar mid-run. A report
+  now offers every filter it *can* answer from the first frame — Differences
+  for a comparison, Incorrect for a ground-truthed report, Regressions and
+  Improvements for both — even while one selects nothing yet (an empty
+  Regressions on a scored comparison means "none"). The GUI always shows the
+  bar, All at least; Waiting for pair sits last and is the only button that
+  goes, when the run ends. The HTML export follows the same rule.
+- **Stopping a run keeps everything that came back, and the run can be
+  resumed.** A stopped run used to lose its summary, confusion matrix and
+  filters, and stopping with a filter selected could leave an empty grid with
+  no way back. Now the grid stays exactly as it was — rows, summary, matrix,
+  filters and sorting all still work, and the grid goes back to All. **Resume**
+  (a button beside Run in the GUI; `r` on a stopped run in the terminal UI,
+  which asks: `y` resumes, `n` starts again from scratch) runs only the rows
+  that hadn't come back, into their places, and finishes the report as a whole
+  run would. Exporting a stopped run writes the pairs that came back, compared
+  and scored, marked as covering part of the run.
+- **Filters work while a run is going.** Differences, Incorrect,
+  Regressions, Improvements and the confusion-matrix cells (and `/` in the
+  terminal UI) pick from the rows that have come back, judged as the finished
+  report will judge them; each case shows as both of its raw rows. A case with
+  only one side back yet is not counted as a difference — it has its own
+  **Waiting for pair** filter while the run goes. A filter picked mid-run
+  carries over when the run finishes, unless the finished report has no rows
+  for it.
+- **Accuracy, Fixed/Regressed and the confusion matrix fill in while a run is
+  going.** They used to appear only when the run finished. They are there from
+  the first frame — every count, and every confusion-matrix cell, at 0 — and
+  fill in as rows come back. Each baseline and
+  comparison pair that has come back is now merged and scored as the finished
+  report will score it, so a run's verdict on the comparison builds up live
+  (GUI cards and matrices, the terminal UI's pinned summary). A baseline whose
+  comparison row is still on its way isn't counted, so its answers can't stand
+  in for the comparison's.
+- **A Correct filter, and Correct/Incorrect cards that filter (GUI).** A
+  ground-truthed report gets a **Correct** filter beside Incorrect, and a
+  Correct count card beside the Incorrect one. Clicking either card selects
+  its filter, the same rows its count is of (on the overall row, and on a
+  column's own row when it is the only scored column); clicking it again
+  shows every row.
+- **Click a "Fixed" or "Regressed" card to see those rows (GUI).** The
+  movement cards above a ground-truthed comparison now filter the grid to the
+  rows they count, as confusion-matrix cells already did; clicking the
+  selected card again shows every row.
+- **Sort the results grid by any column.** Click a column header in the GUI, or
+  press **`o`** on a column in the terminal UI: ascending, descending, then back
+  to run order. Numbers sort numerically, text naturally (`img2` before
+  `img10`), and empty cells always sink to the bottom. Works while a run is
+  going too — rows still on their way wait at the bottom. View-only — exports
+  keep the run's order.
+
+### Changed
+
+- **The GUI results grid keeps its column headers pinned** while the rows
+  scroll under them (they still follow the rows sideways), and the hint line
+  above the grid is gone — the cell, row and header interactions it described
+  have tooltips of their own.
+- **The results grid no longer shifts sideways during a run** (GUI and
+  terminal UI). The
+  drill-down caret column is reserved from the start for a report with
+  `DETAIL` or `IMAGE` columns in the GUI (it used to appear with the first row
+  that had something to show), and in both front-ends the status column stays
+  in place after the run instead of disappearing when it finishes.
+
+### Fixed
+
+- **The GUI's Export dialog and its Browse… disagreed about where the file
+  goes.** Export wrote to the path in the dialog — for a report with no folder
+  of its own, a bare name resolved against wherever PaperBoy was started — while
+  Browse… opened on a different folder. The dialog now always holds a full
+  path and says "Saved in: <folder>" under it, Browse… opens on that folder and
+  file name, and cancelling Browse… returns to the dialog instead of closing
+  it. A report with no folder of its own now defaults to the folder last
+  browsed to.
+- **A file chooser that didn't open said nothing.** Asking for one while
+  another is still open (it may be behind the window) now says so in the
+  status bar instead of silently doing nothing.
+- **Exporting results could silently overwrite a file.** The GUI's Export
+  dialog and the terminal UI's export both wrote straight over an existing
+  file. Now the GUI says the file exists and turns Export into **Replace**
+  (changing the name drops the warning), and the terminal UI asks to confirm
+  the overwrite, as Save As already did. Saving a baseline snapshot asks the
+  same way in the terminal UI.
+- **Toggles and list rows across the GUI no longer shift when hovered or
+  picked** — the results filter bar, the environment source filter, the node
+  wizards' option switches, drop-down lists and the rest. egui outlines such a
+  control only when hovered or selected, and with the theme's border that
+  outline made it grow by a pixel each side, shoving its neighbours along under
+  the pointer. Every one of them now keeps the same footprint in every state.
+- **The drill-down did nothing while a report was running (GUI).** Clicking a
+  row's caret mid-run now opens its panel, as it does once the run is over.
+- **A row still waiting on its requests hid columns that were already
+  known.** Since 0.7.0 a pending row shows a placeholder in place of anything
+  the dry pass made up, which also swallowed columns the dry pass gets exactly
+  right: `REPORT FILE AS Document`, `REPORT "{{DIR}}/{{FILE}}" AS Path`. A
+  column built only from loop variables, parameters, environment values and
+  assignments of those is now shown on a pending row as it will be; anything a
+  response feeds — directly, through a capture or `[Gen]` value, or through an
+  assignment of one — still shows the placeholder.
+- **Live `STATISTICS` in a comparison mixed the baseline into the figure.**
+  While a run with `ENVS BASELINE(…), COMPARISON(…)` streamed, the grid holds
+  each case once per side, and the footer averaged (summed, counted…) both
+  sides together — a number that described neither, and that jumped when the
+  run finished. The footer now leaves out every baseline row that has a
+  comparison row beside it, so the live figure is the one the finished report
+  shows. Applies to the GUI and the terminal UI alike.
+
+
 ## [0.7.0] - 2026-09-30
 
 ### Added
