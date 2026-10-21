@@ -40,8 +40,12 @@ impl RowFacts {
             // listing. `no baseline`/`no candidate` count as differences: a row
             // that exists on only one side is exactly what a reader scanning
             // for changes needs to see.
-            differs: cell(super::compare::RESULT_COLUMN)
-                .is_some_and(|v| !v.trim().is_empty() && v != super::compare::MATCH),
+            // A live case still waiting on its other side isn't one either.
+            differs: cell(super::compare::RESULT_COLUMN).is_some_and(|v| {
+                !v.trim().is_empty()
+                    && v != super::compare::MATCH
+                    && v != super::compare::WAITING_BASELINE
+            }),
             verdict: cell(super::compare::CORRECT_COLUMN).and_then(|v| match v {
                 v if v == Verdict::Correct.as_str() => Some(Verdict::Correct),
                 v if v == Verdict::Incorrect.as_str() => Some(Verdict::Incorrect),
@@ -76,6 +80,9 @@ pub enum RowFilter {
     All,
     /// Rows the comparison found a difference on.
     Differ,
+    /// Rows whose ground-truth roll-up is `correct` — the other half of the
+    /// `Correct` column, so its count card has rows to show.
+    Correct,
     /// Rows whose ground-truth roll-up is `incorrect`. Untested rows are *not*
     /// included: "wrong" and "unchecked" are different problems, and merging
     /// them is how an unlabelled corpus comes to look like a broken engine.
@@ -88,6 +95,11 @@ pub enum RowFilter {
     /// two" is a different story from "we broke two", and only offering the
     /// regressions made the second the only one the grid could tell.
     Fixed,
+    /// While a run is going: rows that have come back whose comparison pair
+    /// hasn't — one side landed, the other still on its way. Only ever offered
+    /// for a live grid (see [`waiting_rows`]); a finished report has nothing
+    /// waiting, so it selects nothing there.
+    Waiting,
     /// One cell of a confusion matrix: rows where `column`'s ground truth is
     /// the `truth` class and its answer is the `answer` class. This is what
     /// makes the matrix clickable — "which 7 rows are those?" is the first
@@ -110,32 +122,48 @@ impl RowFilter {
         match self {
             RowFilter::All => "All".to_string(),
             RowFilter::Differ => "Differences".to_string(),
+            RowFilter::Correct => "Correct".to_string(),
             RowFilter::Incorrect => "Incorrect".to_string(),
             RowFilter::Regressed => "Regressions".to_string(),
             RowFilter::Fixed => "Improvements".to_string(),
+            RowFilter::Waiting => "Waiting".to_string(),
             RowFilter::MatrixCell { truth, answer, .. } => format!("{truth} → {answer}"),
         }
     }
 
     /// The filters worth offering for `result`, in the order they should be
-    /// shown. A filter that could only ever select nothing is left out: an
-    /// always-empty "Regressions" button on a report with no ground truth
-    /// invites the reader to conclude there are none.
+    /// shown.
+    ///
+    /// A filter is offered when the report *can* answer it — it carries the
+    /// reserved column the filter reads (`Result`, `Correct`, `Trend`) — not
+    /// only once a row does: buttons that turned up one by one as a run went
+    /// on shuffled the bar under the pointer, and an empty Regressions button
+    /// on a scored comparison says something true ("none"). A filter that
+    /// could only ever select nothing is still left out: no Regressions button
+    /// on a report with no ground truth, inviting the reader to conclude there
+    /// are none. A row that answers a filter without the column (a hand-built
+    /// result) still brings its button.
     pub fn available(result: &ReportResult) -> Vec<RowFilter> {
+        let has = |c: &str| result.column_order.iter().any(|k| k == c);
         let mut out = vec![RowFilter::All];
         let facts: Vec<RowFacts> = (0..result.rows.len())
             .map(|r| RowFacts::of(result, r))
             .collect();
-        if facts.iter().any(|f| f.differs) {
+        if has(super::compare::RESULT_COLUMN) || facts.iter().any(|f| f.differs) {
             out.push(RowFilter::Differ);
         }
-        if facts.iter().any(|f| f.verdict == Some(Verdict::Incorrect)) {
+        let scored = has(super::compare::CORRECT_COLUMN);
+        if scored || facts.iter().any(|f| f.verdict == Some(Verdict::Correct)) {
+            out.push(RowFilter::Correct);
+        }
+        if scored || facts.iter().any(|f| f.verdict == Some(Verdict::Incorrect)) {
             out.push(RowFilter::Incorrect);
         }
-        if facts.iter().any(|f| f.trend == Some(Trend::Regressed)) {
+        let trended = has(super::compare::TREND_COLUMN);
+        if trended || facts.iter().any(|f| f.trend == Some(Trend::Regressed)) {
             out.push(RowFilter::Regressed);
         }
-        if facts.iter().any(|f| f.trend == Some(Trend::Fixed)) {
+        if trended || facts.iter().any(|f| f.trend == Some(Trend::Fixed)) {
             out.push(RowFilter::Fixed);
         }
         out
@@ -152,9 +180,11 @@ impl RowFilter {
         match self {
             RowFilter::All => true,
             RowFilter::Differ => RowFacts::of(result, r).differs,
+            RowFilter::Correct => RowFacts::of(result, r).verdict == Some(Verdict::Correct),
             RowFilter::Incorrect => RowFacts::of(result, r).verdict == Some(Verdict::Incorrect),
             RowFilter::Regressed => RowFacts::of(result, r).trend == Some(Trend::Regressed),
             RowFilter::Fixed => RowFacts::of(result, r).trend == Some(Trend::Fixed),
+            RowFilter::Waiting => false,
             RowFilter::MatrixCell {
                 column,
                 truth,
@@ -251,9 +281,235 @@ pub fn visible_rows(
         .collect()
 }
 
+/// The rows of a *live* grid that `filter` and `text` select.
+///
+/// A running report's grid holds its raw rows — a comparison's baseline and
+/// candidate each on a row of their own — while the filters describe the
+/// report those rows will become (see [`crate::report::run::project_live`]).
+/// So the filter is judged on `projected`, and each row it picks is shown as
+/// the raw rows it was made from: the candidate and the baseline it was
+/// measured against, side by side. `All` with no text shows every row,
+/// pending ones included, exactly as an unfiltered live grid does.
+/// The rows of a *live* grid that have come back while the other side of
+/// their comparison pair hasn't — what [`RowFilter::Waiting`] shows.
+pub fn waiting_rows(live: &ReportResult) -> Vec<usize> {
+    use crate::report::model::RowRole;
+    let pending: std::collections::HashSet<(&[String], Option<&str>)> = live
+        .pending
+        .iter()
+        .filter_map(|&r| live.rows.get(r))
+        .filter(|row| matches!(row.role, RowRole::Baseline | RowRole::Candidate))
+        .map(|row| (row.key.as_slice(), row.comparison.as_deref()))
+        .collect();
+    (0..live.rows.len())
+        .filter(|r| !live.pending.contains(r))
+        .filter(|&r| {
+            let row = &live.rows[r];
+            matches!(row.role, RowRole::Baseline | RowRole::Candidate)
+                && pending.contains(&(row.key.as_slice(), row.comparison.as_deref()))
+        })
+        .collect()
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn live_visible_rows(
+    live: &ReportResult,
+    live_columns: &[OutputColumn],
+    projected: &ReportResult,
+    projected_columns: &[OutputColumn],
+    labels: &LabelMap,
+    filter: &RowFilter,
+    text: &str,
+) -> Vec<usize> {
+    if *filter == RowFilter::All && text.trim().is_empty() {
+        return (0..live.rows.len()).collect();
+    }
+    let by_text: std::collections::HashSet<usize> =
+        visible_rows(live, live_columns, labels, &RowFilter::All, text)
+            .into_iter()
+            .collect();
+    if *filter == RowFilter::All {
+        return (0..live.rows.len())
+            .filter(|r| by_text.contains(r))
+            .collect();
+    }
+    if *filter == RowFilter::Waiting {
+        return waiting_rows(live)
+            .into_iter()
+            .filter(|r| by_text.contains(r))
+            .collect();
+    }
+    let picked = visible_rows(projected, projected_columns, labels, filter, "");
+    let paths: std::collections::HashSet<&[(usize, usize)]> = picked
+        .iter()
+        .map(|&r| projected.rows[r].path.as_slice())
+        .collect();
+    let sides: std::collections::HashSet<(&[String], Option<&str>)> = picked
+        .iter()
+        .map(|&r| &projected.rows[r])
+        .filter(|row| row.role == crate::report::model::RowRole::Candidate)
+        .map(|row| (row.key.as_slice(), row.comparison.as_deref()))
+        .collect();
+    (0..live.rows.len())
+        .filter(|r| by_text.contains(r))
+        .filter(|&r| {
+            let row = &live.rows[r];
+            paths.contains(row.path.as_slice())
+                || (row.role == crate::report::model::RowRole::Baseline
+                    && sides.contains(&(row.key.as_slice(), row.comparison.as_deref())))
+        })
+        .collect()
+}
+
+/// Reorder `rows` (indices into `result.rows`) by `column`'s rendered value.
+///
+/// Numbers compare as numbers, so `9` sorts before `10`, and text compares
+/// case-insensitively with any runs of digits inside it taken as numbers, so
+/// `img2.jpg` sorts before `img10.jpg`. In a mixed column the numbers come
+/// first. Empty cells and the no-match marker always sink to the bottom, in
+/// either direction: a missing value is not the smallest or the largest one,
+/// and bunching them at the top would hide the answers being sorted for. The
+/// sort is stable, so ties keep the run's order.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn sort_rows(
+    result: &ReportResult,
+    column: &OutputColumn,
+    descending: bool,
+    rows: &mut [usize],
+) {
+    use std::cmp::Ordering;
+    enum Key {
+        Number(f64),
+        Text(String),
+        Blank,
+    }
+    let key = |r: usize| -> Key {
+        let Some(row) = result.rows.get(r) else {
+            return Key::Blank;
+        };
+        // A row still waiting on its requests sorts by what it shows: the
+        // values settled before the run (its file, its environment), and
+        // otherwise nothing — not the dry pass's made-up `0`s, which would
+        // float every unfinished row to the top of an ascending sort.
+        let v = if result.pending.contains(&r) {
+            column.pending_value(row, "", &result.planned_columns)
+        } else {
+            column.value(row, &result.no_match_marker)
+        };
+        if v.trim().is_empty() || v == result.no_match_marker {
+            Key::Blank
+        } else if let Some(n) = crate::report::writer::parse_report_number(&v) {
+            Key::Number(n)
+        } else {
+            Key::Text(v.to_lowercase())
+        }
+    };
+    let mut keyed: Vec<(Key, usize)> = rows.iter().map(|&r| (key(r), r)).collect();
+    keyed.sort_by(|(a, _), (b, _)| {
+        let ord = match (a, b) {
+            (Key::Blank, Key::Blank) => return Ordering::Equal,
+            (Key::Blank, _) => return Ordering::Greater,
+            (_, Key::Blank) => return Ordering::Less,
+            (Key::Number(x), Key::Number(y)) => x.total_cmp(y),
+            (Key::Number(_), Key::Text(_)) => Ordering::Less,
+            (Key::Text(_), Key::Number(_)) => Ordering::Greater,
+            (Key::Text(x), Key::Text(y)) => natural_cmp(x, y),
+        };
+        if descending { ord.reverse() } else { ord }
+    });
+    for (slot, (_, r)) in rows.iter_mut().zip(keyed) {
+        *slot = r;
+    }
+}
+
+/// Compare two strings with each run of ASCII digits taken as a number.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut a, mut b) = (a, b);
+    loop {
+        match (a.chars().next(), b.chars().next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let da = a.len() - a.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+                let db = b.len() - b.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+                let (na, nb) = (&a[..da], &b[..db]);
+                let (ta, tb) = (na.trim_start_matches('0'), nb.trim_start_matches('0'));
+                let ord = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+                a = &a[da..];
+                b = &b[db..];
+            }
+            (Some(x), Some(y)) => {
+                if x != y {
+                    return x.cmp(&y);
+                }
+                a = &a[x.len_utf8()..];
+                b = &b[y.len_utf8()..];
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_rows_orders_numbers_numerically_and_sinks_blanks() {
+        let result = ReportResult {
+            rows: vec![
+                row(&[("Time", "100")]),
+                row(&[("Time", "")]),
+                row(&[("Time", "9")]),
+                row(&[("Time", "timeout")]),
+                row(&[("Time", "1000")]),
+            ],
+            ..Default::default()
+        };
+        let mut rows: Vec<usize> = (0..5).collect();
+        sort_rows(&result, &col("Time"), false, &mut rows);
+        assert_eq!(rows, vec![2, 0, 4, 3, 1]);
+        sort_rows(&result, &col("Time"), true, &mut rows);
+        assert_eq!(rows, vec![3, 4, 0, 2, 1], "blank still last");
+    }
+
+    /// Mid-run, a row still on its way sorts by what it shows — nothing, here
+    /// — rather than by the dry pass's placeholder `0`.
+    #[test]
+    fn sort_rows_sinks_rows_still_on_their_way() {
+        let mut result = ReportResult {
+            rows: vec![
+                row(&[("Time", "0")]),
+                row(&[("Time", "250")]),
+                row(&[("Time", "120")]),
+            ],
+            ..Default::default()
+        };
+        result.pending.insert(0);
+        let mut rows: Vec<usize> = (0..3).collect();
+        sort_rows(&result, &col("Time"), false, &mut rows);
+        assert_eq!(rows, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn sort_rows_orders_paths_naturally_and_keeps_ties_stable() {
+        let result = ReportResult {
+            rows: vec![
+                row(&[("FILE", "img/img10.jpg")]),
+                row(&[("FILE", "IMG/img2.jpg")]),
+                row(&[("FILE", "img/a.jpg")]),
+                row(&[("FILE", "img/img2.jpg")]),
+            ],
+            ..Default::default()
+        };
+        let mut rows: Vec<usize> = (0..4).collect();
+        sort_rows(&result, &col("FILE"), false, &mut rows);
+        assert_eq!(rows, vec![2, 1, 3, 0]);
+    }
     use crate::report::compare::{CORRECT_COLUMN, MATCH, RESULT_COLUMN, TREND_COLUMN};
     use crate::report::model::ReportRow;
 
@@ -365,6 +621,7 @@ mod tests {
             vec![1, 2, 3],
             "the matched row is not a difference"
         );
+        assert_eq!(pick(RowFilter::Correct), vec![0, 1], "the two right rows");
         assert_eq!(
             pick(RowFilter::Incorrect),
             vec![2, 3],
@@ -469,6 +726,7 @@ mod tests {
             vec![
                 RowFilter::All,
                 RowFilter::Differ,
+                RowFilter::Correct,
                 RowFilter::Incorrect,
                 RowFilter::Regressed,
                 RowFilter::Fixed
@@ -481,11 +739,11 @@ mod tests {
         assert_eq!(RowFilter::available(&plain), vec![RowFilter::All]);
     }
 
-    /// The two halves of "what moved?" are offered on their own terms: a run
-    /// that only fixed things still gets an Improvements button, and isn't
-    /// given a Regressions one to prove empty.
+    /// A scored comparison offers both halves of "what moved?" whatever moved:
+    /// a run that only fixed things still has a Regressions button, reading
+    /// "none", rather than one that turns up the first time something breaks.
     #[test]
-    fn a_run_that_only_fixed_things_is_offered_the_improvements_filter() {
+    fn a_run_that_only_fixed_things_is_offered_both_movement_filters() {
         let mut res = fixture();
         res.rows.remove(2);
         res.trends = [
@@ -501,8 +759,8 @@ mod tests {
             "something came right, so the filter that shows it is there: {offered:?}"
         );
         assert!(
-            !offered.contains(&RowFilter::Regressed),
-            "nothing broke, so there is no button inviting the reader to look: {offered:?}"
+            offered.contains(&RowFilter::Regressed),
+            "nothing broke, and the button says so by showing nothing: {offered:?}"
         );
     }
 

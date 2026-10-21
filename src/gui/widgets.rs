@@ -501,6 +501,23 @@ pub fn selectable_row<'a>(
     response
 }
 
+/// [`selectable_row`] for picking one of several values, as
+/// [`egui::Ui::selectable_value`] does — and with the same steady footprint,
+/// which the egui one (a frameless-until-hovered button) doesn't have.
+pub fn selectable_value<'a, V: PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut V,
+    value: V,
+    atoms: impl egui::IntoAtoms<'a>,
+) -> egui::Response {
+    let mut response = selectable_row(ui, *current == value, atoms);
+    if response.clicked() && *current != value {
+        *current = value;
+        response.mark_changed();
+    }
+    response
+}
+
 /// A panel header: a bold, **truncating** title on the left and right-aligned
 /// action buttons that stay fully visible.
 ///
@@ -1435,7 +1452,7 @@ impl Suggest {
                                         RichText::new(&row.text).monospace().color(theme.computed)
                                     }
                                 };
-                                let hit = ui.add(egui::Button::selectable(k == self.sel, label));
+                                let hit = selectable_row(ui, k == self.sel, label);
                                 // Pointing at a row selects it, as the arrow
                                 // keys do: the note and the preview under the
                                 // list describe *the* highlighted row, and a
@@ -1810,6 +1827,39 @@ pub fn status_color(theme: &GuiTheme, status: u16) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// egui's own `selectable_label` / `selectable_value` are frameless until
+    /// hovered or picked, and this app's theme gives a frame a border — so they
+    /// grow under the pointer and shove their neighbours along. Every toggle in
+    /// the GUI goes through [`selectable_row`], [`selectable_value`] or
+    /// [`selectable`] instead; this keeps a new one from slipping back in.
+    #[test]
+    fn no_gui_code_uses_eguis_shifting_selectables() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gui");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                // Spelt in pieces so this line doesn't find itself.
+                let (label, value) = (
+                    concat!(".selectable", "_label("),
+                    concat!(".selectable", "_value("),
+                );
+                if code.contains(label) || code.contains(value) {
+                    offenders.push(format!("{}:{}", path.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use widgets::selectable_row: {offenders:#?}"
+        );
+    }
 
     fn screen() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 600.0))

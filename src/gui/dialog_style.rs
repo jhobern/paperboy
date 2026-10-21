@@ -121,6 +121,7 @@ mod tests {
                 Box::new(|a: &mut GuiApp| {
                     a.dialog = Some(Dialog::ExportResults {
                         path: "/home/me/report.csv".into(),
+                        replace: false,
                     })
                 }),
             ),

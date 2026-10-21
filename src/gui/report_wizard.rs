@@ -1179,7 +1179,7 @@ fn request_ui(
                         .selected_text(RichText::new("…").color(th.dim))
                         .show_ui(ui, |ui| {
                             for t in f.titles.clone() {
-                                if ui.selectable_label(f.name == t, &t).clicked() {
+                                if super::widgets::selectable_row(ui, f.name == t, &t).clicked() {
                                     f.name = t;
                                 }
                             }
@@ -1205,9 +1205,24 @@ fn request_ui(
             if f.report {
                 ui.label(RichText::new(s.node_form_response).color(th.dim));
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut f.response, None, s.node_form_response_default);
-                    ui.selectable_value(&mut f.response, Some(ResponseFmt::Raw), "RAW");
-                    ui.selectable_value(&mut f.response, Some(ResponseFmt::Pretty), "PRETTY");
+                    super::widgets::selectable_value(
+                        ui,
+                        &mut f.response,
+                        None,
+                        s.node_form_response_default,
+                    );
+                    super::widgets::selectable_value(
+                        ui,
+                        &mut f.response,
+                        Some(ResponseFmt::Raw),
+                        "RAW",
+                    );
+                    super::widgets::selectable_value(
+                        ui,
+                        &mut f.response,
+                        Some(ResponseFmt::Pretty),
+                        "PRETTY",
+                    );
                 });
                 ui.end_row();
 
@@ -1334,8 +1349,8 @@ fn envs_ui(
     ui.horizontal(|ui| {
         ui.label(RichText::new(s.report_node_envs_mode_label).color(th.dim));
         let mut compare = f.compare;
-        ui.selectable_value(&mut compare, false, s.report_node_envs_mode_plain);
-        ui.selectable_value(&mut compare, true, s.report_node_envs_mode_roles);
+        super::widgets::selectable_value(ui, &mut compare, false, s.report_node_envs_mode_plain);
+        super::widgets::selectable_value(ui, &mut compare, true, s.report_node_envs_mode_roles);
         if compare != f.compare {
             f.compare = compare;
             // Entering compare with no baseline promotes the first entry so a
@@ -1377,7 +1392,8 @@ fn envs_ui(
                 })
                 .show_ui(ui, |ui| {
                     for c in list.clone() {
-                        if ui.selectable_label(f.entries[i].name == c, &c).clicked() {
+                        if super::widgets::selectable_row(ui, f.entries[i].name == c, &c).clicked()
+                        {
                             f.entries[i].name = c;
                         }
                     }

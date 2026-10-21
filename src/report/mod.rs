@@ -40,6 +40,7 @@ pub mod producers;
 // around.
 #[allow(clippy::module_inception)]
 pub mod report;
+pub mod rerun;
 pub mod run;
 pub mod validate;
 pub mod writer;

@@ -111,6 +111,8 @@ pub fn run() -> io::Result<()> {
         // Apply a finished background report run (non-blocking; the app stayed
         // responsive while it ran).
         app.poll_report_run_updates();
+        // Start any row re-runs queued during a run that has now finished.
+        app.start_ready_reruns();
         match event::poll(Duration::from_millis(120)) {
             Ok(true) => {
                 // Terminal (column, row) bounds to clamp every incoming

@@ -212,12 +212,12 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 crate::env_panel::EnvSource::Global,
                 crate::env_panel::EnvSource::Workspace,
             ] {
-                if ui
-                    .selectable_label(
-                        app.session.env_source == source,
-                        env_source_label(&app.strings, source),
-                    )
-                    .clicked()
+                if super::widgets::selectable_row(
+                    ui,
+                    app.session.env_source == source,
+                    env_source_label(&app.strings, source),
+                )
+                .clicked()
                 {
                     app.session.env_source = source;
                     app.session.save();

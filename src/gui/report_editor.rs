@@ -133,17 +133,18 @@ pub struct ReportEditor {
     /// the result, because the file then describes a run that is no longer on
     /// screen.
     pub last_export: Option<String>,
-    /// Which of the results view's row filters is selected, as an index into
-    /// [`crate::report::filter::RowFilter::available`] for the current result.
-    ///
-    /// Held as an index rather than the filter itself because the set of
-    /// filters worth offering is derived from the result: a stored `Regressed`
-    /// would have to be validated against every new result anyway, and an index
-    /// only has to be clamped. Reset with the result.
-    pub results_filter: usize,
+    /// Which rows the results grid is showing. Held as the filter itself,
+    /// not as a position in the list of filters on offer: that list is derived
+    /// from the result and changes under it — as rows stream in, or a re-run
+    /// lands — and a position would silently come to mean a different filter.
+    pub results_filter: RowFilter,
     /// The results view's find box: a case-insensitive substring the shown
     /// columns are searched for, narrowing the rows the filter already chose.
     pub results_find: String,
+    /// The column the results grid is sorted by — `(header, descending)` —
+    /// or `None` for the run's own order. View-only: exports keep run order.
+    /// Held by header name so it survives a rerun that keeps the column.
+    pub results_sort: Option<(String, bool)>,
     /// The Source view's find bar, open only once Ctrl+F has asked for it.
     ///
     /// Separate from [`Self::results_find`] because the two search different
@@ -233,6 +234,29 @@ pub struct ReportEditor {
     /// asked while looking at the table, and because the answers can be
     /// changed afterwards without rerunning.
     result_params: Vec<(String, String)>,
+    /// The flow the result on screen was run from. A row is re-run against
+    /// *this*, not against whatever the editor holds now: a row's identity is
+    /// its position in the loops of the flow that produced it, which an edit
+    /// can move.
+    result_flow: Option<ReportFlow>,
+    /// The parameter values the result on screen was *run* with — set by a
+    /// real run only. [`Self::result_params`] also follows a dry-run preview
+    /// (it labels whatever is on show), so re-running a row from it would send
+    /// that row with the preview's answers and splice it into a report made
+    /// with others.
+    result_run_params: crate::report::params::ParamValues,
+    /// Rows of the run in flight picked to re-run once it has finished (a
+    /// running report's grid is the uncollapsed projection, so they are held
+    /// by identity and mapped onto the finished rows when it lands).
+    queued_reruns: Vec<crate::report::rerun::RowRef>,
+    /// The summary of a run in flight: the rows that have come back, as the
+    /// finished report will see them, and their metrics — recomputed only as
+    /// more rows land (see [`Self::refresh_live_summary`]).
+    live_summary: Option<LiveSummary>,
+    /// A row whose re-run was asked for from the grid's context menu this
+    /// frame, started at the end of the frame (the grid draws while the
+    /// result is borrowed).
+    pending_rerun: Option<usize>,
     /// A toolbar button pressed this frame, run *after* the body has been drawn
     /// (see [`ToolbarAct`]).
     pending_toolbar: Option<ToolbarAct>,
@@ -262,6 +286,8 @@ pub(super) enum RunIntent {
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum ToolbarAct {
     Run,
+    /// Carry on a stopped run from where it stopped.
+    Resume,
     DryRun,
     /// Open the run-settings dialog without starting anything.
     RunSettings,
@@ -269,6 +295,14 @@ enum ToolbarAct {
     Close,
     /// Hand the named file (the last export) to the desktop's opener.
     OpenExport(String),
+}
+
+/// See [`ReportEditor::live_summary`].
+struct LiveSummary {
+    /// How many rows had come back when this was worked out.
+    done: usize,
+    result: ReportResult,
+    metrics: Option<crate::report::metrics::Metrics>,
 }
 
 /// One results cell opened in the inspector window: the column header (title)
@@ -313,8 +347,9 @@ impl ReportEditor {
             run: None,
             results_exported: false,
             last_export: None,
-            results_filter: 0,
+            results_filter: RowFilter::All,
             results_find: String::new(),
+            results_sort: None,
             source_find: None,
             results_detail: None,
             results_textures: std::collections::HashMap::new(),
@@ -328,6 +363,11 @@ impl ReportEditor {
             dry_run: None,
             param_values: Default::default(),
             result_params: Vec::new(),
+            result_flow: None,
+            result_run_params: Default::default(),
+            queued_reruns: Vec::new(),
+            live_summary: None,
+            pending_rerun: None,
             params_seeded: false,
             params_sig: String::new(),
             params_confirmed: false,
@@ -358,6 +398,10 @@ impl ReportEditor {
             results_exported: self.results_exported,
             last_export: self.last_export.clone(),
             params: std::mem::take(&mut self.param_values),
+            result_params: std::mem::take(&mut self.result_params),
+            result_flow: self.result_flow.take(),
+            result_run_params: std::mem::take(&mut self.result_run_params),
+            queued_reruns: std::mem::take(&mut self.queued_reruns),
         }
     }
 
@@ -370,6 +414,10 @@ impl ReportEditor {
         self.run = parked.run;
         self.results_exported = parked.results_exported;
         self.last_export = parked.last_export;
+        self.result_params = parked.result_params;
+        self.result_flow = parked.result_flow;
+        self.result_run_params = parked.result_run_params;
+        self.queued_reruns = parked.queued_reruns;
         if !parked.params.is_empty() {
             self.param_values = parked.params;
             // Already answered: don't overwrite them from the remembered set.
@@ -686,13 +734,16 @@ impl ReportEditor {
                 // Only the app knows the chosen language; the run's own errors
                 // are user-facing text like any other.
                 inputs.language = app.session.language.clone();
+                self.result_run_params = chosen.clone();
                 inputs.params = chosen;
                 self.result = None;
                 self.progress = None;
                 self.results_exported = false;
                 self.last_export = None;
+                self.result_flow = Some(flow.clone());
+                self.queued_reruns.clear();
                 // The old result's filters and panels described the old rows.
-                self.results_filter = 0;
+                self.results_filter = RowFilter::All;
                 self.results_find.clear();
                 self.results_detail = None;
                 self.results_textures.clear();
@@ -816,7 +867,354 @@ impl ReportEditor {
         // Clear streaming progress so no row is left rendering as "running".
         // The partial grid in `self.result` is intentionally kept.
         self.progress = None;
+        // A stopped run never finishes, so what was queued for its end goes.
+        self.queued_reruns.clear();
+        // What came back stays as it was — rows, summary, matrix, filters —
+        // and the grid says how much of the run it covers, which is also
+        // what lets the run be resumed from here.
+        if let Some(result) = self.result.as_mut().filter(|r| !r.finalized) {
+            result.partial = Some(crate::report::model::Partial {
+                rows_completed: result.rows.len() - result.pending.len(),
+                rows_planned: result.rows.len(),
+            });
+        }
+        // Back to every row, so whatever filter was up can't leave the grid
+        // looking empty.
+        self.results_filter = RowFilter::All;
         app.session.status = Some(Status::ReportRunStopped);
+    }
+
+    /// Why a row of the result on screen can't be re-run right now, or `None`
+    /// when it can.
+    fn rerun_blocked(&self, s: &Strings) -> Option<&'static str> {
+        let result = self.result.as_ref()?;
+        if self.is_running() || self.progress.is_some() {
+            return Some(s.report_rerun_blocked_running);
+        }
+        // A stopped run's grid is the *uncollapsed* projection with holes in
+        // it, not a report: there is no finished row to put an answer into.
+        if !result.finalized || !result.pending.is_empty() || result.partial.is_some() {
+            return Some(s.report_rerun_blocked_partial);
+        }
+        if self.result_flow.is_none() {
+            return Some(s.report_rerun_blocked_partial);
+        }
+        None
+    }
+
+    /// Whether a whole run is streaming into the grid (as opposed to a row
+    /// re-run, or nothing).
+    fn streaming(&self) -> bool {
+        self.is_running() && self.progress.as_ref().is_some_and(|p| !p.rerun)
+    }
+
+    /// Bring the live summary up to date with the rows that have come back,
+    /// or drop it once no run is streaming. Collapsing and scoring the rows is
+    /// the finished report's work, so it is done again only when another row
+    /// has landed rather than on every frame.
+    fn refresh_live_summary(&mut self) {
+        let streaming = self.progress.as_ref().is_some_and(|p| !p.rerun);
+        if !streaming && !self.frozen() {
+            self.live_summary = None;
+            return;
+        }
+        let Some(done) = self.result.as_ref().map(|r| r.rows.len() - r.pending.len()) else {
+            return;
+        };
+        if self.live_summary.as_ref().is_some_and(|s| s.done == done) {
+            return;
+        }
+        let (Some(result), Some(flow)) = (self.result.as_ref(), self.result_flow.as_ref()) else {
+            return;
+        };
+        let params = self.result_run_params.clone();
+        let root = context::run_root(flow, self.report.path.as_deref());
+        let projected = crate::report::run::project_live(result, flow, &params, root.as_deref());
+        let metrics = crate::report::run::live_metrics(&projected, flow);
+        self.live_summary = Some(LiveSummary {
+            done,
+            result: projected,
+            metrics,
+        });
+    }
+
+    /// Re-run row `r` of the run in flight straight away, beside it: someone
+    /// who notices a wrong row mid-run is keen for its answer, not for the end
+    /// of the run. Both sides of a comparison row go again, so the case's rows
+    /// that have come back are drawn running until the answer lands (see
+    /// [`report_run::RunHandle::rerun_live`]).
+    fn rerun_row_live(&mut self, app: &mut GuiApp, r: usize) {
+        let (Some(flow), Some(result), Some(progress)) = (
+            self.result_flow.as_ref(),
+            self.result.as_ref(),
+            self.progress.as_ref(),
+        ) else {
+            return;
+        };
+        let Some(row) = result.rows.get(r) else {
+            return;
+        };
+        if progress.states.get(r) != Some(&RowState::Finished) {
+            app.session.status = Some(Status::ReportRowRerunBlocked(
+                app.strings.report_rerun_not_back_yet.to_string(),
+            ));
+            return;
+        }
+        // The case's other sides: same key, same comparison.
+        let marked: Vec<usize> = result
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(i, other)| {
+                *i == r
+                    || (row.comparison.is_some()
+                        && other.comparison == row.comparison
+                        && other.key == row.key)
+            })
+            .filter(|(i, _)| progress.states.get(*i) == Some(&RowState::Finished))
+            .map(|(i, _)| i)
+            .collect();
+        let refs = vec![crate::report::rerun::RowRef::of(row)];
+        let path = row.path.clone();
+        let inputs = match context::report_run_inputs(
+            &app.session.collections,
+            &app.session.global_envs,
+            flow,
+            self.report.path.as_deref(),
+        ) {
+            Ok(mut inputs) => {
+                inputs.language = app.session.language.clone();
+                inputs.params = self.result_run_params.clone();
+                inputs
+            }
+            Err(context::RunInputError::Unbound) => {
+                app.session.status = Some(Status::ReportRunBlocked(
+                    app.strings.report_run_unbound.to_string(),
+                ));
+                return;
+            }
+        };
+        let (Some(handle), Some(progress)) = (self.run.as_mut(), self.progress.as_mut()) else {
+            return;
+        };
+        for &i in &marked {
+            progress.states[i] = RowState::Running;
+        }
+        handle.rerun_live(inputs, vec![path], refs, marked);
+        app.session.status = Some(Status::ReportRowRerunning);
+    }
+
+    /// Whether the result on screen is a run that was stopped part-way — the
+    /// raw grid it left, shown as it was (summary, filters and all) and able to
+    /// be resumed.
+    pub(super) fn frozen(&self) -> bool {
+        self.run.is_none()
+            && self.progress.is_none()
+            && self
+                .result
+                .as_ref()
+                .is_some_and(|r| r.partial.is_some() && !r.finalized)
+            && self.result_flow.is_some()
+    }
+
+    /// The result an export writes: the one on screen — or, for a run that was
+    /// stopped part-way, the rows that came back merged and scored as the
+    /// finished report would have them, still marked as covering only part of
+    /// the run. The raw grid a stop leaves is no report: it has a row per side
+    /// and no `Result` to say how they compare.
+    pub(super) fn exportable_result(&self) -> Option<std::borrow::Cow<'_, ReportResult>> {
+        let result = self.result.as_ref()?;
+        if !self.frozen() {
+            return Some(std::borrow::Cow::Borrowed(result));
+        }
+        let flow = self.result_flow.as_ref()?;
+        let root = context::run_root(flow, self.report.path.as_deref());
+        let mut projected = crate::report::run::project_live(
+            result,
+            flow,
+            &self.result_run_params,
+            root.as_deref(),
+        );
+        projected.partial = result.partial;
+        Some(std::borrow::Cow::Owned(projected))
+    }
+
+    /// Carry a stopped run on from where it stopped: run the rows that hadn't
+    /// come back, into the slots waiting for them, and finish the report.
+    fn resume_run(&mut self, app: &mut GuiApp) {
+        if !self.frozen() {
+            return;
+        }
+        let (Some(flow), Some(result)) = (self.result_flow.as_ref(), self.result.as_mut()) else {
+            return;
+        };
+        let inputs = match context::report_run_inputs(
+            &app.session.collections,
+            &app.session.global_envs,
+            flow,
+            self.report.path.as_deref(),
+        ) {
+            Ok(mut inputs) => {
+                inputs.language = app.session.language.clone();
+                inputs.params = self.result_run_params.clone();
+                inputs
+            }
+            Err(context::RunInputError::Unbound) => {
+                app.session.status = Some(Status::ReportRunBlocked(
+                    app.strings.report_run_unbound.to_string(),
+                ));
+                return;
+            }
+        };
+        result.partial = None;
+        let total = result.rows.len();
+        let states = (0..total)
+            .map(|r| {
+                if result.pending.contains(&r) {
+                    RowState::Scheduled
+                } else {
+                    RowState::Finished
+                }
+            })
+            .collect();
+        let index = result
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| (row.path.clone(), i))
+            .collect();
+        let done = total - result.pending.len();
+        self.progress = Some(RunProgress {
+            states,
+            index,
+            done,
+            total,
+            rerun: false,
+        });
+        self.results_exported = false;
+        self.last_export = None;
+        self.run = Some(report_run::spawn_resume(inputs, result.clone()));
+        app.session.status = Some(Status::ReportRunning);
+    }
+
+    /// Whether a row re-run is in flight.
+    fn rerunning(&self) -> bool {
+        self.is_running() && self.progress.as_ref().is_some_and(|p| p.rerun)
+    }
+
+    /// Queue row `r` to re-run once what is in flight — a run, or another
+    /// re-run — has finished, or take it off the queue if it is already on it.
+    fn toggle_queued_rerun(&mut self, app: &mut GuiApp, r: usize) {
+        let Some(row) = self.result.as_ref().and_then(|res| res.rows.get(r)) else {
+            return;
+        };
+        if let Some(at) = self.queued_reruns.iter().position(|q| q.is(row)) {
+            self.queued_reruns.remove(at);
+        } else {
+            let state = self
+                .progress
+                .as_ref()
+                .and_then(|p| p.states.get(r))
+                .copied();
+            let refused = match state {
+                Some(RowState::Running) if self.rerunning() => {
+                    Some(app.strings.report_rerun_already_running)
+                }
+                Some(RowState::Scheduled | RowState::Running) => {
+                    Some(app.strings.report_rerun_not_back_yet)
+                }
+                _ => None,
+            };
+            if let Some(why) = refused {
+                app.session.status = Some(Status::ReportRowRerunBlocked(why.to_string()));
+                return;
+            }
+            self.queued_reruns
+                .push(crate::report::rerun::RowRef::of(row));
+        }
+        app.session.status = Some(Status::ReportRowRerunQueued {
+            rows: self.queued_reruns.len(),
+        });
+    }
+
+    /// Show every row again when a re-run has left the selected filter
+    /// selecting none. Picking the failures out (say, through a confusion-matrix
+    /// cell) and re-running them until they pass should end on the table, not
+    /// on an empty view.
+    fn fall_back_from_an_empty_filter(&mut self) {
+        let Some(result) = self.result.as_ref() else {
+            return;
+        };
+        if self.results_filter == RowFilter::All || self.progress.is_some() {
+            return;
+        }
+        let header = self
+            .flow
+            .as_ref()
+            .map(|f| f.header.clone())
+            .unwrap_or_default();
+        let columns = result.resolved_columns(&header);
+        let labels = crate::report::labels::LabelMap::parse(&header.labels());
+        if crate::report::filter::visible_rows(result, &columns, &labels, &self.results_filter, "")
+            .is_empty()
+        {
+            self.results_filter = RowFilter::All;
+        }
+    }
+
+    /// The finished result's rows to re-run for what was queued during the
+    /// run, once that run has finished — `Some(empty)` when none of them could
+    /// be found in it. A run that ended without finishing (stopped, or its
+    /// worker lost) drops the queue: there is no finished row to re-run.
+    fn take_ready_reruns(&mut self) -> Option<Vec<usize>> {
+        if self.queued_reruns.is_empty() || self.is_running() || self.progress.is_some() {
+            return None;
+        }
+        let queued = std::mem::take(&mut self.queued_reruns);
+        let result = self.result.as_ref().filter(|r| r.finalized)?;
+        Some(crate::report::rerun::rows_after_finalize(&queued, result))
+    }
+
+    /// Re-run rows `rows` of the result on screen in the background, with the
+    /// parameters that result was produced with; its fresh answer is spliced
+    /// in when it lands (see [`report_run::spawn_rerun`]).
+    fn rerun_rows(&mut self, app: &mut GuiApp, rows: &[usize]) {
+        if let Some(why) = self.rerun_blocked(&app.strings) {
+            app.session.status = Some(Status::ReportRowRerunBlocked(why.to_string()));
+            return;
+        }
+        let (Some(flow), Some(result)) = (self.result_flow.as_ref(), self.result.as_ref()) else {
+            return;
+        };
+        let rows: Vec<usize> = rows
+            .iter()
+            .copied()
+            .filter(|&r| r < result.rows.len())
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let paths = rows.iter().map(|&r| result.rows[r].path.clone()).collect();
+        let total = result.rows.len();
+        match context::report_run_inputs(
+            &app.session.collections,
+            &app.session.global_envs,
+            flow,
+            self.report.path.as_deref(),
+        ) {
+            Ok(mut inputs) => {
+                inputs.language = app.session.language.clone();
+                inputs.params = self.result_run_params.clone();
+                self.progress = Some(RunProgress::rerun(total, &rows));
+                self.run = Some(report_run::spawn_rerun(inputs, paths, rows));
+                app.session.status = Some(Status::ReportRowRerunning);
+            }
+            Err(context::RunInputError::Unbound) => {
+                app.session.status = Some(Status::ReportRunBlocked(
+                    app.strings.report_run_unbound.to_string(),
+                ));
+            }
+        }
     }
 
     /// Drain the run channel this frame, folding streamed rows into the grid.
@@ -826,12 +1224,42 @@ impl ReportEditor {
         let Some(handle) = self.run.as_mut() else {
             return false;
         };
+        let mut rerun_landed = false;
         match report_run::drain(handle, &mut self.result, &mut self.progress) {
             report_run::Drained::Progress { done, total } => {
                 app.session.status = Some(Status::ReportRunProgress { done, total });
             }
             report_run::Drained::Done { rows, errors } => {
                 app.session.status = Some(Status::ReportRunDone { rows, errors });
+                // The finished result numbers its rows afresh (a comparison
+                // folds each baseline away), so a drill-down opened during the
+                // run would now be showing some other row.
+                self.results_detail = None;
+                self.results_textures.clear();
+                rerun_landed = true;
+            }
+            report_run::Drained::Rerun { replaced, errors } => {
+                app.session.status = Some(if replaced.is_empty() {
+                    Status::ReportRowRerunLost
+                } else {
+                    // Whatever was exported, and the pictures decoded for the
+                    // old rows, describe a table that is no longer on screen.
+                    self.results_exported = false;
+                    self.last_export = None;
+                    self.results_textures.clear();
+                    rerun_landed = true;
+                    Status::ReportRowRerunDone { errors }
+                });
+            }
+            report_run::Drained::LiveRerun { replaced, errors } => {
+                app.session.status = Some(if replaced.is_empty() {
+                    Status::ReportRowRerunLost
+                } else {
+                    Status::ReportRowRerunDone { errors }
+                });
+                // The rows under the live summary changed without the count
+                // of finished rows moving, so it has to be worked out afresh.
+                self.live_summary = None;
             }
             report_run::Drained::Disconnected => {
                 self.run = None;
@@ -839,7 +1267,11 @@ impl ReportEditor {
             }
             report_run::Drained::Idle => {}
         }
-        if handle.finished() {
+        let finished = handle.finished();
+        if rerun_landed {
+            self.fall_back_from_an_empty_filter();
+        }
+        if finished {
             self.run = None;
             false
         } else {
@@ -2194,6 +2626,19 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 if run.clicked() {
                     ed.pending_toolbar = Some(ToolbarAct::Run);
                 }
+                // A stopped run can be carried on from where it stopped.
+                if ed.frozen()
+                    && ui
+                        .button(format!(
+                            "{} {}",
+                            super::icons::RERUN,
+                            app.strings.gui_report_resume
+                        ))
+                        .on_hover_text(app.strings.gui_report_resume_tooltip)
+                        .clicked()
+                {
+                    ed.pending_toolbar = Some(ToolbarAct::Resume);
+                }
                 // Dry run sits beside Run, disabled on the same terms: it
                 // expands the flow for real, so a flow with errors can't be
                 // previewed any more than it can be run.
@@ -2393,8 +2838,25 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // The header's buttons act here, at the end of the frame that pressed them,
     // so any inline field that committed on losing focus above has already been
     // folded into the report (see [`ToolbarAct`]).
+    if let Some(r) = ed.pending_rerun.take() {
+        if ed.streaming() {
+            ed.rerun_row_live(app, r);
+        } else if ed.rerunning() {
+            ed.toggle_queued_rerun(app, r);
+        } else {
+            ed.rerun_rows(app, &[r]);
+        }
+    }
+    if let Some(rows) = ed.take_ready_reruns() {
+        if rows.is_empty() {
+            app.session.status = Some(Status::ReportRowRerunLost);
+        } else {
+            ed.rerun_rows(app, &rows);
+        }
+    }
     match ed.pending_toolbar.take() {
         Some(ToolbarAct::Run) => ed.start_run(app),
+        Some(ToolbarAct::Resume) => ed.resume_run(app),
         Some(ToolbarAct::DryRun) => ed.start_dry_run(app),
         Some(ToolbarAct::RunSettings) => ed.open_param_modal(app, RunIntent::Review),
         Some(ToolbarAct::Save) => save_report(&mut ed, app),
@@ -2497,6 +2959,8 @@ fn dry_run_body(
         None,
         &preview_detail_cols,
         &mut none,
+        None,
+        None,
         None,
     ) {
         opened = Some(ins);
@@ -3382,10 +3846,11 @@ fn param_combo(
             // opening the list can't quietly discard it.
             if !known && !value.is_empty() {
                 let cur = value.clone();
-                let _ = ui.selectable_label(true, RichText::new(cur).color(th.pending));
+                let _ =
+                    super::widgets::selectable_row(ui, true, RichText::new(cur).color(th.pending));
             }
             for o in options {
-                if ui.selectable_label(o == value, o).clicked() {
+                if super::widgets::selectable_row(ui, o == value, o).clicked() {
                     *value = o.clone();
                     changed = true;
                 }
@@ -3793,6 +4258,7 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         return;
     }
 
+    ed.refresh_live_summary();
     // The run's status and its Baseline/Export buttons live in the editor's one
     // header row (see `report_header`), not in a strip of their own: this view
     // is a table, and every line spent above it is a row of that table not
@@ -3853,155 +4319,187 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     }
 
     let states = ed.progress.as_ref().map(|p| p.states.as_slice());
+    // While a row re-run is in flight, picking another queues it to go next
+    // rather than being refused.
+    let rerun_blocked = if ed.rerunning() {
+        None
+    } else {
+        ed.rerun_blocked(&app.strings)
+    };
+    let queued: std::collections::HashSet<usize> = result
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| ed.queued_reruns.iter().any(|q| q.is(row)))
+        .map(|(i, _)| i)
+        .collect();
 
-    // The metric cards and the filter bar, the two things the interactive HTML
-    // export offers that reading the grid alone doesn't. Both are skipped while
-    // a run is streaming: the figures would be computed over a half-filled
-    // table and would tick misleadingly as rows land, and `visible_rows` drops
-    // pending rows, so filtering a live run would empty the very view you are
-    // watching.
-    let live = states.is_some();
-    if let Some(visible) = visible_for_view(
+    // A row re-run draws its row as running but leaves the grid a finished
+    // one: the rest of the table is final, so it stays filterable.
+    let live = ed.progress.as_ref().is_some_and(|p| !p.rerun);
+    // A stopped run is shown as it was while it ran: through the projection
+    // of the rows that came back.
+    let projected_view = live || ed.frozen();
+    // The summary — metric cards, filter bar, confusion matrices — sits in the
+    // same place whether or not a run is going, so nothing jumps when it ends.
+    // While one streams it describes the rows that have come back, as the
+    // finished report will see them (see `ReportEditor::refresh_live_summary`),
+    // so the matrix fills in — and filters — as the run goes.
+    let projected = ed
+        .live_summary
+        .as_ref()
+        .filter(|_| projected_view)
+        .map(|s| &s.result);
+    let (summary_of, metrics) = match (&ed.live_summary, projected_view) {
+        (Some(s), true) => (&s.result, s.metrics.clone()),
+        (_, true) => (result, None),
+        (_, false) => (result, result.metrics(&columns, &header)),
+    };
+    let (mut filters, mut buttons) =
+        crate::report::filter::all_filters(summary_of, metrics.as_ref());
+    // Mid-run, the cases with one side in and the other on its way get a
+    // button of their own, rather than passing for differences.
+    // Last in the bar, and there for the whole run, so it is the only button
+    // that comes or goes — and only at the run's end.
+    if projected_view
+        && result.rows.iter().any(|r| {
+            matches!(
+                r.role,
+                crate::report::model::RowRole::Baseline | crate::report::model::RowRole::Candidate
+            )
+        })
+    {
+        filters.insert(buttons, RowFilter::Waiting);
+        buttons += 1;
+    }
+    // The rows on screen, in the order shown. A sort applies while a run
+    // streams too: rows still on their way have nothing to sort by, so they
+    // wait at the bottom and take their place as they land.
+    let mut visible = visible_for_view(
         result,
         &columns,
         &header,
-        live,
-        &mut ed.results_filter,
+        projected_view,
+        projected,
+        &ed.results_filter,
         &ed.results_find,
-    ) {
-        let metrics = result.metrics(&columns, &header);
-        let (filters, buttons) = crate::report::filter::all_filters(result, metrics.as_ref());
-        // The summary block scrolls inside a height of its own rather than
-        // pushing the grid off the bottom. A report with a matrix per
-        // ground-truthed column can otherwise leave no room at all for the rows
-        // the matrices describe.
-        let summary_h = ed
-            .summary_h
-            .clamp(60.0, (ui.available_height() - 120.0).max(60.0));
-        let mut filter = ed.results_filter;
-        let mut find = std::mem::take(&mut ed.results_find);
-        egui::ScrollArea::vertical()
-            .id_salt("pb_report_summary")
-            .max_height(summary_h)
-            // Vertical auto-shrink is left on so a report with no matrices
-            // doesn't reserve a band of empty space above its grid.
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                if let Some(metrics) = &metrics {
-                    metric_cards(&th, ui, app, metrics);
-                }
-                filter_bar(
-                    &th,
-                    ui,
-                    app,
-                    &filters[..buttons],
-                    &mut filter,
-                    &mut find,
-                    visible.len(),
-                    result.rows.len(),
-                );
-                // The matrices sit under the bar they drive: a cell is itself a
-                // filter, and picking one selects exactly the rows that cell
-                // counted.
-                if let Some(metrics) = &metrics {
-                    for m in &metrics.columns {
-                        if let Some(matrix) = &m.matrix {
-                            confusion_matrix(
-                                &th,
-                                ui,
-                                app,
-                                &m.header,
-                                matrix,
-                                &filters,
-                                &mut filter,
-                            );
-                        }
-                    }
-                }
-            });
-        ed.results_filter = filter;
-        ed.results_find = find;
-        summary_splitter(&mut ed.summary_h, ui);
-        ui.colored_label(
-            th.dim,
-            app.strings
-                .gui_report_cell_hint
-                .replace("{c}", super::icons::CARET_RIGHT),
-        );
-        ui.add_space(2.0);
-        // A row whose panel is open still has to be *reachable*, so the grid
-        // gives up the height the reader dragged the panel to (defaulting to
-        // something a picture fits in) rather than the panel appearing
-        // off-screen below it.
-        let avail = ui.available_height();
-        let grid_h = if ed.results_detail.is_some() {
-            let panel = ed.detail_h.clamp(80.0, (avail - 120.0).max(80.0));
-            (avail - panel - 10.0).max(80.0)
-        } else {
-            avail
-        };
-        let mut open_detail = ed.results_detail;
-        let mut inspector = None;
-        ui.allocate_ui(egui::vec2(ui.available_width(), grid_h), |ui| {
-            inspector = results_grid(
-                &th,
-                &app.strings,
-                ui,
-                result,
-                &grid_columns,
-                states,
-                Some(&visible),
-                &detail_columns,
-                &mut open_detail,
-                Some(&mut ed.results_col_widths),
-            );
-        });
-        if let Some(ins) = inspector {
-            ed.inspector = Some(ins);
-        }
-        // A filtered-away row must not keep its panel open: the panel is the
-        // row's, and the row is no longer on screen to close it.
-        if open_detail.is_some_and(|r| !visible.contains(&r)) {
-            open_detail = None;
-        }
-        ed.results_detail = open_detail;
-        if let Some(r) = ed.results_detail {
-            detail_splitter(&mut ed.detail_h, ui);
-            detail_panel(
+    );
+    if let Some((h, desc)) = &ed.results_sort
+        && let Some(col) = grid_columns.iter().find(|c| &c.header == h)
+    {
+        crate::report::filter::sort_rows(result, col, *desc, &mut visible);
+    }
+    let pickable: &[RowFilter] = &filters;
+    // The summary block scrolls inside a height of its own rather than
+    // pushing the grid off the bottom. A report with a matrix per
+    // ground-truthed column can otherwise leave no room at all for the rows
+    // the matrices describe.
+    let summary_h = ed
+        .summary_h
+        .clamp(60.0, (ui.available_height() - 120.0).max(60.0));
+    // The widgets pick by position in this frame's list; the choice is kept by
+    // value. A filter not on offer right now (none of its rows have come back
+    // yet) stays chosen, with nothing lit.
+    let picked_at = filters
+        .iter()
+        .position(|f| *f == ed.results_filter)
+        .unwrap_or(usize::MAX);
+    let mut filter = picked_at;
+    let mut find = std::mem::take(&mut ed.results_find);
+    egui::ScrollArea::vertical()
+        .id_salt("pb_report_summary")
+        .max_height(summary_h)
+        // Vertical auto-shrink is left on so a report with no matrices
+        // doesn't reserve a band of empty space above its grid.
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            if let Some(metrics) = &metrics {
+                metric_cards(&th, ui, app, metrics, pickable, &mut filter);
+            }
+            filter_bar(
                 &th,
                 ui,
                 app,
-                result,
-                r,
-                &columns,
-                &detail_columns,
-                &mut ed.results_textures,
-                &mut ed.results_detail,
+                &filters[..buttons],
+                &mut filter,
+                &mut find,
+                visible.len(),
+                result.rows.len(),
             );
-        }
-        return;
+            // The matrices sit under the bar they drive: a cell is itself a
+            // filter, and picking one selects exactly the rows that cell
+            // counted.
+            if let Some(metrics) = &metrics {
+                for m in &metrics.columns {
+                    if let Some(matrix) = &m.matrix {
+                        confusion_matrix(&th, ui, app, &m.header, matrix, pickable, &mut filter);
+                    }
+                }
+            }
+        });
+    if filter != picked_at
+        && let Some(f) = filters.get(filter)
+    {
+        ed.results_filter = f.clone();
     }
-    ui.colored_label(
-        th.dim,
-        app.strings
-            .gui_report_cell_hint
-            .replace("{c}", super::icons::CARET_RIGHT),
-    );
-    ui.add_space(2.0);
-    let mut none = None;
-    if let Some(ins) = results_grid(
-        &th,
-        &app.strings,
-        ui,
-        result,
-        &grid_columns,
-        states,
-        None,
-        &detail_columns,
-        &mut none,
-        Some(&mut ed.results_col_widths),
-    ) {
+    ed.results_find = find;
+    summary_splitter(&mut ed.summary_h, ui);
+    // A row whose panel is open still has to be *reachable*, so the grid
+    // gives up the height the reader dragged the panel to (defaulting to
+    // something a picture fits in) rather than the panel appearing
+    // off-screen below it.
+    let avail = ui.available_height();
+    let grid_h = if ed.results_detail.is_some() {
+        let panel = ed.detail_h.clamp(80.0, (avail - 120.0).max(80.0));
+        (avail - panel - 10.0).max(80.0)
+    } else {
+        avail
+    };
+    let mut open_detail = ed.results_detail;
+    let mut inspector = None;
+    ui.allocate_ui(egui::vec2(ui.available_width(), grid_h), |ui| {
+        inspector = results_grid(
+            &th,
+            &app.strings,
+            ui,
+            result,
+            &grid_columns,
+            states,
+            Some(&visible),
+            &detail_columns,
+            &mut open_detail,
+            Some(&mut ed.results_col_widths),
+            Some(&mut ed.results_sort),
+            Some(RowMenu {
+                blocked: rerun_blocked,
+                streaming: live,
+                queued,
+                rerun: &mut ed.pending_rerun,
+            }),
+        );
+    });
+    if let Some(ins) = inspector {
         ed.inspector = Some(ins);
+    }
+    // A filtered-away row must not keep its panel open: the panel is the
+    // row's, and the row is no longer on screen to close it.
+    if open_detail.is_some_and(|r| !visible.contains(&r)) {
+        open_detail = None;
+    }
+    ed.results_detail = open_detail;
+    if let Some(r) = ed.results_detail {
+        detail_splitter(&mut ed.detail_h, ui);
+        detail_panel(
+            &th,
+            ui,
+            app,
+            result,
+            r,
+            &columns,
+            &detail_columns,
+            &mut ed.results_textures,
+            &mut ed.results_detail,
+        );
     }
 }
 
@@ -4275,42 +4773,40 @@ fn detail_image(
     let _ = app;
 }
 
-/// The rows the results view should show, or `None` to show every row
-/// unfiltered.
+/// The rows the results view shows, in run order: those `filter` and `find`
+/// select.
 ///
-/// `None` while a run is `live`, deliberately: `visible_rows` drops pending
-/// rows, so filtering a streaming run would empty the very view being watched,
-/// and the metric figures would be computed over a half-filled table and tick
-/// misleadingly as rows land.
-///
-/// `selected` is clamped rather than validated: the set of filters worth
-/// offering comes from the result, so a selection made against an earlier
-/// result can point past the end of the current one.
+/// A finished grid is filtered directly. A grid a run is still `streaming`
+/// into holds raw rows — each side of a comparison on its own row — so the
+/// filter is judged on the rows' live `projected` form (the report they will
+/// become) and shows each pick as the raw rows it came from (see
+/// [`crate::report::filter::live_visible_rows`]); with nothing projected yet,
+/// every row is shown.
 fn visible_for_view(
     result: &ReportResult,
     columns: &[crate::report::model::OutputColumn],
     header: &crate::report::flow::Header,
-    live: bool,
-    selected: &mut usize,
+    streaming: bool,
+    projected: Option<&ReportResult>,
+    filter: &RowFilter,
     find: &str,
-) -> Option<Vec<usize>> {
-    if live {
-        return None;
-    }
-    // The *full* list, matrix cells included: a matrix cell is picked by index
-    // exactly as a button is, so clamping against the buttons alone would throw
-    // away every selection made by clicking the matrix.
-    let (filters, _) =
-        crate::report::filter::all_filters(result, result.metrics(columns, header).as_ref());
-    *selected = (*selected).min(filters.len().saturating_sub(1));
+) -> Vec<usize> {
     let labels = crate::report::labels::LabelMap::parse(&header.labels());
-    Some(crate::report::filter::visible_rows(
-        result,
-        columns,
-        &labels,
-        filters.get(*selected).unwrap_or(&RowFilter::All),
-        find,
-    ))
+    if streaming {
+        return match projected {
+            Some(p) => crate::report::filter::live_visible_rows(
+                result,
+                columns,
+                p,
+                &p.resolved_columns(header),
+                &labels,
+                filter,
+                find,
+            ),
+            None => (0..result.rows.len()).collect(),
+        };
+    }
+    crate::report::filter::visible_rows(result, columns, &labels, filter, find)
 }
 
 /// The results view's metric cards: the same figures the interactive HTML
@@ -4325,18 +4821,13 @@ fn metric_cards(
     ui: &mut egui::Ui,
     app: &GuiApp,
     metrics: &crate::report::metrics::Metrics,
+    filters: &[RowFilter],
+    selected: &mut usize,
 ) {
-    let tinted = |ui: &mut egui::Ui, k: &str, v: &str, colour: egui::Color32| {
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(8, 4))
-            .show(ui, |ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(k).size(11.0).color(th.dim));
-                    ui.label(RichText::new(v).strong().color(colour));
-                });
-            });
+    // A card that no filter stands behind: nothing to select.
+    let plain = |ui: &mut egui::Ui, k: &str, v: &str| {
+        metric_card(th, ui, app, k, v, th.text, None, &[], &mut 0)
     };
-    let card = |ui: &mut egui::Ui, k: &str, v: &str| tinted(ui, k, v, th.text);
 
     // How the run moved comes first when there is a baseline to have moved
     // from: the accuracy cards below cannot tell a run that fixed three rows
@@ -4344,30 +4835,42 @@ fn metric_cards(
     if let Some(mv) = &metrics.movement {
         ui.horizontal_wrapped(|ui| {
             if mv.is_still() {
-                card(
+                plain(
                     ui,
                     app.strings.report_metric_movement,
                     app.strings.report_metric_nothing_moved,
                 );
             } else {
-                tinted(
+                // Each of these counts the rows a filter shows, so the card
+                // is a button for it (see `metric_card`).
+                metric_card(
+                    th,
                     ui,
+                    app,
                     app.strings.report_metric_fixed,
                     &mv.fixed.to_string(),
                     th.ok,
+                    Some(RowFilter::Fixed),
+                    filters,
+                    selected,
                 );
                 // The regression count is the one figure here anybody is
                 // scanning for, so it is the one that stays plain at zero: red
                 // on a `0` teaches the eye to ignore the colour.
-                tinted(
+                metric_card(
+                    th,
                     ui,
+                    app,
                     app.strings.report_metric_regressed,
                     &mv.regressed.to_string(),
                     if mv.regressed > 0 { th.err } else { th.text },
+                    Some(RowFilter::Regressed),
+                    filters,
+                    selected,
                 );
             }
             if mv.still_wrong > 0 {
-                card(
+                plain(
                     ui,
                     app.strings.report_metric_still_wrong,
                     &mv.still_wrong.to_string(),
@@ -4378,25 +4881,109 @@ fn metric_cards(
     }
     // The roll-up first when there is one -- it answers "did this run pass?",
     // and the per-column breakdown is the follow-up question.
+    // The Correct and Incorrect cards count the rows the Correct and Incorrect
+    // filters show — on the roll-up row, and on a column's own row when it is
+    // the only scored column (its verdict *is* the roll-up). With several, a
+    // column's own counts are of a different set of rows, so they stay plain.
+    let single = metrics.columns.len() == 1;
+    let overall_header = metrics.overall.as_ref().map(|o| o.header.clone());
     for m in metrics.overall.iter().chain(metrics.columns.iter()) {
+        let linked = single || overall_header.as_deref() == Some(m.header.as_str());
+        let pick = |f: RowFilter| linked.then_some(f);
         ui.horizontal_wrapped(|ui| {
-            card(
+            plain(
                 ui,
                 &format!("{} — {}", m.header, app.strings.report_metric_compared),
                 &format!("{} / {}", m.compared, m.total),
             );
-            card(
+            metric_card(
+                th,
                 ui,
+                app,
+                app.strings.report_metric_correct,
+                &m.correct.to_string(),
+                th.text,
+                pick(RowFilter::Correct),
+                filters,
+                selected,
+            );
+            metric_card(
+                th,
+                ui,
+                app,
                 app.strings.report_metric_incorrect,
                 &m.incorrect.to_string(),
+                th.text,
+                pick(RowFilter::Incorrect),
+                filters,
+                selected,
             );
-            card(
+            plain(
                 ui,
                 app.strings.report_metric_accuracy,
                 m.accuracy_text().as_deref().unwrap_or("\u{2014}"),
             );
         });
         ui.add_space(2.0);
+    }
+}
+
+/// One metric card: a caption over a figure.
+///
+/// A card that counts rows `filter` would show is a button for that filter,
+/// exactly as a confusion-matrix cell is — "which three regressed?" is the next
+/// question, and the answer should be a click away rather than a search.
+/// Picking the selected card again goes back to every row. A filter the result
+/// doesn't offer (it would select nothing) leaves the card plain.
+///
+/// The selected card is marked by its border's *colour*, never its width: a
+/// frame's stroke is part of its size, and a card that grew when picked would
+/// push its neighbours along under the pointer.
+#[allow(clippy::too_many_arguments)]
+fn metric_card(
+    th: &GuiTheme,
+    ui: &mut egui::Ui,
+    app: &GuiApp,
+    caption: &str,
+    figure: &str,
+    colour: egui::Color32,
+    filter: Option<RowFilter>,
+    filters: &[RowFilter],
+    selected: &mut usize,
+) {
+    let target = filter.and_then(|f| filters.iter().position(|g| *g == f));
+    let on = target.is_some_and(|i| i == *selected);
+    let mut frame = egui::Frame::group(ui.style()).inner_margin(egui::Margin::symmetric(8, 4));
+    if on {
+        frame = frame.stroke(egui::Stroke::new(frame.stroke.width, th.accent));
+    }
+    let shown = frame.show(ui, |ui| {
+        ui.vertical(|ui| {
+            ui.add(
+                egui::Label::new(RichText::new(caption).size(11.0).color(th.dim)).selectable(false),
+            );
+            ui.add(
+                egui::Label::new(RichText::new(figure).strong().color(colour)).selectable(false),
+            );
+        });
+    });
+    // The whole card is the target, not the words in it — the matrix cells
+    // learnt the same lesson.
+    if let Some(i) = target {
+        let resp = ui.interact(
+            shown.response.rect,
+            // Keyed by the card itself: the roll-up row and a column's own row
+            // can carry cards with the same caption.
+            shown.response.id.with("pb_metric_card"),
+            egui::Sense::click(),
+        );
+        if resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(app.strings.help_report_matrix_cell)
+            .clicked()
+        {
+            *selected = if on { 0 } else { i };
+        }
     }
 }
 
@@ -4558,18 +5145,17 @@ fn filter_bar(
     total: usize,
 ) {
     ui.horizontal_wrapped(|ui| {
-        if filters.len() > 1 {
-            for (i, f) in filters.iter().enumerate() {
-                if ui
-                    .selectable_label(i == *selected, filter_label(&app.strings, f))
-                    .on_hover_text(app.strings.help_report_filter)
-                    .clicked()
-                {
-                    *selected = i;
-                }
+        // Always there, All at least, so the bar never appears under the
+        // reader once a filter becomes worth offering.
+        for (i, f) in filters.iter().enumerate() {
+            if super::widgets::selectable_row(ui, i == *selected, filter_label(&app.strings, f))
+                .on_hover_text(app.strings.help_report_filter)
+                .clicked()
+            {
+                *selected = i;
             }
-            ui.separator();
         }
+        ui.separator();
         ui.add(
             egui::TextEdit::singleline(find)
                 .desired_width(180.0)
@@ -4596,9 +5182,11 @@ fn filter_label(s: &crate::i18n::Strings, f: &RowFilter) -> String {
     match f {
         RowFilter::All => s.report_filter_all.to_string(),
         RowFilter::Differ => s.report_filter_differences.to_string(),
+        RowFilter::Correct => s.report_filter_correct.to_string(),
         RowFilter::Incorrect => s.report_filter_incorrect.to_string(),
         RowFilter::Regressed => s.report_filter_regressions.to_string(),
         RowFilter::Fixed => s.report_filter_improvements.to_string(),
+        RowFilter::Waiting => s.report_filter_waiting.to_string(),
         RowFilter::MatrixCell { .. } => f.label(),
     }
 }
@@ -4893,17 +5481,33 @@ fn results_grid(
     detail_columns: &[&crate::report::model::OutputColumn],
     open_detail: &mut Option<usize>,
     mut overrides: Option<&mut ColumnWidths>,
+    mut sort: Option<&mut Option<(String, bool)>>,
+    mut row_menu: Option<RowMenu<'_>>,
 ) -> Option<CellInspector> {
-    let show_icons = states.is_some();
-    // The expander column is offered only when *some* row has something to
-    // drill into: on a run with no pictures and no `DETAIL` columns it would be
-    // a column of blanks.
+    // A real result's grid always keeps its status column — empty once the
+    // run is over — so the cells don't jump sideways when a run starts, ends,
+    // or a row is re-run.
+    let show_icons = states.is_some() || row_menu.is_some();
+    // A row still waiting on its requests has nothing real to drill into:
+    // its cells are the dry pass's placeholders.
     let expandable: std::collections::HashSet<usize> = (0..result.rows.len())
         .filter(|&r| {
-            !crate::report::detail::sections(result, r, columns, detail_columns).is_empty()
+            !result.pending.contains(&r)
+                && !crate::report::detail::sections(result, r, columns, detail_columns).is_empty()
         })
         .collect();
-    let show_expanders = !expandable.is_empty();
+    // The expander column is offered whenever a row *could* have something to
+    // drill into — a `DETAIL` or `IMAGE` column — rather than when one first
+    // does, which is only once rows (and, for pictures, the run's end) arrive:
+    // appearing then pushed every cell sideways mid-run. Without either kind
+    // of column it would be a column of blanks, so it is left out.
+    let show_expanders = !detail_columns.is_empty()
+        || columns.iter().any(|c| c.image.is_some())
+        || !expandable.is_empty();
+    let queued: std::collections::HashSet<usize> = row_menu
+        .as_ref()
+        .map(|m| m.queued.clone())
+        .unwrap_or_default();
     let mut opened: Option<CellInspector> = None;
     // Drop any pins that no longer name a live column before they are read, so a
     // width pinned against last run's columns can't leak onto this run's.
@@ -4921,31 +5525,69 @@ fn results_grid(
     let widths = fitted_column_widths(ui, result, columns, show_icons, &pin_vec);
     let row_h = ui.text_style_height(&egui::TextStyle::Body);
 
-    egui::ScrollArea::both()
-        .auto_shrink([false, false])
+    // The header is a grid of its own, outside the rows' scroll area, so it
+    // stays put while the rows scroll under it. It follows the rows sideways:
+    // its offset is the body's from the frame before (a frame's lag, repainted
+    // straight away), and it takes no scrolling of its own.
+    let x_key = ui.id().with("pb_results_scroll_x");
+    let x = ui.data(|d| d.get_temp::<f32>(x_key)).unwrap_or(0.0);
+    egui::ScrollArea::horizontal()
+        .id_salt("pb_results_head")
+        .auto_shrink([false, true])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .scroll_source(egui::scroll_area::ScrollSource::NONE)
+        .horizontal_scroll_offset(x)
         .show(ui, |ui| {
-            egui::Grid::new("report_results_grid")
-                .striped(true)
+            egui::Grid::new("report_results_head")
                 .spacing(egui::vec2(SPACING_X, 3.0))
                 .show(ui, |ui| {
                     // Header row. The expander column comes first, where a
                     // tree control's twisty lives.
                     if show_expanders {
-                        ui.label(" ");
+                        cell_slot(ui, EXPANDER_W, row_h, |_| {});
                     }
                     if show_icons {
-                        ui.label(" ");
+                        cell_slot(ui, ICON_W, row_h, |_| {});
                     }
                     for (c, col) in columns.iter().enumerate() {
                         let w = widths.get(c).copied().unwrap_or(MIN_COL_W);
+                        let sorted = sort
+                            .as_deref()
+                            .and_then(|s| s.as_ref())
+                            .filter(|(h, _)| *h == col.header)
+                            .map(|(_, desc)| *desc);
                         let cell_rect = cell_slot(ui, w, row_h, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&col.header).strong().color(th.accent),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(&col.header);
+                            let text = match sorted {
+                                Some(false) => format!("{} {}", super::icons::SORT_ASC, col.header),
+                                Some(true) => format!("{} {}", super::icons::SORT_DESC, col.header),
+                                None => col.header.clone(),
+                            };
+                            let mut label =
+                                egui::Label::new(RichText::new(text).strong().color(th.accent))
+                                    .truncate();
+                            if sort.is_some() {
+                                label = label.sense(egui::Sense::click());
+                            }
+                            let resp = ui.add(label);
+                            if let Some(sort) = sort.as_deref_mut() {
+                                let resp = resp
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text(format!(
+                                        "{}\n{}",
+                                        col.header, s.gui_report_sort_hint
+                                    ));
+                                if resp.clicked() {
+                                    // Ascending, then descending, then back to
+                                    // the order the run produced.
+                                    *sort = match sorted {
+                                        None => Some((col.header.clone(), false)),
+                                        Some(false) => Some((col.header.clone(), true)),
+                                        Some(true) => None,
+                                    };
+                                }
+                            } else {
+                                resp.on_hover_text(&col.header);
+                            }
                         });
                         // A resize handle straddling this column's border, added
                         // after the cell so it wins the pointer on the boundary.
@@ -4954,7 +5596,17 @@ fn results_grid(
                         }
                     }
                     ui.end_row();
+                });
+        });
 
+    let body = egui::ScrollArea::both()
+        .id_salt("pb_results_body")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("report_results_grid")
+                .striped(true)
+                .spacing(egui::vec2(SPACING_X, 3.0))
+                .show(ui, |ui| {
                     // Data rows. `visible` is the filtered row order when the
                     // view is filtering; the column widths are still measured
                     // over *every* row, so narrowing the rows doesn't make the
@@ -4977,64 +5629,81 @@ fn results_grid(
                         // each cell's own hover text and its inspector click.
                         // Its size is known up front: the widths were measured
                         // before the loop.
-                        let row_target = expandable.contains(&i).then(|| {
-                            let w: f32 = widths.iter().sum::<f32>()
-                                + SPACING_X * widths.len() as f32
-                                + if show_expanders { 24.0 } else { 0.0 }
-                                + if show_icons { 18.0 + SPACING_X } else { 0.0 };
-                            let rect =
-                                egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w, row_h));
-                            let r = ui.interact(
-                                rect,
-                                ui.id().with(("pb_result_row", i)),
-                                egui::Sense::click(),
-                            );
-                            // The pointing hand has to cover the whole row, not
-                            // just the words in it. `hovered()` is no use here:
-                            // the cells are drawn after this target and take the
-                            // hover from it wherever they overlap -- over their
-                            // own text, which is exactly the part that most
-                            // looks clickable. `contains_pointer` doesn't care
-                            // who is on top, so the cursor stays a hand all the
-                            // way across.
-                            if r.contains_pointer() {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                            }
-                            r
-                        });
+                        // Every row gets the target when there is a row menu
+                        // to open from it; only a drill-down row is a click
+                        // target as well.
+                        let row_target =
+                            (expandable.contains(&i) || row_menu.is_some()).then(|| {
+                                let w: f32 = widths.iter().sum::<f32>()
+                                    + SPACING_X * widths.len() as f32
+                                    + if show_expanders {
+                                        EXPANDER_W + SPACING_X
+                                    } else {
+                                        0.0
+                                    }
+                                    + if show_icons { ICON_W + SPACING_X } else { 0.0 };
+                                let rect = egui::Rect::from_min_size(
+                                    ui.cursor().min,
+                                    egui::vec2(w, row_h),
+                                );
+                                let r = ui.interact(
+                                    rect,
+                                    ui.id().with(("pb_result_row", i)),
+                                    egui::Sense::click(),
+                                );
+                                // The pointing hand has to cover the whole row, not
+                                // just the words in it. `hovered()` is no use here:
+                                // the cells are drawn after this target and take the
+                                // hover from it wherever they overlap -- over their
+                                // own text, which is exactly the part that most
+                                // looks clickable. `contains_pointer` doesn't care
+                                // who is on top, so the cursor stays a hand all the
+                                // way across.
+                                if r.contains_pointer() && expandable.contains(&i) {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                r
+                            });
                         if show_expanders {
                             let has = expandable.contains(&i);
                             let open = *open_detail == Some(i);
                             // A row with nothing to drill into gets a blank
                             // rather than a caret that opens an empty panel.
-                            if has {
-                                let glyph = if open {
-                                    super::icons::CARET_DOWN
-                                } else {
-                                    super::icons::CARET_RIGHT
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(RichText::new(glyph).color(if open {
-                                            th.accent
-                                        } else {
-                                            th.dim
-                                        }))
-                                        .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    // Clicking the open row's caret closes it,
-                                    // so the panel can be got rid of the same
-                                    // way it was opened.
-                                    *open_detail = (!open).then_some(i);
+                            cell_slot(ui, EXPANDER_W, row_h, |ui| {
+                                if has {
+                                    let glyph = if open {
+                                        super::icons::CARET_DOWN
+                                    } else {
+                                        super::icons::CARET_RIGHT
+                                    };
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(glyph).color(if open {
+                                                    th.accent
+                                                } else {
+                                                    th.dim
+                                                }),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        // Clicking the open row's caret closes it,
+                                        // so the panel can be got rid of the same
+                                        // way it was opened.
+                                        *open_detail = (!open).then_some(i);
+                                    }
                                 }
-                            } else {
-                                ui.label(" ");
-                            }
+                            });
                         }
                         if show_icons {
-                            match state {
+                            cell_slot(ui, ICON_W, row_h, |ui| match state {
+                                // Queued to re-run once the run finishes.
+                                _ if queued.contains(&i) => {
+                                    ui.colored_label(th.accent, super::icons::RERUN)
+                                        .on_hover_text(s.report_rerun_queued_hint);
+                                }
                                 // Turning, so a row waiting on a slow endpoint
                                 // says "still going" rather than sitting there
                                 // looking like a result.
@@ -5044,10 +5713,11 @@ fn results_grid(
                                 Some(RowState::Finished) => {
                                     ui.colored_label(th.ok, super::icons::PASS);
                                 }
-                                _ => {
+                                Some(RowState::Scheduled) => {
                                     ui.colored_label(th.dim, super::icons::ROW_SCHEDULED);
                                 }
-                            }
+                                Some(RowState::Idle) | None => {}
+                            });
                         }
                         let text_col = match state {
                             Some(RowState::Running) => th.pending,
@@ -5065,7 +5735,13 @@ fn results_grid(
                             );
                             let w = widths.get(c).copied().unwrap_or(MIN_COL_W);
                             cell_slot(ui, w, row_h, |ui| {
-                                if let Some(ins) = result_cell(ui, text_col, &col.header, &full) {
+                                let resp = result_cell(ui, text_col, &full);
+                                row_context_menu(&resp, s, row_menu.as_mut(), i, state);
+                                if resp.clicked() {
+                                    let ins = CellInspector {
+                                        title: col.header.clone(),
+                                        content: pretty_json_cell(&full),
+                                    };
                                     // Clicking anywhere in a row that has a
                                     // drill-down opens it: the panel is the
                                     // fuller answer to "what is this row?" than
@@ -5082,8 +5758,11 @@ fn results_grid(
                                 }
                             });
                         }
-                        if row_target.is_some_and(|r| r.clicked()) {
-                            *open_detail = Some(i);
+                        if let Some(target) = &row_target {
+                            row_context_menu(target, s, row_menu.as_mut(), i, state);
+                            if target.clicked() && expandable.contains(&i) {
+                                *open_detail = Some(i);
+                            }
                         }
                         ui.end_row();
                     }
@@ -5091,10 +5770,10 @@ fn results_grid(
                     // STATISTICS summary rows (a footer, distinguished by italic accent).
                     for srow in result.summary_rows(columns) {
                         if show_expanders {
-                            ui.label(" ");
+                            cell_slot(ui, EXPANDER_W, row_h, |_| {});
                         }
                         if show_icons {
-                            ui.label(" ");
+                            cell_slot(ui, ICON_W, row_h, |_| {});
                         }
                         for (c, col) in columns.iter().enumerate() {
                             let full = srow.text_cell(c);
@@ -5124,8 +5803,17 @@ fn results_grid(
                     }
                 });
         });
+    if (body.state.offset.x - x).abs() > 0.5 {
+        ui.data_mut(|d| d.insert_temp(x_key, body.state.offset.x));
+        ui.ctx().request_repaint();
+    }
     opened
 }
+
+/// The fixed widths of the grid's leading drill-down caret and status-icon
+/// columns, so the pinned header grid lines up with the rows under it.
+const EXPANDER_W: f32 = 14.0;
+const ICON_W: f32 = 16.0;
 
 /// The gap left between a tethered chip and the chip it qualifies: none, so the
 /// two sit flush and their touching borders form the divider of a single
@@ -5247,7 +5935,7 @@ fn fitted_column_widths(
 ) -> Vec<f32> {
     // The status-glyph column is a fixed narrow gutter, not a data column, so
     // it is taken off the top of the budget rather than shared in it.
-    let icon_w = if show_icons { 18.0 + SPACING_X } else { 0.0 };
+    let icon_w = if show_icons { ICON_W + SPACING_X } else { 0.0 };
     let natural = cached_natural_widths(ui, result, columns);
     let avail = (ui.available_width() - icon_w).max(0.0);
     // Fitting is pure arithmetic over the naturals, so it stays uncached and
@@ -5429,25 +6117,71 @@ fn natural_column_widths(
 /// A single clickable results cell: shows the truncated one-line value, the full
 /// value on hover, and — when clicked — returns a [`CellInspector`] carrying the
 /// cell's full (JSON-pretty-printed) value so a long cell can be read in full.
-fn result_cell(
-    ui: &mut egui::Ui,
-    text_col: Color32,
-    header: &str,
-    full: &str,
-) -> Option<CellInspector> {
+fn result_cell(ui: &mut egui::Ui, text_col: Color32, full: &str) -> egui::Response {
     let cell = flatten_cell(full);
-    let resp = ui
-        .add(
-            egui::Label::new(RichText::new(truncate_cell(&cell)).color(text_col))
-                .truncate()
-                .sense(egui::Sense::click()),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(cell);
-    resp.clicked().then(|| CellInspector {
-        title: header.to_string(),
-        content: pretty_json_cell(full),
-    })
+    ui.add(
+        egui::Label::new(RichText::new(truncate_cell(&cell)).color(text_col))
+            .truncate()
+            .sense(egui::Sense::click()),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    .on_hover_text(cell)
+}
+
+/// The results grid's per-row right-click menu, and what picking from it does.
+pub(super) struct RowMenu<'a> {
+    /// Why a row can't be re-run right now — the item is shown disabled with
+    /// this as its explanation rather than hidden, so the option is findable.
+    /// Not consulted while a run streams: the item queues then instead.
+    pub blocked: Option<&'static str>,
+    /// Set while the grid is a run in flight: picking a finished row queues
+    /// (or unqueues) it to re-run once the run has finished.
+    pub streaming: bool,
+    /// The rows queued that way, by index into this grid.
+    pub queued: std::collections::HashSet<usize>,
+    /// Set to the row whose re-run was picked.
+    pub rerun: &'a mut Option<usize>,
+}
+
+/// Attach the row menu (if any) to `resp`, a cell of row `row` or the row's
+/// own background.
+fn row_context_menu(
+    resp: &egui::Response,
+    s: &Strings,
+    menu: Option<&mut RowMenu<'_>>,
+    row: usize,
+    state: Option<RowState>,
+) {
+    let Some(menu) = menu else {
+        return;
+    };
+    resp.context_menu(|ui| {
+        let (label, blocked) = if menu.queued.contains(&row) {
+            (s.report_rerun_unqueue, None)
+        } else if menu.streaming {
+            // Only a row that has come back has an answer to doubt; it goes
+            // again straight away, beside the run.
+            let blocked =
+                (state != Some(RowState::Finished)).then_some(s.report_rerun_not_back_yet);
+            (s.report_rerun_row, blocked)
+        } else if state == Some(RowState::Running) {
+            (s.report_rerun_row, Some(s.report_rerun_already_running))
+        } else {
+            (s.report_rerun_row, menu.blocked)
+        };
+        let item = ui.add_enabled(
+            blocked.is_none(),
+            egui::Button::new(format!("{} {}", super::icons::RERUN, label)),
+        );
+        let item = match blocked {
+            Some(why) => item.on_disabled_hover_text(why),
+            None => item,
+        };
+        if item.clicked() {
+            *menu.rerun = Some(row);
+            ui.close();
+        }
+    });
 }
 
 /// Pretty-print a cell whose whole trimmed value is a single JSON object/array
@@ -5501,21 +6235,39 @@ fn open_export_dialog(app: &mut GuiApp) {
             // gives an absolute name. A scratch report gives a bare filename,
             // which would land wherever PaperBoy happens to have been started
             // from -- anchor it to the report's own base directory, the folder
-            // the terminal UI's picker opens in.
+            // the terminal UI's picker opens in. A report with no folder of its
+            // own (no file, no `# root:`) has only the process's working
+            // directory for that, which nobody chose; the folder the user last
+            // browsed to is a far better guess.
             if p.is_absolute() {
                 p
             } else {
-                crate::report::context::report_base_dir(
+                let (base, anchored) = crate::report::context::report_base_dir(
                     &e.flow.clone().unwrap_or_default(),
                     e.report.path.as_deref(),
-                )
-                .0
-                .join(p)
+                );
+                let base = if anchored {
+                    base
+                } else {
+                    app.session
+                        .picker_dir(crate::session::PickerKind::Other)
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or(base)
+                };
+                base.join(p)
             }
         })
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "results.csv".to_string());
-    app.dialog = Some(super::app::Dialog::ExportResults { path });
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join("results.csv")
+        })
+        .to_string_lossy()
+        .into_owned();
+    app.dialog = Some(super::app::Dialog::ExportResults {
+        path,
+        replace: false,
+    });
 }
 
 /// The Scratch-style block view: a toolbar plus the stacked, nested blocks.
@@ -7521,8 +8273,7 @@ fn collection_item(
     current: &str,
     picked: &mut Option<String>,
 ) {
-    if ui
-        .selectable_label(c.value == current, &c.label)
+    if super::widgets::selectable_row(ui, c.value == current, &c.label)
         .on_hover_text(&c.detail)
         .clicked()
     {
@@ -7890,7 +8641,7 @@ fn header_chip(
                                 );
                             } else {
                                 for c in choices.map(Vec::as_slice).unwrap_or_default() {
-                                    if ui.selectable_label(c == value, c).clicked() {
+                                    if super::widgets::selectable_row(ui, c == value, c).clicked() {
                                         picked = Some(c.clone());
                                     }
                                 }
@@ -9338,14 +10089,13 @@ fn param_value_combo(
     egui::ComboBox::from_id_salt((path, "pt_param_value"))
         .selected_text(RichText::new(shown).color(text_col))
         .show_ui(ui, |ui| {
-            if ui
-                .selectable_label(current.is_empty(), s.gui_report_param_no_default)
+            if super::widgets::selectable_row(ui, current.is_empty(), s.gui_report_param_no_default)
                 .clicked()
             {
                 *picked = Some(String::new());
             }
             for c in choices {
-                if ui.selectable_label(c == current, c).clicked() {
+                if super::widgets::selectable_row(ui, c == current, c).clicked() {
                     *picked = Some(c.clone());
                 }
             }
@@ -9612,7 +10362,7 @@ fn combo_chip(
                     filtered_choices(ui, s, path, prefix, current, choices, &mut picked);
                 } else {
                     for c in choices {
-                        if ui.selectable_label(c == current, c).clicked() {
+                        if super::widgets::selectable_row(ui, c == current, c).clicked() {
                             picked = Some(c.clone());
                         }
                     }
@@ -9705,7 +10455,7 @@ fn filtered_choices(
                 .iter()
                 .filter(|c| needle.is_empty() || c.to_lowercase().contains(&needle))
             {
-                if ui.selectable_label(c == current, c).clicked() {
+                if super::widgets::selectable_row(ui, c == current, c).clicked() {
                     *picked = Some(c.clone());
                     ui.data_mut(|d| d.remove::<String>(filt_id));
                 }
@@ -9748,7 +10498,7 @@ fn palette_panel(
             match pick_request {
                 None => {
                     for kind in BASE_KINDS {
-                        if ui.selectable_label(false, kind.label(s)).clicked() {
+                        if super::widgets::selectable_row(ui, false, kind.label(s)).clicked() {
                             acts.push(Act::PickKind(kind));
                         }
                     }
@@ -9773,7 +10523,7 @@ fn palette_panel(
                         });
                     }
                     for name in titles {
-                        if ui.selectable_label(false, name).clicked() {
+                        if super::widgets::selectable_row(ui, false, name).clicked() {
                             acts.push(Act::InsertRequest {
                                 report,
                                 name: name.clone(),
@@ -13586,17 +14336,23 @@ mod results_render_tests {
         (result, columns)
     }
 
-    /// A streaming run must not be filtered: `visible_rows` drops pending rows,
-    /// so a live filter would hide the very rows the reader is watching arrive.
+    /// A streaming run with no filter shows every row it has, pending ones
+    /// included — `visible_rows` alone would drop those and empty the view.
     #[test]
-    fn a_live_run_is_shown_unfiltered() {
-        let (result, columns) = fixture(&["A"], &["x"], 3);
+    fn a_live_run_with_no_filter_shows_every_row() {
+        let (mut result, columns) = fixture(&["A"], &["x"], 3);
+        result.pending = [1, 2].into_iter().collect();
         let header = crate::report::flow::Header::default();
-        let mut sel = 0;
-        assert!(
-            super::visible_for_view(&result, &columns, &header, true, &mut sel, "").is_none(),
-            "a live run shows every row it has, filters and all"
+        let rows = super::visible_for_view(
+            &result,
+            &columns,
+            &header,
+            true,
+            None,
+            &crate::report::filter::RowFilter::All,
+            "",
         );
+        assert_eq!(rows, vec![0, 1, 2]);
     }
 
     /// The find box narrows the rows the filter chose, over the columns that are
@@ -13608,27 +14364,19 @@ mod results_render_tests {
             .cells
             .insert("A".to_string(), "needle".to_string());
         let header = crate::report::flow::Header::default();
-        let mut sel = 0;
-        let all = super::visible_for_view(&result, &columns, &header, false, &mut sel, "").unwrap();
-        assert_eq!(all, vec![0, 1, 2], "no text means no narrowing");
-        let hit =
-            super::visible_for_view(&result, &columns, &header, false, &mut sel, "NEED").unwrap();
-        assert_eq!(hit, vec![1], "and the search is case-insensitive");
-    }
-
-    /// The filter selection is an index into a list derived from the *result*,
-    /// so a selection made against a richer result must not index past the end
-    /// of a plainer one (or silently select the wrong filter).
-    #[test]
-    fn a_stale_filter_selection_is_clamped_rather_than_panicking() {
-        let (result, columns) = fixture(&["A"], &["x"], 2);
-        let header = crate::report::flow::Header::default();
-        // A plain result offers only `All`, so index 3 cannot stand.
-        let mut sel = 3;
-        let rows =
-            super::visible_for_view(&result, &columns, &header, false, &mut sel, "").unwrap();
-        assert_eq!(sel, 0, "clamped back onto the only filter there is");
-        assert_eq!(rows, vec![0, 1], "which selects everything");
+        let view = |find| {
+            super::visible_for_view(
+                &result,
+                &columns,
+                &header,
+                false,
+                None,
+                &crate::report::filter::RowFilter::All,
+                find,
+            )
+        };
+        assert_eq!(view(""), vec![0, 1, 2], "no text means no narrowing");
+        assert_eq!(view("NEED"), vec![1], "and the search is case-insensitive");
     }
 
     /// The in-app bar translates its own buttons; the exported document's stay
@@ -14059,6 +14807,8 @@ mod results_render_tests {
                 &[],
                 &mut none,
                 None,
+                None,
+                None,
             );
         });
     }
@@ -14195,8 +14945,347 @@ mod results_render_tests {
                 &[],
                 &mut none,
                 Some(&mut overrides),
+                None,
+                None,
             );
         });
+    }
+
+    /// Where every text that is exactly `needle` was painted this frame, in
+    /// painting order.
+    fn texts_exactly(out: &egui::FullOutput, needle: &str) -> Vec<egui::Rect> {
+        fn walk(shape: &egui::Shape, needle: &str, found: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == needle => {
+                    found.push(t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, needle, found)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for c in &out.shapes {
+            walk(&c.shape, needle, &mut found);
+        }
+        found
+    }
+
+    /// Where the text containing `needle` was painted this frame.
+    fn text_rect(out: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text().contains(needle) => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                _ => None,
+            }
+        }
+        out.shapes.iter().find_map(|c| walk(&c.shape, needle))
+    }
+
+    fn click(at: egui::Pos2, button: egui::PointerButton) -> Vec<egui::Event> {
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button,
+            pressed,
+            modifiers: Default::default(),
+        };
+        vec![egui::Event::PointerMoved(at), press(true), press(false)]
+    }
+
+    /// Right-clicking a row offers to re-run it, and picking that names the
+    /// row; clicking a header sorts by it, ascending first.
+    #[test]
+    fn a_row_menu_offers_a_rerun_and_a_header_click_sorts() {
+        let (mut result, columns) = fixture(&["Name"], &["x"], 2);
+        result.rows[0].cells.insert("Name".into(), "alpha".into());
+        result.rows[1].cells.insert("Name".into(), "bravo".into());
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
+        let ctx = egui::Context::default();
+        let mut rerun = None;
+        let mut sort = None;
+        let frame = |events: Vec<egui::Event>,
+                     rerun: &mut Option<usize>,
+                     sort: &mut Option<(String, bool)>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 400.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                let mut none = None;
+                results_grid(
+                    &th,
+                    &s,
+                    ui,
+                    &result,
+                    &columns,
+                    None,
+                    None,
+                    &[],
+                    &mut none,
+                    None,
+                    Some(sort),
+                    Some(super::RowMenu {
+                        blocked: None,
+                        streaming: false,
+                        queued: Default::default(),
+                        rerun,
+                    }),
+                );
+            })
+        };
+
+        frame(vec![], &mut rerun, &mut sort);
+        let out = frame(vec![], &mut rerun, &mut sort);
+        let bravo = text_rect(&out, "bravo").expect("row 1 is drawn").center();
+        frame(
+            click(bravo, egui::PointerButton::Secondary),
+            &mut rerun,
+            &mut sort,
+        );
+        let out = frame(vec![], &mut rerun, &mut sort);
+        let item = text_rect(&out, s.report_rerun_row)
+            .expect("the right-click opened the row menu")
+            .center();
+        frame(
+            click(item, egui::PointerButton::Primary),
+            &mut rerun,
+            &mut sort,
+        );
+        assert_eq!(rerun, Some(1));
+
+        let out = frame(vec![], &mut rerun, &mut sort);
+        let header = text_rect(&out, "Name").expect("header drawn").center();
+        frame(
+            click(header, egui::PointerButton::Primary),
+            &mut rerun,
+            &mut sort,
+        );
+        assert_eq!(sort, Some(("Name".to_string(), false)));
+    }
+
+    /// The cells don't move sideways when a row's drill-down appears: the
+    /// expander column is there from the start for a report that can have
+    /// one, rather than appearing with the first row that does.
+    #[test]
+    fn cells_stay_put_when_the_first_drill_down_arrives() {
+        let file = OutputColumn {
+            header: "FILE".into(),
+            sources: vec!["FILE".into()],
+            stats: Vec::new(),
+            image: None,
+            truth: None,
+            detail: false,
+        };
+        let body = OutputColumn {
+            header: "Body".into(),
+            sources: vec!["Body".into()],
+            detail: true,
+            ..file.clone()
+        };
+        let mut result = ReportResult::default();
+        let mut row = ReportRow::default();
+        row.vars.insert("FILE".into(), "alpha".into());
+        row.cells.insert("Body".into(), "{\"x\": 1}".into());
+        result.rows.push(row);
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
+        let ctx = egui::Context::default();
+        let x_of_alpha = |result: &ReportResult, state| {
+            let mut out = None;
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 400.0),
+                    )),
+                    ..Default::default()
+                };
+                out = Some(ctx.run_ui(input, |ui| {
+                    let (mut none, mut rerun) = (None, None);
+                    results_grid(
+                        &th,
+                        &s,
+                        ui,
+                        result,
+                        std::slice::from_ref(&file),
+                        Some(&[state]),
+                        None,
+                        &[&body],
+                        &mut none,
+                        None,
+                        None,
+                        Some(super::RowMenu {
+                            blocked: None,
+                            streaming: true,
+                            queued: Default::default(),
+                            rerun: &mut rerun,
+                        }),
+                    );
+                }));
+            }
+            text_rect(&out.unwrap(), "alpha").expect("drawn").min.x
+        };
+        let mut pending = result.clone();
+        pending.pending.insert(0);
+        let before = x_of_alpha(&pending, crate::gui::report_run::RowState::Scheduled);
+        let after = x_of_alpha(&result, crate::gui::report_run::RowState::Finished);
+        assert!((before - after).abs() < 0.5, "{before} vs {after}");
+    }
+
+    fn screen(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 300.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    /// The filter buttons are the same size in every state, so hovering one
+    /// or picking one doesn't slide the rest along under the pointer.
+    #[test]
+    fn the_filter_bar_stays_put_when_hovered_and_picked() {
+        use crate::report::filter::RowFilter;
+        let app = crate::gui::app::GuiApp::for_test(crate::session::Session::default());
+        let th = app.theme;
+        let filters = [
+            RowFilter::All,
+            RowFilter::Differ,
+            RowFilter::Incorrect,
+            RowFilter::Regressed,
+        ];
+        let ctx = egui::Context::default();
+        // The app's own widget style, where the outline widths live.
+        th.apply(&ctx);
+        let last = app.strings.report_filter_regressions;
+        let draw = |events: Vec<egui::Event>, selected: usize| {
+            let mut out = None;
+            let mut events = Some(events);
+            for _ in 0..2 {
+                out = Some(ctx.run_ui(screen(events.take().unwrap_or_default()), |ui| {
+                    let (mut sel, mut find) = (selected, String::new());
+                    super::filter_bar(&th, ui, &app, &filters, &mut sel, &mut find, 1, 1);
+                }));
+            }
+            out.unwrap()
+        };
+        let at_rest = text_rect(&draw(vec![], 0), last).expect("drawn");
+        let picked = text_rect(&draw(vec![], 2), last).expect("drawn");
+        let hover_at = text_rect(&draw(vec![], 0), app.strings.report_filter_incorrect)
+            .expect("drawn")
+            .center();
+        let hovered =
+            text_rect(&draw(vec![egui::Event::PointerMoved(hover_at)], 0), last).expect("drawn");
+        assert!(
+            (at_rest.min.x - picked.min.x).abs() < 0.5,
+            "{at_rest:?} vs {picked:?}"
+        );
+        assert!(
+            (at_rest.min.x - hovered.min.x).abs() < 0.5,
+            "{at_rest:?} vs {hovered:?}"
+        );
+    }
+
+    /// The Correct and Incorrect cards pick the matching filters on the
+    /// roll-up row; with two scored columns, a column's own Incorrect count is
+    /// of a different set of rows, so its card doesn't.
+    #[test]
+    fn the_correct_and_incorrect_cards_pick_their_filters() {
+        use crate::report::filter::RowFilter;
+        use crate::report::metrics::{ColumnMetrics, Metrics};
+        let app = crate::gui::app::GuiApp::for_test(crate::session::Session::default());
+        let th = app.theme;
+        let column = |header: &str, correct, incorrect| ColumnMetrics {
+            header: header.to_string(),
+            total: 4,
+            compared: correct + incorrect,
+            correct,
+            incorrect,
+            matrix: None,
+        };
+        let metrics = Metrics {
+            columns: vec![column("Colour", 3, 1), column("Shape", 1, 3)],
+            overall: Some(column("Correct", 2, 2)),
+            movement: None,
+        };
+        let filters = [RowFilter::All, RowFilter::Correct, RowFilter::Incorrect];
+        let ctx = egui::Context::default();
+        let mut selected = 0;
+        let frame = |events: Vec<egui::Event>, selected: &mut usize| {
+            ctx.run_ui(screen(events), |ui| {
+                super::metric_cards(&th, ui, &app, &metrics, &filters, selected);
+            })
+        };
+        frame(vec![], &mut selected);
+        let out = frame(vec![], &mut selected);
+        // The first card captioned exactly "Correct" is the roll-up's (its
+        // "Correct — compared" card doesn't match exactly).
+        let cards = texts_exactly(&out, app.strings.report_metric_correct);
+        frame(
+            click(cards[0].center(), egui::PointerButton::Primary),
+            &mut selected,
+        );
+        assert_eq!(selected, 1, "the roll-up's Correct card picks Correct");
+
+        let incorrect = texts_exactly(&out, app.strings.report_metric_incorrect);
+        assert_eq!(incorrect.len(), 3, "roll-up + two columns");
+        selected = 0;
+        frame(vec![], &mut selected);
+        frame(
+            click(incorrect[1].center(), egui::PointerButton::Primary),
+            &mut selected,
+        );
+        assert_eq!(
+            selected, 0,
+            "a column's own count with two columns is plain"
+        );
+    }
+
+    /// Clicking the "Regressed" card selects the Regressions filter; clicking it
+    /// again goes back to every row.
+    #[test]
+    fn clicking_a_movement_card_filters_to_its_rows() {
+        use crate::report::filter::RowFilter;
+        use crate::report::metrics::{Metrics, Movement};
+        let app = crate::gui::app::GuiApp::for_test(crate::session::Session::default());
+        let th = app.theme;
+        let metrics = Metrics {
+            columns: Vec::new(),
+            overall: None,
+            movement: Some(Movement {
+                fixed: 2,
+                regressed: 1,
+                still_wrong: 0,
+                unchanged: 5,
+            }),
+        };
+        let filters = [RowFilter::All, RowFilter::Regressed, RowFilter::Fixed];
+        let ctx = egui::Context::default();
+        let mut selected = 0;
+        let frame = |events: Vec<egui::Event>, selected: &mut usize| {
+            ctx.run_ui(screen(events), |ui| {
+                super::metric_cards(&th, ui, &app, &metrics, &filters, selected);
+            })
+        };
+        frame(vec![], &mut selected);
+        let out = frame(vec![], &mut selected);
+        let card = text_rect(&out, app.strings.report_metric_regressed)
+            .expect("drawn")
+            .center();
+        frame(click(card, egui::PointerButton::Primary), &mut selected);
+        assert_eq!(selected, 1);
+        frame(vec![], &mut selected);
+        frame(click(card, egui::PointerButton::Primary), &mut selected);
+        assert_eq!(selected, 0, "picking it again shows every row");
     }
 }
 
@@ -14482,7 +15571,7 @@ mod toolbar_commit_tests {
         }
         super::open_export_dialog(&mut app);
         let path = match app.dialog {
-            Some(super::super::app::Dialog::ExportResults { path }) => path,
+            Some(super::super::app::Dialog::ExportResults { path, .. }) => path,
             _ => panic!("Export opens PaperBoy's own dialog"),
         };
         std::fs::remove_dir_all(&dir).ok();
@@ -14491,6 +15580,21 @@ mod toolbar_commit_tests {
             trail.with_extension("xlsx").to_string_lossy(),
             "the file is named for the report, in the format it declares, beside it"
         );
+    }
+
+    /// The Export dialog always says exactly where the file will go: a
+    /// full path, never a bare name resolved against wherever PaperBoy was
+    /// started from.
+    #[test]
+    fn the_export_dialog_offers_a_full_path() {
+        // No file, no `# root:`: the case that used to offer a bare name.
+        let mut app = app_with_report("# collection: api\n");
+        super::open_export_dialog(&mut app);
+        let path = match app.dialog {
+            Some(super::super::app::Dialog::ExportResults { path, .. }) => path,
+            _ => panic!("Export opens PaperBoy's own dialog"),
+        };
+        assert!(std::path::Path::new(&path).is_absolute(), "{path}");
     }
 
     #[test]
@@ -14506,7 +15610,7 @@ mod toolbar_commit_tests {
         }
         super::open_export_dialog(&mut app);
         let path = match app.dialog {
-            Some(super::super::app::Dialog::ExportResults { path }) => path,
+            Some(super::super::app::Dialog::ExportResults { path, .. }) => path,
             _ => panic!("Export opens PaperBoy's own dialog"),
         };
         std::fs::remove_dir_all(&dir).ok();
@@ -15147,6 +16251,295 @@ pub(crate) mod stop_run_tests {
         assert!(!ed.is_running());
     }
 
+    /// A dry run relabels what is on show with the answers it previewed, but
+    /// the result's own run parameters — what a row re-run is sent with — stay
+    /// those it was made with.
+    #[test]
+    fn a_preview_leaves_the_results_run_parameters_alone() {
+        let (mut app, mut ed) = editor();
+        ed.result_run_params.insert("REGION".into(), "au".into());
+        ed.params_confirmed = true;
+        ed.param_values.insert("REGION".into(), "eu".into());
+        ed.start_dry_run(&mut app);
+        assert_eq!(
+            ed.result_run_params.get("REGION").map(String::as_str),
+            Some("au")
+        );
+    }
+
+    /// A row can be re-run only from a finished run — and that survives the
+    /// editor being closed and reopened over the run, and the report being
+    /// edited since (the re-run uses the flow the result came from).
+    #[test]
+    fn a_row_can_be_rerun_only_from_a_finished_run() {
+        let (app, mut ed) = editor();
+        let s = &app.strings;
+        assert!(ed.flow.is_some());
+        let mut finished = result_with("200");
+        finished.finalized = true;
+        ed.result = Some(finished);
+        ed.result_flow = ed.flow.clone();
+        assert_eq!(ed.rerun_blocked(s), None);
+
+        let parked = ed.park_run();
+        ed.adopt_run(parked);
+        assert_eq!(
+            ed.rerun_blocked(s),
+            None,
+            "parking keeps what the run came from"
+        );
+
+        ed.result.as_mut().unwrap().pending.insert(0);
+        assert_eq!(ed.rerun_blocked(s), Some(s.report_rerun_blocked_partial));
+        ed.result.as_mut().unwrap().pending.clear();
+
+        ed.progress = Some(crate::gui::report_run::RunProgress::rerun(1, &[0]));
+        assert_eq!(ed.rerun_blocked(s), Some(s.report_rerun_blocked_running));
+        ed.progress = None;
+
+        ed.report.text.push_str("\n# edited\n");
+        assert_eq!(
+            ed.rerun_blocked(s),
+            None,
+            "an edit doesn't strand the result"
+        );
+
+        ed.result_flow = None;
+        assert_eq!(ed.rerun_blocked(s), Some(s.report_rerun_blocked_partial));
+        ed.result_flow = ed.flow.clone();
+
+        // Stopped after the last row landed but before the run finished: no
+        // row is pending, but the grid is still the raw, uncollapsed one.
+        ed.result.as_mut().unwrap().finalized = false;
+        assert_eq!(ed.rerun_blocked(s), Some(s.report_rerun_blocked_partial));
+    }
+
+    /// Mid-run, picking a row that has come back re-runs it straight away:
+    /// every finished side of its case is drawn running until it lands, and a
+    /// row still waiting on the run itself is refused.
+    #[test]
+    fn a_row_picked_mid_run_reruns_at_once() {
+        use crate::gui::report_run::RowState;
+        use crate::report::model::RowRole;
+        let (mut app, mut ed) = editor();
+        let (handle, _tx) = test_handle();
+        let row = |role, path| crate::report::model::ReportRow {
+            key: vec!["a".to_string()],
+            role,
+            comparison: Some("c".to_string()),
+            path: vec![(0, path)],
+            ..Default::default()
+        };
+        ed.result = Some(ReportResult {
+            rows: vec![
+                row(RowRole::Baseline, 0),
+                row(RowRole::Candidate, 1),
+                crate::report::model::ReportRow {
+                    key: vec!["b".to_string()],
+                    path: vec![(0, 2)],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        // Bound to a collection, as any report that ran is.
+        app.session
+            .collections
+            .push(crate::collection::Collection::new("api".into(), Vec::new()));
+        ed.result_flow = crate::report::parser::parse_flow("# collection: api\n").ok();
+        ed.run = Some(handle);
+        ed.progress = Some(crate::gui::report_run::RunProgress {
+            states: vec![RowState::Finished, RowState::Finished, RowState::Scheduled],
+            index: Default::default(),
+            done: 2,
+            total: 3,
+            rerun: false,
+        });
+        assert!(ed.streaming());
+
+        ed.rerun_row_live(&mut app, 2);
+        assert!(matches!(
+            app.session.status,
+            Some(Status::ReportRowRerunBlocked(_))
+        ));
+
+        ed.rerun_row_live(&mut app, 1);
+        assert_eq!(
+            ed.progress.as_ref().unwrap().states,
+            vec![RowState::Running, RowState::Running, RowState::Scheduled],
+            "both sides of the case go again"
+        );
+        assert!(ed.run.as_ref().unwrap().rerunning_live());
+        assert!(
+            ed.queued_reruns.is_empty(),
+            "nothing waits for the run's end"
+        );
+    }
+
+    /// A filter picked mid-run that the finished report has no rows for —
+    /// Waiting always, since nothing is waiting once the run is done — gives
+    /// way to every row when the run finishes.
+    #[test]
+    fn a_filter_the_finished_run_leaves_empty_gives_way_to_all() {
+        let (_app, mut ed) = editor();
+        let (handle, tx) = test_handle();
+        ed.result = Some(result_with("200"));
+        ed.results_filter = RowFilter::Waiting;
+        tx.send(crate::gui::report_run::RunUpdate::Done({
+            let mut done = result_with("200");
+            done.finalized = true;
+            done
+        }))
+        .unwrap();
+        ed.run = Some(handle);
+        let mut app = crate::gui::app::GuiApp::for_test(crate::session::Session::default());
+        ed.poll_run(&mut app);
+        assert_eq!(ed.results_filter, RowFilter::All);
+    }
+
+    /// Stopping a comparison part-way keeps it readable: the grid is frozen
+    /// as it was (and can be resumed), and an export writes the pairs that came
+    /// back, compared and marked partial — not one raw row per side.
+    #[test]
+    fn a_stopped_comparison_freezes_and_exports_its_finished_pairs() {
+        let (mut app, mut ed) = editor();
+        let text = "FOR X IN [1, 2]\n\
+                    \x20 FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n\
+                    \x20   REPORT \"{{a}}\" AS \"proc.v\"\n\
+                    \x20 END\n\
+                    END\n";
+        let flow = crate::report::parser::parse_flow(text).unwrap();
+        let env = |a: &str| {
+            [("a".to_string(), a.to_string())]
+                .into_iter()
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let ctx = crate::report::run::RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: Default::default(),
+            named_envs: [
+                ("prod".to_string(), env("P")),
+                ("staging".to_string(), env("S")),
+            ]
+            .into_iter()
+            .collect(),
+            root: None,
+            runner: &crate::report::run::DryRunner,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+            shuffle: None,
+            cancel: None,
+        };
+        let mut live = crate::report::run::run_flow_raw(&flow, &ctx);
+        let waiting = live
+            .rows
+            .iter()
+            .position(|r| {
+                r.role == crate::report::model::RowRole::Candidate
+                    && r.vars.get("X").map(String::as_str) == Some("2")
+            })
+            .unwrap();
+        live.pending.insert(waiting);
+        let n = live.rows.len();
+        let (handle, _tx) = test_handle();
+        ed.result_flow = Some(flow);
+        ed.result = Some(live);
+        ed.run = Some(handle);
+        ed.progress = Some(crate::gui::report_run::RunProgress {
+            states: vec![crate::gui::report_run::RowState::Finished; n],
+            index: Default::default(),
+            done: n - 1,
+            total: n,
+            rerun: false,
+        });
+
+        ed.stop_run(&mut app);
+        assert!(
+            ed.frozen(),
+            "a stopped run is shown as it was, and can resume"
+        );
+        ed.refresh_live_summary();
+        assert!(ed.live_summary.is_some(), "the summary stays");
+
+        let exported = ed.exportable_result().unwrap().into_owned();
+        assert_eq!(
+            exported.rows.len(),
+            1,
+            "the one pair that came back, compared"
+        );
+        assert!(
+            exported.rows[0]
+                .cells
+                .contains_key(crate::report::compare::RESULT_COLUMN)
+        );
+        assert_eq!(
+            exported.partial.map(|p| (p.rows_completed, p.rows_planned)),
+            Some((n - 1, n))
+        );
+    }
+
+    /// While a row re-runs, picking another queues it to go next — but not
+    /// the row already re-running.
+    #[test]
+    fn rows_picked_during_a_rerun_queue_to_go_next() {
+        let (mut app, mut ed) = editor();
+        let (handle, _tx) = test_handle();
+        let mut finished = result_with("200");
+        finished.rows.push(finished.rows[0].clone());
+        finished.rows[0].path = vec![(0, 0)];
+        finished.rows[1].path = vec![(0, 1)];
+        finished.finalized = true;
+        ed.result = Some(finished);
+        ed.run = Some(handle);
+        ed.progress = Some(crate::gui::report_run::RunProgress::rerun(2, &[0]));
+        assert!(ed.rerunning() && !ed.streaming());
+
+        ed.toggle_queued_rerun(&mut app, 0);
+        assert!(ed.queued_reruns.is_empty(), "already re-running");
+        ed.toggle_queued_rerun(&mut app, 1);
+        assert_eq!(ed.queued_reruns.len(), 1);
+        assert!(matches!(
+            app.session.status,
+            Some(Status::ReportRowRerunQueued { rows: 1 })
+        ));
+
+        // The re-run lands: the queued row goes next.
+        ed.run = None;
+        ed.progress = None;
+        assert_eq!(ed.take_ready_reruns(), Some(vec![1]));
+    }
+
+    /// A filter that a re-run has left selecting nothing gives way to the
+    /// whole table; one that still selects rows is kept, even though the list
+    /// of filters on offer may have moved under it.
+    #[test]
+    fn a_filter_left_empty_by_a_rerun_falls_back_to_all() {
+        use crate::report::compare::{MATCH, RESULT_COLUMN};
+        let (_app, mut ed) = editor();
+        let mut result = result_with("200");
+        result.rows.push(result.rows[0].clone());
+        for row in &mut result.rows {
+            row.cells
+                .insert(RESULT_COLUMN.to_string(), "{\"a\":1}".to_string());
+        }
+        ed.result = Some(result);
+        ed.results_filter = RowFilter::Differ;
+
+        ed.result.as_mut().unwrap().rows[0]
+            .cells
+            .insert(RESULT_COLUMN.to_string(), MATCH.to_string());
+        ed.fall_back_from_an_empty_filter();
+        assert_eq!(ed.results_filter, RowFilter::Differ, "row 1 still differs");
+
+        ed.result.as_mut().unwrap().rows[1]
+            .cells
+            .insert(RESULT_COLUMN.to_string(), MATCH.to_string());
+        ed.fall_back_from_an_empty_filter();
+        assert_eq!(ed.results_filter, RowFilter::All);
+    }
+
     /// Retiring the handle must not take the partial grid with it: rows that
     /// completed before the stop keep their real responses, and the user can
     /// still read, save or export them.
@@ -15161,7 +16554,9 @@ pub(crate) mod stop_run_tests {
             index: Default::default(),
             done: 0,
             total: 1,
+            rerun: false,
         });
+        ed.results_filter = RowFilter::Waiting;
 
         ed.stop_run(&mut app);
 
@@ -15169,6 +16564,11 @@ pub(crate) mod stop_run_tests {
             ed.result.as_ref().map(|r| r.rows.len()),
             Some(1),
             "the partial grid survives the stop"
+        );
+        assert_eq!(
+            ed.results_filter,
+            RowFilter::All,
+            "and is shown whole: no filter can read the stopped grid"
         );
         assert!(
             ed.progress.is_none(),

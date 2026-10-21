@@ -329,6 +329,175 @@ fn effective_params(flow: &ReportFlow, ctx: &RunContext) -> super::params::Param
     super::params::effective(&flow.params(), &ctx.params)
 }
 
+/// The produced columns whose values are settled before any request is sent —
+/// see [`ReportResult::planned_columns`].
+///
+/// Worked out from the flow's text rather than observed: the skeleton a live
+/// grid starts from comes from a dry pass, where no request returns anything,
+/// so a column that *would* read a capture looks exactly like one that never
+/// does. A `REPORT <var>`, `REPORT <var> AS …` or `REPORT "<template>" AS …`
+/// column is planned when every name it reads is a loop variable, parameter,
+/// assignment or environment value — and not a capture or `[Gen]` value of any
+/// request the flow sends, a step-qualified (`step.var`) reference, a
+/// generator call, or an assignment that itself reads one of those. A column
+/// any statement fills from a response is never planned.
+fn planned_columns(flow: &ReportFlow, ctx: &RunContext) -> std::collections::HashSet<String> {
+    #[derive(Default)]
+    struct Walk {
+        produced: HashSet<String>,
+        assigns: Vec<(String, String)>,
+        reports: Vec<(String, Vec<String>)>,
+    }
+    use std::collections::HashSet;
+    fn walk(nodes: &[FlowNode], ctx: &RunContext, w: &mut Walk) {
+        let note_request = |name: &str, w: &mut Walk| {
+            if let Some(e) = resolve_qualified(ctx.entries, ctx.helpers, name) {
+                w.produced.extend(e.captures.iter().map(|(n, _)| n.clone()));
+                w.produced
+                    .extend(e.generators.iter().map(|(n, _)| n.clone()));
+            }
+        };
+        for node in nodes {
+            match node {
+                FlowNode::Assign { key, value } => {
+                    w.assigns.push((key.clone(), unquote(value)));
+                }
+                FlowNode::Request { name, .. } | FlowNode::Cleanup { name, .. } => {
+                    note_request(name, w)
+                }
+                FlowNode::Report(stmt) => match stmt {
+                    ReportStmt::Request { name, .. } => note_request(name, w),
+                    ReportStmt::Vars(vars) => {
+                        for v in vars {
+                            w.reports.push((v.clone(), vec![v.clone()]));
+                        }
+                    }
+                    ReportStmt::VarAs { var, name, .. } => {
+                        w.reports.push((name.clone(), vec![var.clone()]));
+                    }
+                    ReportStmt::Computed { template, name, .. } => {
+                        w.reports.push((name.clone(), template_refs(template)));
+                    }
+                },
+                FlowNode::ForEach { body, .. }
+                | FlowNode::ForEnvs { body, .. }
+                | FlowNode::Graph { body, .. } => walk(body, ctx, w),
+                _ => {}
+            }
+        }
+    }
+    let mut w = Walk::default();
+    walk(&flow.nodes, ctx, &mut w);
+    let plain = |n: &str| {
+        !n.is_empty()
+            && n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    };
+    // An assignment is unsettled if it reads anything unsettled — repeated
+    // until nothing changes, since one assignment can read another.
+    let mut unsettled = w.produced;
+    loop {
+        let before = unsettled.len();
+        for (key, value) in &w.assigns {
+            if template_refs(value)
+                .iter()
+                .any(|r| !plain(r) || unsettled.contains(r))
+            {
+                unsettled.insert(key.clone());
+            }
+        }
+        if unsettled.len() == before {
+            break;
+        }
+    }
+    let mut planned = HashSet::new();
+    let mut refused = HashSet::new();
+    for (column, refs) in w.reports {
+        if refs.iter().all(|r| plain(r) && !unsettled.contains(r)) {
+            planned.insert(column);
+        } else {
+            refused.insert(column);
+        }
+    }
+    planned.retain(|c| !refused.contains(c));
+    planned
+}
+
+/// The names a `{{ … }}` template reads, as written between the braces.
+fn template_refs(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            break;
+        };
+        out.push(after[..close].trim().to_string());
+        rest = &after[close + 2..];
+    }
+    out
+}
+
+/// The rows a run is limited to: one pattern per selected row, one
+/// `(loop node index, iteration)` step per enclosing loop — a
+/// [`ReportRow::path`] with some iterations left open.
+///
+/// The open steps are the role-bearing `ENVS` loops. A finished comparison row
+/// is a *collapse* of a baseline row and a candidate row that differ only in
+/// that loop's iteration, so re-producing it means running every side of the
+/// comparison again, not just the side whose path the collapsed row kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RowSelection {
+    patterns: Vec<Vec<(usize, Option<usize>)>>,
+}
+
+impl RowSelection {
+    /// The selection that produces exactly the raw rows at `paths` — no side
+    /// of a comparison opened up — which is what resuming a stopped run needs:
+    /// the sides that already came back stay as they are.
+    pub fn exact(paths: &[Vec<(usize, usize)>]) -> Self {
+        RowSelection {
+            patterns: paths
+                .iter()
+                .map(|p| p.iter().map(|&(n, i)| (n, Some(i))).collect())
+                .collect(),
+        }
+    }
+
+    /// The selection that re-produces the rows at `paths` of a run of `flow`.
+    pub fn for_paths(flow: &ReportFlow, paths: &[Vec<(usize, usize)>]) -> Self {
+        let patterns = paths
+            .iter()
+            .map(|path| {
+                let mut block: &[FlowNode] = &flow.nodes;
+                path.iter()
+                    .map(|&(n, i)| match block.get(n) {
+                        Some(FlowNode::ForEnvs {
+                            clause: EnvClause::Roles { .. },
+                            body,
+                            ..
+                        }) => {
+                            block = body;
+                            (n, None)
+                        }
+                        Some(FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. }) => {
+                            block = body;
+                            (n, Some(i))
+                        }
+                        // Not a loop the walk can follow (a saved snapshot's
+                        // rows carry a path of their own making): pin the rest.
+                        _ => {
+                            block = &[];
+                            (n, Some(i))
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        RowSelection { patterns }
+    }
+}
+
 /// Run a whole flow and collect its rows, applying the final comparison/baseline
 /// collapse. This is the batch entry point (CSV export, dry run, tests); for a
 /// live streaming run a front-end sets [`RunContext::sink`] and calls
@@ -347,7 +516,23 @@ pub fn run_flow(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
 /// front-end can build its grid from these raw rows (which map 1:1 to the sink's
 /// updates) and only collapse at the end.
 pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
+    run_flow_raw_selected(flow, ctx, None)
+}
+
+/// [`run_flow_raw`] limited to the loop iterations that produce the rows
+/// `selection` names — what re-running a few rows of a finished report needs.
+///
+/// Everything *outside* the loops still runs: a request written above a loop
+/// (a login, a setup call) is what the rows inside it were produced with, and
+/// skipping it would re-run them against nothing. Loops off the selected paths
+/// run no iterations at all.
+pub fn run_flow_raw_selected(
+    flow: &ReportFlow,
+    ctx: &RunContext,
+    selection: Option<&RowSelection>,
+) -> ReportResult {
     let mut ex = Exec::new(ctx);
+    ex.selection = selection.cloned().map(std::sync::Arc::new);
     // Only `baseline_show` is wanted here, and it is a list of field names: no
     // role target is read, so there is nothing for the run's answers to correct
     // — and none exist yet, since this is the call that starts the run.
@@ -371,7 +556,9 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         // caller that stopped one part-way (see [`Cancel`]) can say otherwise,
         // and it sets this afterwards.
         partial: None,
+        finalized: false,
         role_targets: ex.role_targets,
+        planned_columns: planned_columns(flow, ctx),
         column_order: ex.column_order,
         no_match_marker,
         errors: ex.errors,
@@ -390,6 +577,7 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         // populates this, for the skeleton it is filling in.
         pending: std::collections::HashSet::new(),
         baseline_rows: HashMap::new(),
+        baseline_errors: HashMap::new(),
         track_baseline: false,
         trends: HashMap::new(),
         // Decided by `finalize`, not here: the emit phase runs against an
@@ -446,6 +634,146 @@ pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) 
     }
     resolve_truths(result, flow);
     resolve_images(result, flow, ctx);
+    result.finalized = true;
+}
+
+/// What the finished report would say, so far, about the rows a live run has
+/// produced — collapsed and scored exactly as [`finalize`] will, so a
+/// front-end can show the run's metrics and confusion matrices filling in
+/// rather than appearing only at the end.
+///
+/// Only the rows that have come back are used, and a baseline whose
+/// comparison row is still on its way is left out rather than shown as `no
+/// candidate`: counted then, its answers would stand in for the comparison's
+/// in every figure until the real one landed. Pictures are not fetched — the
+/// figures don't need them, and this is recomputed as the run goes.
+pub fn project_live(
+    live: &ReportResult,
+    flow: &ReportFlow,
+    params: &super::params::ParamValues,
+    root: Option<&std::path::Path>,
+) -> ReportResult {
+    let pending_sides: std::collections::HashSet<(Vec<String>, Option<String>)> = live
+        .pending
+        .iter()
+        .filter_map(|&r| live.rows.get(r))
+        .map(|row| (row.key.clone(), row.comparison.clone()))
+        .collect();
+    let mut result = ReportResult {
+        rows: live
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !live.pending.contains(i))
+            .map(|(_, row)| row.clone())
+            .collect(),
+        pending: std::collections::HashSet::new(),
+        images: HashMap::new(),
+        ..live.clone()
+    };
+    result.track_baseline = result
+        .resolved_columns(&flow.header)
+        .iter()
+        .any(|c| c.truth.is_some());
+    let params = super::params::effective(&flow.params(), params);
+    if let Some(roles) = super::compare::comparison_roles_with(flow, &params, &result.role_targets)
+    {
+        super::compare::apply(&mut result, &roles);
+    } else if let Some(rel) = flow
+        .header
+        .baseline()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
+        let path = super::producers::resolve_path(root, rel);
+        if let Ok(baseline) = super::baseline::Baseline::load(&path) {
+            super::baseline::apply(&mut result, &baseline);
+        }
+    }
+    // A candidate whose baseline is still on its way isn't "no baseline" yet.
+    for row in &mut result.rows {
+        if row.cells.get(RESULT_COLUMN).map(String::as_str) == Some(super::compare::NO_BASELINE)
+            && pending_sides.contains(&(row.key.clone(), row.comparison.clone()))
+        {
+            row.cells.insert(
+                RESULT_COLUMN.to_string(),
+                super::compare::WAITING_BASELINE.to_string(),
+            );
+        }
+    }
+    // Drop the baselines still waiting on their other side. Done by index, so
+    // the per-row maps the collapse keyed by it are re-keyed with the rows.
+    let keep: Vec<bool> = result
+        .rows
+        .iter()
+        .map(|row| {
+            row.cells.get(RESULT_COLUMN).map(String::as_str) != Some(super::compare::NO_CANDIDATE)
+                || !pending_sides.contains(&(row.key.clone(), row.comparison.clone()))
+        })
+        .collect();
+    if keep.iter().any(|k| !k) {
+        let mut renumber = HashMap::new();
+        let mut rows = Vec::new();
+        for (i, row) in std::mem::take(&mut result.rows).into_iter().enumerate() {
+            if keep[i] {
+                renumber.insert(i, rows.len());
+                rows.push(row);
+            }
+        }
+        result.rows = rows;
+        result.baseline_rows = std::mem::take(&mut result.baseline_rows)
+            .into_iter()
+            .filter_map(|(i, row)| renumber.get(&i).map(|&j| (j, row)))
+            .collect();
+        result.baseline_errors = std::mem::take(&mut result.baseline_errors)
+            .into_iter()
+            .filter_map(|(i, e)| renumber.get(&i).map(|&j| (j, e)))
+            .collect();
+    }
+    resolve_truths(&mut result, flow);
+    // The verdict columns a finished report will carry are there from the
+    // start, scored or not, so the filters that read them are offered before
+    // the first row lands rather than appearing one by one as rows do.
+    if !result.column_truths.is_empty() {
+        let has = |r: &ReportResult, c: &str| r.column_order.iter().any(|k| k == c);
+        if !has(&result, CORRECT_COLUMN) {
+            result.column_order.push(CORRECT_COLUMN.to_string());
+        }
+        if has(&result, RESULT_COLUMN) && !has(&result, TREND_COLUMN) {
+            result.column_order.push(TREND_COLUMN.to_string());
+        }
+    }
+    result
+}
+
+/// The metrics a live view shows for `projected` (a [`project_live`] result):
+/// what has been scored so far — and, before anything has, the same summary
+/// at zero, so it is laid out from the first frame instead of appearing when
+/// the first row lands. A comparison's movement likewise starts at zero rather
+/// than appearing with the first pair.
+pub fn live_metrics(
+    projected: &ReportResult,
+    flow: &ReportFlow,
+) -> Option<super::metrics::Metrics> {
+    let header = &flow.header;
+    let columns = projected.resolved_columns(header);
+    let labels = super::labels::LabelMap::parse(&header.labels());
+    // The roll-up comes with the `Correct` column, which is only added once
+    // something is scored; a `columns:` directive that leaves it out leaves
+    // the roll-up out too.
+    let with_overall = header.columns().is_none_or(|spec| {
+        spec.split(',')
+            .any(|c| c.trim().starts_with(CORRECT_COLUMN))
+    });
+    let mut metrics = projected
+        .metrics(&columns, header)
+        .or_else(|| super::metrics::Metrics::empty(&columns, &labels, with_overall))?;
+    let comparing = super::compare::comparison_roles(flow).is_some()
+        || header.baseline().is_some_and(|b| !b.trim().is_empty());
+    if comparing && metrics.movement.is_none() {
+        metrics.movement = Some(Default::default());
+    }
+    Some(metrics)
 }
 
 /// Score every `TRUTH` column against its ground truth, filling
@@ -614,6 +942,10 @@ fn resolve_images(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext
 /// Mutable interpreter state threaded through the walk.
 struct Exec<'a> {
     ctx: &'a RunContext<'a>,
+    /// The rows this run is limited to, when it is re-producing some rows of an
+    /// earlier run rather than all of them (see [`RowSelection`]). `None` runs
+    /// every iteration of every loop.
+    selection: Option<std::sync::Arc<RowSelection>>,
     /// Lexical scope stack (outer → inner). Each frame holds this-block's
     /// `Assign`/loop-bind variables; inner frames shadow outer.
     scopes: Vec<HashMap<String, String>>,
@@ -743,6 +1075,7 @@ struct Exec<'a> {
 /// its captures don't leak to the continuation).
 #[derive(Clone)]
 struct ExecState {
+    selection: Option<std::sync::Arc<RowSelection>>,
     scopes: Vec<HashMap<String, String>>,
     lists: HashMap<String, Producer>,
     captures: HashMap<String, String>,
@@ -1288,6 +1621,7 @@ impl<'a> Exec<'a> {
     fn new(ctx: &'a RunContext<'a>) -> Self {
         Exec {
             ctx,
+            selection: None,
             scopes: vec![HashMap::new()],
             lists: HashMap::new(),
             captures: HashMap::new(),
@@ -1321,6 +1655,7 @@ impl<'a> Exec<'a> {
     /// and to isolate each iteration's variable/capture scope.
     fn to_state(&self) -> ExecState {
         ExecState {
+            selection: self.selection.clone(),
             scopes: self.scopes.clone(),
             lists: self.lists.clone(),
             captures: self.captures.clone(),
@@ -1380,6 +1715,7 @@ impl<'a> Exec<'a> {
     fn from_state(ctx: &'a RunContext<'a>, state: ExecState) -> Self {
         Exec {
             ctx,
+            selection: state.selection,
             scopes: state.scopes,
             lists: state.lists,
             captures: state.captures,
@@ -1406,6 +1742,42 @@ impl<'a> Exec<'a> {
             role_targets: HashMap::new(),
             baseline_show: state.baseline_show,
         }
+    }
+
+    /// Which iterations of the loop at `node_index` (in the current block) this
+    /// run should execute, out of `count`: all of them for an unrestricted run,
+    /// the ones a [`RowSelection`] pattern passes through otherwise, and `None`
+    /// when no selected row lies inside this loop at all — so the loop is
+    /// skipped whole, snapshot rows included.
+    fn selected_iterations(&self, node_index: usize, count: usize) -> Option<Vec<usize>> {
+        let Some(sel) = &self.selection else {
+            return Some((0..count).collect());
+        };
+        let depth = self.path.len();
+        let mut reached = false;
+        let mut picked = std::collections::BTreeSet::new();
+        for pattern in &sel.patterns {
+            let Some(&(n, iteration)) = pattern.get(depth) else {
+                continue;
+            };
+            let on_path = n == node_index
+                && pattern
+                    .iter()
+                    .zip(&self.path)
+                    .all(|(&(pn, pi), &(cn, ci))| pn == cn && pi.is_none_or(|pi| pi == ci));
+            if !on_path {
+                continue;
+            }
+            reached = true;
+            match iteration {
+                None => return Some((0..count).collect()),
+                Some(i) if i < count => {
+                    picked.insert(i);
+                }
+                Some(_) => {}
+            }
+        }
+        reached.then(|| picked.into_iter().collect())
     }
 
     /// The effective `PARALLEL` worker count for a loop marked with `spec`:
@@ -2605,6 +2977,9 @@ impl<'a> Exec<'a> {
         for (k, v) in inherited {
             seed.broadcast.insert(k.clone(), v.clone());
         }
+        let Some(picked) = self.selected_iterations(node_index, items.len()) else {
+            return Vec::new();
+        };
         let ctx = self.ctx;
         let run_one = |i: usize| -> IterOut {
             let item = &items[i];
@@ -2628,7 +3003,7 @@ impl<'a> Exec<'a> {
                 warnings: sub.warnings,
             }
         };
-        self.run_iterations(items.len(), parallel, run_one)
+        self.run_iterations(&picked, parallel, run_one)
     }
 
     /// Run a `GRAPH` region: order its steps by the graph, then execute them.
@@ -2852,7 +3227,10 @@ impl<'a> Exec<'a> {
                 warnings: sub.warnings,
             }
         };
-        let mut rows = self.run_iterations(live.len(), parallel, run_one);
+        let Some(picked) = self.selected_iterations(node_index, live.len()) else {
+            return Vec::new();
+        };
+        let mut rows = self.run_iterations(&picked, parallel, run_one);
 
         // Inject each `FILE(…)` role's saved snapshot: it is loaded once (no
         // environment is run) and its rows stand in for a live run of that role.
@@ -2907,13 +3285,14 @@ impl<'a> Exec<'a> {
     /// notes and errors back into this `Exec`.
     fn run_iterations<F>(
         &mut self,
-        count: usize,
+        indices: &[usize],
         parallel: Option<&ParallelSpec>,
         run_one: F,
     ) -> Vec<ReportRow>
     where
         F: Fn(usize) -> IterOut + Sync,
     {
+        let count = indices.len();
         let outs: Vec<IterOut> = match parallel {
             Some(spec) if count > 1 => {
                 let degree = self.parallel_degree(spec, count);
@@ -2937,7 +3316,7 @@ impl<'a> Exec<'a> {
                                 if cancel.is_some_and(Cancel::stopped) {
                                     break;
                                 }
-                                let out = run_one(i);
+                                let out = run_one(indices[i]);
                                 *slots[i].lock().unwrap() = Some(out);
                             }
                         });
@@ -2951,9 +3330,10 @@ impl<'a> Exec<'a> {
                     .flat_map(|m| m.into_inner().unwrap())
                     .collect()
             }
-            _ => (0..count)
+            _ => indices
+                .iter()
                 .take_while(|_| !self.ctx.cancel.is_some_and(Cancel::stopped))
-                .map(&run_one)
+                .map(|&i| run_one(i))
                 .collect(),
         };
 
@@ -8345,6 +8725,645 @@ mod tests {
             .position(|c| c.header == "svc.Elapsed")
             .expect("Elapsed column present");
         assert_eq!(summary[0].text_cell(idx), "100");
+    }
+
+    /// A live comparison run streams the *uncollapsed* rows — one per side —
+    /// into its grid. The footer drawn under that grid must measure what the
+    /// finished report will, not the baseline and the candidate averaged
+    /// together.
+    #[test]
+    fn live_comparison_statistics_match_the_finished_report() {
+        let entries = [graph_entry("r", &[], &[])];
+        let fake = Fake::new(&[]);
+        let flow = parse_flow(
+            "FOR X IN [1, 2]\n\
+             \x20 FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n\
+             \x20   REPORT \"{{n}}{{X}}\" AS \"proc.n\" STATISTICS(MEAN, COUNT)\n\
+             \x20 END\n\
+             END\n",
+        )
+        .unwrap();
+        let named_envs: HashMap<String, HashMap<String, String>> =
+            [("prod", "1"), ("staging", "3")]
+                .into_iter()
+                .map(|(e, n)| {
+                    (
+                        e.to_string(),
+                        [("n".to_string(), n.to_string())].into_iter().collect(),
+                    )
+                })
+                .collect();
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs,
+            root: None,
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+            shuffle: None,
+            cancel: None,
+        };
+        let stats = |res: &ReportResult| {
+            let cols = res.resolved_columns(&crate::report::flow::Header::default());
+            let ci = cols.iter().position(|c| c.header == "proc.n").unwrap();
+            res.summary_rows(&cols)
+                .iter()
+                .map(|r| (r.label.clone(), r.text_cell(ci)))
+                .collect::<Vec<_>>()
+        };
+
+        let mut live = run_flow_raw(&flow, &ctx);
+        assert!(live.errors.is_empty(), "{:?}", live.errors);
+        assert_eq!(live.rows.len(), 4, "both sides stream: {:?}", live.rows);
+        let streamed = stats(&live);
+        let mut finished = live.clone();
+        finalize(&mut finished, &flow, &ctx);
+        assert_eq!(finished.rows.len(), 2);
+
+        // Staging's 31 and 32, not prod's 11 and 12 averaged in.
+        assert_eq!(
+            streamed,
+            vec![
+                ("Count".to_string(), "2".to_string()),
+                ("Mean".to_string(), "31.5".to_string())
+            ]
+        );
+        assert_eq!(streamed, stats(&finished));
+
+        // Mid-run: a baseline that has landed stays out of the figure while
+        // its candidate is still on the way.
+        let staging_second = live
+            .rows
+            .iter()
+            .position(|r| r.cells.get("proc.n").map(String::as_str) == Some("32"))
+            .unwrap();
+        live.pending.insert(staging_second);
+        assert_eq!(
+            stats(&live),
+            vec![
+                ("Count".to_string(), "1".to_string()),
+                ("Mean".to_string(), "31".to_string())
+            ]
+        );
+    }
+
+    /// A `RunContext` over `fake` with the given named environments — for the
+    /// tests that need two runs of one flow against different runners.
+    fn ctx_over<'a>(
+        entries: &'a [HurlEntry],
+        envs: &[(&str, &[(&str, &str)])],
+        fake: &'a Fake,
+    ) -> RunContext<'a> {
+        RunContext {
+            entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: envs
+                .iter()
+                .map(|(name, kvs)| {
+                    (
+                        name.to_string(),
+                        kvs.iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            root: None,
+            runner: fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+            shuffle: None,
+            cancel: None,
+        }
+    }
+
+    /// Re-running one row of a plain loop sends that iteration's requests and
+    /// no others, and its fresh answer replaces the old one in place.
+    #[test]
+    fn rerunning_a_row_runs_only_its_iteration_and_replaces_it() {
+        let entries = [entry("svc", &[])];
+        let flow =
+            parse_flow("FOR X IN [\"a\", \"b\", \"c\"]\n    REPORT REQUEST svc AS proc\nEND\n")
+                .unwrap();
+        let flaky = Fake::new(&[(
+            "svc",
+            Canned {
+                status: 503,
+                ..Default::default()
+            },
+        )]);
+        let mut result = run_flow(&flow, &ctx_over(&entries, &[], &flaky));
+        let status = |res: &ReportResult, r: usize| res.rows[r].cells["proc.HttpStatus"].clone();
+        assert_eq!(status(&result, 1), "503");
+
+        let healthy = Fake::new(&[(
+            "svc",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let path = result.rows[1].path.clone();
+        let fresh =
+            crate::report::rerun::rerun_rows(&flow, &ctx_over(&entries, &[], &healthy), &[path]);
+        assert_eq!(healthy.call_order(), vec!["svc".to_string()]);
+        assert_eq!(
+            healthy.call_vars("svc").get("X").map(String::as_str),
+            Some("b")
+        );
+
+        let replaced = crate::report::rerun::splice(&mut result, &fresh, &[1]);
+        assert_eq!(replaced, vec![1]);
+        assert_eq!(status(&result, 0), "503");
+        assert_eq!(status(&result, 1), "200");
+        assert_eq!(status(&result, 2), "503");
+    }
+
+    /// A comparison row is a collapse of both sides, so re-running it runs the
+    /// baseline and the candidate again — and the errors either side raised
+    /// the first time leave the run's list, while the other row's stay.
+    #[test]
+    fn rerunning_a_comparison_row_reruns_both_sides_and_clears_their_errors() {
+        let entries = [graph_entry("r", &[], &[])];
+        let src = "FOR X IN [1, 2]\n\
+                   \x20 FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n\
+                   \x20   REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+                   \x20 END\n\
+                   END\n";
+        let flow = parse_flow(src).unwrap();
+        let envs: [(&str, &[(&str, &str)]); 2] = [("prod", &[]), ("staging", &[])];
+        let flaky = Fake::new(&[(
+            "r",
+            Canned {
+                error: Some("connection reset".into()),
+                ..Default::default()
+            },
+        )]);
+        let mut result = run_flow(&flow, &ctx_over(&entries, &envs, &flaky));
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.errors.len(), 4, "{:?}", result.errors);
+        assert!(result.baseline_errors.contains_key(&1));
+
+        let healthy = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let path = result.rows[1].path.clone();
+        let fresh =
+            crate::report::rerun::rerun_rows(&flow, &ctx_over(&entries, &envs, &healthy), &[path]);
+        assert_eq!(healthy.call_order().len(), 2, "baseline and candidate");
+        for (_, vars) in healthy.calls.lock().unwrap().iter() {
+            assert_eq!(vars.get("X").map(String::as_str), Some("2"));
+        }
+
+        crate::report::rerun::splice(&mut result, &fresh, &[1]);
+        assert!(
+            result.rows[1].errors.is_empty(),
+            "{:?}",
+            result.rows[1].errors
+        );
+        assert!(!result.baseline_errors.contains_key(&1));
+        assert_eq!(
+            result.rows[1]
+                .cells
+                .get(crate::report::compare::RESULT_COLUMN)
+                .map(String::as_str),
+            Some(crate::report::compare::MATCH)
+        );
+        assert_eq!(
+            result.errors.len(),
+            2,
+            "row 0's two remain: {:?}",
+            result.errors
+        );
+        assert!(!result.rows[0].errors.is_empty());
+    }
+
+    /// A pending row shows what is settled before its requests are sent — a
+    /// column built from loop variables and assignments — and a placeholder
+    /// for anything a response feeds, however indirectly.
+    #[test]
+    fn a_pending_row_shows_the_columns_the_flow_settles_before_sending() {
+        let svc = HurlEntry {
+            captures: vec![("token".into(), "jsonpath \"$.t\"".into())],
+            ..entry("svc", &[])
+        };
+        let entries = [svc];
+        let flow = parse_flow(
+            "FOR FILE IN [\"a.jpg\", \"b.jpg\"]\n\
+             \x20   DIR = \"docs\"\n\
+             \x20   TOK = \"{{token}}\"\n\
+             \x20   REPORT FILE AS Document\n\
+             \x20   REPORT \"{{DIR}}/{{FILE}}\" AS Path\n\
+             \x20   REPORT REQUEST svc\n\
+             \x20   REPORT TOK AS Copied\n\
+             \x20   REPORT \"{{token}}\" AS Token\n\
+             \x20   REPORT \"{{$uuid}}\" AS Id\n\
+             END\n",
+        )
+        .unwrap();
+        let fake = Fake::new(&[]);
+        let ctx = ctx_over(&entries, &[], &fake);
+        let mut skeleton = {
+            let dry = RunContext {
+                runner: &DryRunner,
+                ..ctx
+            };
+            run_flow_raw(&flow, &dry)
+        };
+        let planned: std::collections::BTreeSet<&str> = skeleton
+            .planned_columns
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(planned, ["Document", "Path"].into_iter().collect());
+
+        skeleton.pending = (0..skeleton.rows.len()).collect();
+        let cols = skeleton.resolved_columns(&crate::report::flow::Header::default());
+        let shown = |header: &str| {
+            let col = cols.iter().find(|c| c.header == header).unwrap();
+            skeleton.display_cell(1, col, false)
+        };
+        assert_eq!(shown("Document"), "b.jpg");
+        assert_eq!(shown("Path"), "docs/b.jpg");
+        let placeholder = crate::report::model::PENDING_CELL_MARKER;
+        assert_eq!(shown("Copied"), placeholder);
+        assert_eq!(shown("Token"), placeholder);
+        assert_eq!(shown("Id"), placeholder);
+        assert_eq!(shown("svc.HttpStatus"), placeholder);
+    }
+
+    /// A re-run queued from the live grid lands on the finished report's row:
+    /// a comparison row by its own path, a baseline row on the comparison row
+    /// it was folded into.
+    #[test]
+    fn queued_live_rows_map_onto_the_finished_report() {
+        use crate::report::rerun::{RowRef, rows_after_finalize};
+        let entries = [graph_entry("r", &[], &[])];
+        let flow = parse_flow(
+            "FOR X IN [1, 2]\n\
+             \x20 FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n\
+             \x20   REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20 END\n\
+             END\n",
+        )
+        .unwrap();
+        let envs: [(&str, &[(&str, &str)]); 2] = [("prod", &[]), ("staging", &[])];
+        let fake = Fake::new(&[]);
+        let ctx = ctx_over(&entries, &envs, &fake);
+        let live = run_flow_raw(&flow, &ctx);
+        let side = |x: &str, role: RowRole| {
+            live.rows
+                .iter()
+                .find(|r| r.role == role && r.vars.get("X").map(String::as_str) == Some(x))
+                .map(RowRef::of)
+                .unwrap()
+        };
+        let queued = [side("2", RowRole::Baseline), side("1", RowRole::Candidate)];
+        let mut finished = live.clone();
+        finalize(&mut finished, &flow, &ctx);
+        let x_of = |r: usize| finished.rows[r].vars["X"].clone();
+        let rows = rows_after_finalize(&queued, &finished);
+        assert_eq!(
+            rows.iter().map(|&r| x_of(r)).collect::<Vec<_>>(),
+            ["2", "1"]
+        );
+    }
+
+    /// The live projection scores the rows that have come back as the finished
+    /// report will — and leaves out a baseline whose comparison row hasn't, so
+    /// its answers can't stand in for the comparison's.
+    #[test]
+    fn a_live_projection_scores_only_what_the_finished_report_will() {
+        let entries = [graph_entry("r", &[], &[])];
+        let flow = parse_flow(
+            "FOR X IN [1, 2]\n\
+             \x20 FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n\
+             \x20   REPORT \"{{a}}\" AS Verdict TRUTH \"yes\"\n\
+             \x20 END\n\
+             END\n",
+        )
+        .unwrap();
+        let envs: [(&str, &[(&str, &str)]); 2] =
+            [("prod", &[("a", "no")]), ("staging", &[("a", "yes")])];
+        let fake = Fake::new(&[]);
+        let ctx = ctx_over(&entries, &envs, &fake);
+        let mut live = run_flow_raw(&flow, &ctx);
+        let pending = live
+            .rows
+            .iter()
+            .position(|r| {
+                r.role == RowRole::Candidate && r.vars.get("X").map(String::as_str) == Some("2")
+            })
+            .unwrap();
+        live.pending.insert(pending);
+
+        let seen = project_live(&live, &flow, &Default::default(), None);
+        assert_eq!(seen.rows.len(), 1, "{:?}", seen.rows);
+        assert_eq!(seen.rows[0].vars["X"], "1");
+        assert_eq!(seen.rows[0].cells[CORRECT_COLUMN], "correct");
+        let cols = seen.resolved_columns(&flow.header);
+        let metrics = seen.metrics(&cols, &flow.header).expect("scored");
+        assert_eq!(metrics.movement.map(|m| m.fixed), Some(1));
+
+        // Once everything has come back, the projection is the report.
+        live.pending.clear();
+        let all = project_live(&live, &flow, &Default::default(), None);
+        let mut finished = live.clone();
+        finalize(&mut finished, &flow, &ctx);
+        assert_eq!(all.rows, finished.rows);
+    }
+
+    /// Before a single row has come back, a scored comparison already offers
+    /// every filter it will have, rather than gaining them one by one.
+    #[test]
+    fn a_live_run_offers_its_filters_before_the_first_row() {
+        use crate::report::filter::RowFilter;
+        let entries = [graph_entry("r", &[], &[])];
+        let flow = parse_flow(
+            "FOR X IN [1, 2]\n\
+             \x20 FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n\
+             \x20   REPORT \"{{a}}\" AS Verdict TRUTH \"yes\"\n\
+             \x20 END\n\
+             END\n",
+        )
+        .unwrap();
+        let envs: [(&str, &[(&str, &str)]); 2] =
+            [("prod", &[("a", "no")]), ("staging", &[("a", "yes")])];
+        let fake = Fake::new(&[]);
+        let mut live = run_flow_raw(&flow, &ctx_over(&entries, &envs, &fake));
+        live.pending = (0..live.rows.len()).collect();
+        let seen = project_live(&live, &flow, &Default::default(), None);
+        assert_eq!(
+            RowFilter::available(&seen),
+            [
+                RowFilter::All,
+                RowFilter::Differ,
+                RowFilter::Correct,
+                RowFilter::Incorrect,
+                RowFilter::Regressed,
+                RowFilter::Fixed
+            ]
+        );
+        // The raw grid a stopped run leaves has nothing to filter by but All.
+        assert_eq!(RowFilter::available(&live), [RowFilter::All]);
+    }
+
+    /// Mid-run, a case with one side in and the other on its way is waiting,
+    /// not different: Differences leaves it out, and Waiting shows the side
+    /// that has landed — whichever side that is.
+    #[test]
+    fn a_half_landed_case_is_waiting_not_different() {
+        use crate::report::filter::{RowFilter, live_visible_rows, waiting_rows};
+        let entries = [graph_entry("r", &[], &[])];
+        let flow = parse_flow(
+            "FOR X IN [1, 2, 3]\n\
+             \x20 FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n\
+             \x20   REPORT \"{{a}}\" AS \"proc.v\"\n\
+             \x20 END\n\
+             END\n",
+        )
+        .unwrap();
+        let envs: [(&str, &[(&str, &str)]); 2] =
+            [("prod", &[("a", "P")]), ("staging", &[("a", "S")])];
+        let fake = Fake::new(&[]);
+        let mut live = run_flow_raw(&flow, &ctx_over(&entries, &envs, &fake));
+        let at = |x: &str, role: RowRole| {
+            live.rows
+                .iter()
+                .position(|r| r.role == role && r.vars["X"] == x)
+                .unwrap()
+        };
+        // X=2: the comparison is in, its baseline isn't. X=3: the other way round.
+        live.pending.insert(at("2", RowRole::Baseline));
+        live.pending.insert(at("3", RowRole::Candidate));
+
+        let seen = project_live(&live, &flow, &Default::default(), None);
+        let labels = crate::report::labels::LabelMap::parse(&[]);
+        let (lc, pc) = (
+            live.resolved_columns(&flow.header),
+            seen.resolved_columns(&flow.header),
+        );
+        let xs = |rows: Vec<usize>| -> Vec<String> {
+            rows.iter()
+                .map(|&r| live.rows[r].vars["X"].clone())
+                .collect()
+        };
+        assert_eq!(
+            xs(live_visible_rows(
+                &live,
+                &lc,
+                &seen,
+                &pc,
+                &labels,
+                &RowFilter::Differ,
+                ""
+            )),
+            ["1", "1"],
+            "only the case with both sides in is a difference"
+        );
+        assert_eq!(xs(waiting_rows(&live)), ["2", "3"]);
+        assert_eq!(
+            xs(live_visible_rows(
+                &live,
+                &lc,
+                &seen,
+                &pc,
+                &labels,
+                &RowFilter::Waiting,
+                ""
+            )),
+            ["2", "3"]
+        );
+    }
+
+    /// Before a single row has come back, the live summary is already laid
+    /// out: every count at zero, the confusion matrix on its declared axis, and
+    /// a comparison's movement at zero rather than absent.
+    #[test]
+    fn live_metrics_are_laid_out_at_zero_before_the_first_row() {
+        let entries = [graph_entry("r", &[], &[])];
+        let flow = parse_flow(
+            "# labels: yes = yes\n\
+             # labels: no = no\n\
+             FOR X IN [1, 2]\n\
+             \x20 FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n\
+             \x20   REPORT \"{{a}}\" AS Verdict TRUTH \"yes\"\n\
+             \x20 END\n\
+             END\n",
+        )
+        .unwrap();
+        let envs: [(&str, &[(&str, &str)]); 2] =
+            [("prod", &[("a", "no")]), ("staging", &[("a", "yes")])];
+        let fake = Fake::new(&[]);
+        let mut live = run_flow_raw(&flow, &ctx_over(&entries, &envs, &fake));
+        live.pending = (0..live.rows.len()).collect();
+        let seen = project_live(&live, &flow, &Default::default(), None);
+        let m = live_metrics(&seen, &flow).expect("laid out before anything is scored");
+        let col = &m.columns[0];
+        assert_eq!((col.compared, col.correct, col.incorrect), (0, 0, 0));
+        let matrix = col.matrix.as_ref().expect("the matrix is there");
+        assert_eq!(matrix.axis, ["yes", "no"]);
+        assert!(matrix.counts.iter().flatten().all(|&n| n == 0));
+        assert!(m.overall.is_some(), "the roll-up card is there too");
+        let mv = m.movement.expect("a comparison's movement starts at zero");
+        assert!(
+            !mv.is_still(),
+            "nothing compared yet is not 'nothing moved'"
+        );
+    }
+
+    /// While a comparison runs, a filter picks the cases the finished report
+    /// will — and shows each as both of its raw rows.
+    #[test]
+    fn a_live_filter_shows_both_sides_of_the_cases_it_picks() {
+        use crate::report::filter::{RowFilter, live_visible_rows};
+        let entries = [graph_entry("r", &[], &[])];
+        let flow = parse_flow(
+            "FOR X IN [1, 2]\n\
+             \x20 FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n\
+             \x20   REPORT \"{{a}}{{X}}\" AS Verdict TRUTH \"yes1\"\n\
+             \x20 END\n\
+             END\n",
+        )
+        .unwrap();
+        let envs: [(&str, &[(&str, &str)]); 2] =
+            [("prod", &[("a", "no")]), ("staging", &[("a", "yes")])];
+        let fake = Fake::new(&[]);
+        let ctx = ctx_over(&entries, &envs, &fake);
+        let live = run_flow_raw(&flow, &ctx);
+        let seen = project_live(&live, &flow, &Default::default(), None);
+        let labels = crate::report::labels::LabelMap::parse(&flow.header.labels());
+        let (lc, pc) = (
+            live.resolved_columns(&flow.header),
+            seen.resolved_columns(&flow.header),
+        );
+        let xs = |rows: Vec<usize>| -> Vec<String> {
+            rows.iter()
+                .map(|&r| live.rows[r].vars["X"].clone())
+                .collect()
+        };
+        let pick = |f: RowFilter| live_visible_rows(&live, &lc, &seen, &pc, &labels, &f, "");
+        assert_eq!(xs(pick(RowFilter::Fixed)), ["1", "1"]);
+        assert_eq!(xs(pick(RowFilter::Incorrect)), ["2", "2"]);
+        assert_eq!(pick(RowFilter::All).len(), 4);
+    }
+
+    /// Re-running a row while its report is still going replaces both raw
+    /// sides in the live grid, and hands back the finished row to splice in
+    /// once the run is done.
+    #[test]
+    fn a_live_rerun_replaces_both_raw_sides_and_has_the_finished_row_ready() {
+        let entries = [graph_entry("r", &[], &[])];
+        let flow = parse_flow(
+            "FOR X IN [1, 2]\n\
+             \x20 FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n\
+             \x20   REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20 END\n\
+             END\n",
+        )
+        .unwrap();
+        let envs: [(&str, &[(&str, &str)]); 2] = [("prod", &[]), ("staging", &[])];
+        let flaky = Fake::new(&[(
+            "r",
+            Canned {
+                error: Some("connection reset".into()),
+                ..Default::default()
+            },
+        )]);
+        let mut live = run_flow_raw(&flow, &ctx_over(&entries, &envs, &flaky));
+        let x2 = live
+            .rows
+            .iter()
+            .find(|r| r.role == RowRole::Candidate && r.vars["X"] == "2")
+            .unwrap()
+            .path
+            .clone();
+
+        let healthy = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let fresh =
+            crate::report::rerun::rerun_live(&flow, &ctx_over(&entries, &envs, &healthy), &[x2]);
+        let replaced = crate::report::rerun::splice_live(&mut live, &fresh.raw);
+        assert_eq!(replaced.len(), 2, "baseline and candidate");
+        for &r in &replaced {
+            assert_eq!(live.rows[r].vars["X"], "2");
+            assert!(live.rows[r].errors.is_empty(), "{:?}", live.rows[r].errors);
+        }
+        assert_eq!(fresh.finished.rows.len(), 1);
+        assert_eq!(
+            fresh.finished.rows[0].cells[crate::report::compare::RESULT_COLUMN],
+            crate::report::compare::MATCH
+        );
+    }
+
+    /// Resuming a stopped run sends exactly the rows that hadn't come back —
+    /// not the sides that had — and ends on the report a whole run makes.
+    #[test]
+    fn resuming_a_stopped_run_runs_only_what_was_missing() {
+        let entries = [graph_entry("r", &[], &[])];
+        let flow = parse_flow(
+            "FOR X IN [1, 2]\n\
+             \x20 FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n\
+             \x20   REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20 END\n\
+             END\n",
+        )
+        .unwrap();
+        let envs: [(&str, &[(&str, &str)]); 2] = [("prod", &[]), ("staging", &[])];
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let ctx = ctx_over(&entries, &envs, &fake);
+        let mut stopped = run_flow_raw(&flow, &ctx);
+        let whole = {
+            let mut w = stopped.clone();
+            finalize(&mut w, &flow, &ctx);
+            w
+        };
+        // Stopped with X=2's comparison and X=1's baseline never back.
+        for (x, role) in [("2", RowRole::Candidate), ("1", RowRole::Baseline)] {
+            let i = stopped
+                .rows
+                .iter()
+                .position(|r| r.role == role && r.vars["X"] == x)
+                .unwrap();
+            stopped.pending.insert(i);
+        }
+
+        let resumer = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let resumed =
+            crate::report::rerun::resume(&flow, &ctx_over(&entries, &envs, &resumer), stopped);
+        assert_eq!(
+            resumer.call_order().len(),
+            2,
+            "the two missing rows, no more"
+        );
+        assert!(resumed.finalized && resumed.pending.is_empty());
+        assert_eq!(resumed.rows, whole.rows);
     }
 
     #[test]

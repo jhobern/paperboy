@@ -32520,9 +32520,12 @@ fn slash_cycles_the_results_filter_and_narrows_the_grid() {
     app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
     assert_eq!(
         app.reports[idx].results_filter,
-        RowFilter::Incorrect,
-        "no row differs from a baseline here, so Incorrect is the next filter"
+        RowFilter::Correct,
+        "no row differs from a baseline here, so Correct is the next filter"
     );
+    assert_eq!(app.reports[idx].visible_result_rows(), vec![0, 1]);
+    app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    assert_eq!(app.reports[idx].results_filter, RowFilter::Incorrect);
     assert_eq!(
         app.reports[idx].visible_result_rows(),
         vec![2],
@@ -36084,5 +36087,829 @@ fn dragging_in_the_cell_popup_selects_part_of_the_value() {
             .unwrap_or_default()
             .contains("gamma"),
         "Shift+Down reaches the next line"
+    );
+}
+
+/// Drive the poll until no run is in flight (bounded so a bug can't hang).
+fn poll_until_idle(app: &mut TuiApp) {
+    for _ in 0..400 {
+        app.poll_report_run_updates();
+        if app.running_reports.is_empty() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the background run never finished");
+}
+
+/// A two-row report, run to completion against a runner answering `body`.
+fn report_run_with(body: &str) -> (TuiApp, usize) {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nFOR X IN [\"a\", \"b\"]\n    REPORT REQUEST Oauth\nEND\n");
+    app.revalidate_report(idx);
+    let body = body.to_string();
+    app.start_report_run_faked(move |_| FakeReportRunner { body });
+    poll_until_idle(&mut app);
+    (app, idx)
+}
+
+/// `x` re-runs the row under the cursor and only that row, splicing the
+/// fresh answer in place.
+#[test]
+fn x_reruns_only_the_row_under_the_cursor() {
+    let (mut app, idx) = report_run_with("first");
+    let response = |app: &TuiApp, r: usize| {
+        app.reports[idx].result.as_ref().unwrap().rows[r].cells["Oauth.Response"].clone()
+    };
+    assert_eq!(response(&app, 1), "first");
+    app.reports[idx].cell_cursor = Some((1, 0));
+
+    app.rerun_report_row_with(|_| FakeReportRunner {
+        body: "second".to_string(),
+    });
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportRowRerunning)
+    ));
+    poll_until_idle(&mut app);
+
+    assert_eq!(response(&app, 0), "first");
+    assert_eq!(response(&app, 1), "second");
+    assert!(app.reports[idx].run_progress.is_none());
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportRowRerunDone { errors: 0 })
+    ));
+}
+
+/// A row is identified by its place in the flow that produced it, so a re-run
+/// after the report has been edited still runs *that* flow — here, the edit
+/// removed the row's loop value altogether.
+#[test]
+fn x_reruns_the_flow_that_produced_the_row_even_after_an_edit() {
+    let (mut app, idx) = report_run_with("first");
+    app.reports[idx].cell_cursor = Some((1, 0));
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nFOR X IN [\"z\"]\n    REPORT REQUEST Oauth\nEND\n");
+    app.rerun_report_row_with(|_| FakeReportRunner {
+        body: "second".to_string(),
+    });
+    poll_until_idle(&mut app);
+    let row = &app.reports[idx].result.as_ref().unwrap().rows[1];
+    assert_eq!(row.cells["Oauth.Response"], "second");
+    assert_eq!(row.vars.get("X").map(String::as_str), Some("b"));
+}
+
+/// `o` sorts by the cursor's column — ascending, descending, then run order —
+/// and the cursor stays on the row it was on.
+#[test]
+fn o_cycles_the_sort_on_the_cursor_column() {
+    use super::reports::ReportView;
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let result = crate::report::model::ReportResult {
+        column_order: vec!["Time".to_string()],
+        rows: ["30", "10", "20"]
+            .iter()
+            .map(|t| crate::report::model::ReportRow {
+                cells: [("Time".to_string(), t.to_string())].into_iter().collect(),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    app.reports[idx].result = Some(result);
+    app.reports[idx].view = ReportView::Results;
+    app.reports[idx].cell_cursor = Some((0, 0));
+
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.reports[idx].visible_result_rows(), vec![1, 2, 0]);
+    assert_eq!(
+        app.reports[idx].cell_cursor,
+        Some((2, 0)),
+        "still on the 30 row"
+    );
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.reports[idx].visible_result_rows(), vec![0, 2, 1]);
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.reports[idx].results_sort, None);
+    assert_eq!(app.reports[idx].visible_result_rows(), vec![0, 1, 2]);
+}
+
+/// Mid-run, `x` re-runs a row that has come back straight away (and refuses
+/// one that hasn't); its answer lands in the live grid and survives the run's
+/// own result, which was made from the row it replaced.
+#[test]
+fn x_during_a_run_reruns_the_row_at_once() {
+    use super::reports::{ReportRunUpdate, RowState, RunProgress};
+    let (mut app, idx) = report_run_with("first");
+    let finished = app.reports[idx].result.clone().unwrap();
+    let id = app.reports[idx].report.id;
+
+    // Put the tab back mid-run: row 0 is back, row 1 is still on its way.
+    app.running_reports.insert(
+        id,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    let mut live = finished.clone();
+    live.finalized = false;
+    app.reports[idx].result = Some(live);
+    app.reports[idx].run_progress = Some(RunProgress {
+        states: vec![RowState::Finished, RowState::Scheduled],
+        index: Default::default(),
+        done: 1,
+        rerun: false,
+    });
+
+    app.reports[idx].cell_cursor = Some((1, 0));
+    app.rerun_report_row_with(|_| FakeReportRunner {
+        body: "second".to_string(),
+    });
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportRowRerunBlocked(_))
+    ));
+    assert!(app.live_reruns.is_empty());
+
+    app.reports[idx].cell_cursor = Some((0, 0));
+    app.rerun_report_row_with(|_| FakeReportRunner {
+        body: "second".to_string(),
+    });
+    assert_eq!(app.live_reruns.len(), 1, "started at once, beside the run");
+    assert_eq!(
+        app.reports[idx].run_progress.as_ref().unwrap().states[0],
+        RowState::Running
+    );
+    for _ in 0..400 {
+        app.poll_report_run_updates();
+        if app.live_reruns.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.live_reruns.is_empty(), "the re-run never landed");
+    let response = |app: &TuiApp| {
+        app.reports[idx].result.as_ref().unwrap().rows[0].cells["Oauth.Response"].clone()
+    };
+    assert_eq!(response(&app), "second", "in the live grid now");
+    assert_eq!(
+        app.reports[idx].run_progress.as_ref().unwrap().states[0],
+        RowState::Finished
+    );
+
+    // The run finishes with a result made from the old row.
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pending_report_runs.push((id, rx));
+    tx.send(ReportRunUpdate::Done {
+        report_id: id,
+        result: finished,
+    })
+    .unwrap();
+    drop(tx);
+    app.poll_report_run_updates();
+    assert_eq!(response(&app), "second", "and still there once it's done");
+}
+
+/// While a comparison runs, `/` filters through what its rows so far will
+/// become, showing both raw sides of each case it picks.
+#[test]
+fn a_filter_works_while_the_run_streams() {
+    use super::reports::{RowState, RunProgress};
+    use crate::report::filter::RowFilter;
+    let (text, live) = half_run_comparison();
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let rt = &mut app.reports[idx];
+    rt.report.set_text(&text);
+    rt.result_flow = rt.report.flow().ok();
+    rt.run_progress = Some(RunProgress {
+        states: (0..live.rows.len())
+            .map(|r| {
+                if live.pending.contains(&r) {
+                    RowState::Scheduled
+                } else {
+                    RowState::Finished
+                }
+            })
+            .collect(),
+        index: Default::default(),
+        done: live.rows.len() - 1,
+        rerun: false,
+    });
+    rt.result = Some(live);
+    rt.refresh_live_summary();
+    assert!(rt.result_filters().contains(&RowFilter::Fixed));
+    rt.results_filter = RowFilter::Fixed;
+    let shown = rt.visible_result_rows();
+    let result = rt.result.as_ref().unwrap();
+    let xs: Vec<&str> = shown
+        .iter()
+        .map(|&r| result.rows[r].vars["X"].as_str())
+        .collect();
+    assert_eq!(xs, ["1", "1"], "both sides of the fixed case");
+}
+
+/// While one row re-runs, `x` on another queues it to go next (and refuses the
+/// one already re-running); when the re-run lands, the queued row is ready.
+#[test]
+fn x_during_a_rerun_queues_the_row_to_go_next() {
+    use super::reports::{ReportRunUpdate, RowState, RunProgress};
+    let (mut app, idx) = report_run_with("first");
+    let id = app.reports[idx].report.id;
+    app.running_reports.insert(
+        id,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    app.reports[idx].run_progress = Some(RunProgress {
+        states: vec![RowState::Running, RowState::Idle],
+        index: Default::default(),
+        done: 0,
+        rerun: true,
+    });
+
+    app.reports[idx].cell_cursor = Some((0, 0));
+    press(&mut app, KeyCode::Char('x'));
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportRowRerunBlocked(_))
+    ));
+    app.reports[idx].cell_cursor = Some((1, 0));
+    press(&mut app, KeyCode::Char('x'));
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportRowRerunQueued { rows: 1 })
+    ));
+
+    let fresh = app.reports[idx].result.clone().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pending_report_runs.push((id, rx));
+    tx.send(ReportRunUpdate::Rerun {
+        report_id: id,
+        rows: vec![0],
+        fresh,
+    })
+    .unwrap();
+    drop(tx);
+    app.poll_report_run_updates();
+    assert_eq!(app.reports[idx].reruns_ready, Some(vec![1]));
+}
+
+/// Picking out the failing rows with a filter and re-running them until they
+/// pass ends on the whole table, not on a filter with nothing left in it.
+#[test]
+fn a_filter_left_empty_by_a_rerun_falls_back_to_all() {
+    use super::reports::ReportRunUpdate;
+    use crate::report::compare::{MATCH, RESULT_COLUMN};
+    use crate::report::filter::RowFilter;
+    let (mut app, idx) = report_run_with("first");
+    let id = app.reports[idx].report.id;
+    let result = app.reports[idx].result.as_mut().unwrap();
+    result.rows[0]
+        .cells
+        .insert(RESULT_COLUMN.to_string(), "{\"a\":1}".to_string());
+    let mut fresh = result.clone();
+    fresh.rows[0]
+        .cells
+        .insert(RESULT_COLUMN.to_string(), MATCH.to_string());
+    app.reports[idx].results_filter = RowFilter::Differ;
+    assert_eq!(app.reports[idx].visible_result_rows(), vec![0]);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pending_report_runs.push((id, rx));
+    tx.send(ReportRunUpdate::Rerun {
+        report_id: id,
+        rows: vec![0],
+        fresh,
+    })
+    .unwrap();
+    drop(tx);
+    app.poll_report_run_updates();
+    assert_eq!(app.reports[idx].results_filter, RowFilter::All);
+}
+
+/// A comparison whose baseline answers wrong and whose candidate answers right,
+/// run up to the point where the second candidate is still on its way: the
+/// live grid's raw rows, with that one pending.
+fn half_run_comparison() -> (String, crate::report::model::ReportResult) {
+    let text = "FOR X IN [1, 2]\n\
+                \x20 FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n\
+                \x20   REPORT \"{{a}}\" AS Verdict TRUTH \"yes\"\n\
+                \x20 END\n\
+                END\n"
+        .to_string();
+    let flow = crate::report::parser::parse_flow(&text).unwrap();
+    let env = |a: &str| {
+        [("a".to_string(), a.to_string())]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>()
+    };
+    let ctx = crate::report::run::RunContext {
+        entries: &[],
+        helpers: &[],
+        base_vars: Default::default(),
+        named_envs: [
+            ("prod".to_string(), env("no")),
+            ("staging".to_string(), env("yes")),
+        ]
+        .into_iter()
+        .collect(),
+        root: None,
+        runner: &crate::report::run::DryRunner,
+        strings: crate::i18n::Strings::english(),
+        params: Default::default(),
+        sink: None,
+        shuffle: None,
+        cancel: None,
+    };
+    let mut live = crate::report::run::run_flow_raw(&flow, &ctx);
+    let waiting = live
+        .rows
+        .iter()
+        .position(|r| {
+            r.role == crate::report::model::RowRole::Candidate
+                && r.vars.get("X").map(String::as_str) == Some("2")
+        })
+        .unwrap();
+    live.pending.insert(waiting);
+    (text, live)
+}
+
+/// While a run streams, the pinned summary fills in from the rows that have
+/// come back — here, one baseline/candidate pair, which the candidate fixed.
+#[test]
+fn the_pinned_summary_fills_in_while_the_run_streams() {
+    use super::reports::{RowState, RunProgress};
+    let (text, live) = half_run_comparison();
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let rt = &mut app.reports[idx];
+    rt.report.set_text(&text);
+    rt.result_flow = rt.report.flow().ok();
+    rt.run_progress = Some(RunProgress {
+        states: (0..live.rows.len())
+            .map(|r| {
+                if live.pending.contains(&r) {
+                    RowState::Scheduled
+                } else {
+                    RowState::Finished
+                }
+            })
+            .collect(),
+        index: Default::default(),
+        done: live.rows.len() - 1,
+        rerun: false,
+    });
+    rt.result = Some(live);
+    rt.refresh_live_summary();
+    let s = crate::i18n::Strings::english();
+    let head = super::reports::results_head_text(&app.reports[idx], s);
+    assert!(
+        head.iter()
+            .any(|l| l.contains(&format!("{} 1", s.report_metric_fixed))),
+        "{head:?}"
+    );
+}
+
+/// Exporting a report's results over a file that already exists asks first,
+/// and writes only once the overwrite is confirmed.
+#[test]
+fn exporting_results_over_an_existing_file_asks_first() {
+    use super::app::{ConfirmAction, FileAction, Overlay};
+    let (mut app, _idx) = report_run_with("first");
+    let dir = temp_dir("export_overwrite");
+    let existing = dir.join("out.csv");
+    std::fs::write(&existing, "precious").unwrap();
+
+    app.browser_commit_save(
+        FileAction::SaveReportCsvChooseFolder,
+        dir.clone(),
+        "out.csv".to_string(),
+    );
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::Confirm {
+            action: ConfirmAction::Overwrite(FileAction::SaveReportCsvChooseFolder),
+            ..
+        })
+    ));
+    assert_eq!(std::fs::read_to_string(&existing).unwrap(), "precious");
+
+    press(&mut app, KeyCode::Char('y'));
+    let written = std::fs::read_to_string(&existing).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(written.contains("first"), "{written:?}");
+}
+
+/// A runner that answers `body` only after `delay` — long enough for a test to
+/// act while a live re-run is still out.
+struct SlowRunner {
+    body: String,
+    delay: std::time::Duration,
+}
+
+impl crate::report::run::EntryRunner for SlowRunner {
+    fn run(
+        &self,
+        base: &crate::hurl::HurlEntry,
+        vars: &std::collections::HashMap<String, String>,
+    ) -> crate::hurl::RunOutput {
+        std::thread::sleep(self.delay);
+        FakeReportRunner {
+            body: self.body.clone(),
+        }
+        .run(base, vars)
+    }
+}
+
+/// A live re-run still out when its run ends belongs to that run: starting a
+/// new one cancels it, so its old answer can't land in the new grid.
+#[test]
+fn a_new_run_drops_the_last_runs_live_reruns() {
+    use super::reports::{ReportRunUpdate, RowState, RunProgress};
+    let (mut app, idx) = report_run_with("first");
+    let finished = app.reports[idx].result.clone().unwrap();
+    let id = app.reports[idx].report.id;
+    app.running_reports.insert(
+        id,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    let mut live = finished.clone();
+    live.finalized = false;
+    app.reports[idx].result = Some(live);
+    app.reports[idx].run_progress = Some(RunProgress {
+        states: vec![RowState::Finished, RowState::Finished],
+        index: Default::default(),
+        done: 2,
+        rerun: false,
+    });
+    app.reports[idx].cell_cursor = Some((0, 0));
+    app.rerun_report_row_with(|_| SlowRunner {
+        body: "stale".to_string(),
+        delay: std::time::Duration::from_millis(300),
+    });
+    assert_eq!(app.live_reruns.len(), 1);
+
+    // The run ends with the re-run still out...
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pending_report_runs.push((id, rx));
+    tx.send(ReportRunUpdate::Done {
+        report_id: id,
+        result: finished,
+    })
+    .unwrap();
+    drop(tx);
+    app.poll_report_run_updates();
+    assert_eq!(app.live_reruns.len(), 1, "still out after the run");
+    // The worker hanging up after its last message is the ordinary end of a
+    // run, not a reason to wipe the marks of the re-run still out beside it.
+    let progress = app.reports[idx]
+        .run_progress
+        .as_ref()
+        .expect("still re-running");
+    assert!(progress.rerun);
+    assert!(
+        progress.states.contains(&RowState::Running),
+        "{:?}",
+        progress.states
+    );
+
+    // ...and a new run starts before it lands.
+    app.reports[idx].results_exported = true;
+    app.start_report_run_faked(|_| FakeReportRunner {
+        body: "third".to_string(),
+    });
+    assert!(
+        app.live_reruns.is_empty(),
+        "the old run's re-run was dropped"
+    );
+    poll_until_idle(&mut app);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    app.poll_report_run_updates();
+    let rows = &app.reports[idx].result.as_ref().unwrap().rows;
+    assert!(
+        rows.iter().all(|r| r.cells["Oauth.Response"] == "third"),
+        "{:?}",
+        rows.iter()
+            .map(|r| &r.cells["Oauth.Response"])
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `o` sorts a grid a run is still streaming into, like a finished one; rows
+/// still on their way wait at the bottom.
+#[test]
+fn o_sorts_while_the_run_streams() {
+    use super::reports::{ReportView, RowState, RunProgress};
+    let (text, live) = half_run_comparison();
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let rt = &mut app.reports[idx];
+    rt.report.set_text(&text);
+    rt.result_flow = rt.report.flow().ok();
+    let pending: Vec<usize> = live.pending.iter().copied().collect();
+    rt.run_progress = Some(RunProgress {
+        states: (0..live.rows.len())
+            .map(|r| {
+                if live.pending.contains(&r) {
+                    RowState::Scheduled
+                } else {
+                    RowState::Finished
+                }
+            })
+            .collect(),
+        index: Default::default(),
+        done: live.rows.len() - 1,
+        rerun: false,
+    });
+    let verdict = live
+        .resolved_columns(&rt.report.flow().unwrap().header)
+        .iter()
+        .position(|c| c.header == "Verdict")
+        .unwrap();
+    rt.result = Some(live);
+    rt.view = ReportView::Results;
+    rt.cell_cursor = Some((0, verdict));
+
+    press(&mut app, KeyCode::Char('o'));
+    let rt = &app.reports[idx];
+    assert_eq!(rt.results_sort, Some(("Verdict".to_string(), false)));
+    let shown = rt.visible_result_rows();
+    let result = rt.result.as_ref().unwrap();
+    let verdicts: Vec<&str> = shown[..3]
+        .iter()
+        .map(|&r| result.rows[r].cells["Verdict"].as_str())
+        .collect();
+    assert_eq!(verdicts, ["no", "no", "yes"]);
+    assert_eq!(shown[3..], pending[..], "the row still on its way is last");
+}
+
+/// Mid-run, a case with one side still to come gets a Waiting filter of its
+/// own, which shows the side that has landed.
+#[test]
+fn a_waiting_filter_is_offered_while_pairs_are_half_in() {
+    use super::reports::{RowState, RunProgress};
+    use crate::report::filter::RowFilter;
+    let (text, live) = half_run_comparison();
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let rt = &mut app.reports[idx];
+    rt.report.set_text(&text);
+    rt.result_flow = rt.report.flow().ok();
+    rt.run_progress = Some(RunProgress {
+        states: (0..live.rows.len())
+            .map(|r| {
+                if live.pending.contains(&r) {
+                    RowState::Scheduled
+                } else {
+                    RowState::Finished
+                }
+            })
+            .collect(),
+        index: Default::default(),
+        done: live.rows.len() - 1,
+        rerun: false,
+    });
+    rt.result = Some(live);
+    rt.refresh_live_summary();
+    assert!(rt.result_filters().contains(&RowFilter::Waiting));
+    rt.results_filter = RowFilter::Waiting;
+    let shown = rt.visible_result_rows();
+    let result = rt.result.as_ref().unwrap();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(result.rows[shown[0]].vars["X"], "2");
+    assert_eq!(
+        result.rows[shown[0]].role,
+        crate::report::model::RowRole::Baseline
+    );
+}
+
+/// Stopping a run puts the grid back on All: a filter left up on the stopped
+/// (raw) grid would show nothing, with no way back to the rows.
+#[test]
+fn stopping_a_run_puts_the_grid_back_on_all() {
+    use super::reports::{RowState, RunProgress};
+    use crate::report::filter::RowFilter;
+    let (text, live) = half_run_comparison();
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let id = app.reports[idx].report.id;
+    let rt = &mut app.reports[idx];
+    rt.report.set_text(&text);
+    rt.result_flow = rt.report.flow().ok();
+    rt.run_progress = Some(RunProgress {
+        states: vec![RowState::Finished; live.rows.len()],
+        index: Default::default(),
+        done: live.rows.len(),
+        rerun: false,
+    });
+    rt.result = Some(live);
+    rt.results_filter = RowFilter::Waiting;
+    app.running_reports.insert(
+        id,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    app.run_active_report();
+    assert_eq!(app.reports[idx].results_filter, RowFilter::All);
+    assert_eq!(
+        app.reports[idx].visible_result_rows().len(),
+        app.reports[idx].result.as_ref().unwrap().rows.len()
+    );
+}
+
+/// A runner that records the variables each request was sent with.
+struct VarsRunner {
+    seen: std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+}
+
+impl crate::report::run::EntryRunner for VarsRunner {
+    fn run(
+        &self,
+        base: &crate::hurl::HurlEntry,
+        vars: &std::collections::HashMap<String, String>,
+    ) -> crate::hurl::RunOutput {
+        self.seen.lock().unwrap().push(vars.clone());
+        FakeReportRunner {
+            body: "ok".to_string(),
+        }
+        .run(base, vars)
+    }
+}
+
+/// A dry run previews with the answers in the run settings, but a row
+/// re-run belongs to the result on screen: it is sent with what *that* was
+/// run with, not with whatever was previewed since.
+#[test]
+fn a_rerun_after_a_preview_uses_the_results_own_parameters() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/{{REGION}}".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "# collection: api\nPARAM CHOICE(\"au\", \"eu\") REGION = \"au\"\nFOR X IN [\"a\"]\n    REPORT REQUEST Oauth\nEND\n",
+    );
+    app.revalidate_report(idx);
+    app.seed_report_params(idx);
+    app.reports[idx]
+        .param_values
+        .insert("REGION".into(), "au".into());
+    app.answer_report_params(idx);
+    app.start_report_run_faked(|_| FakeReportRunner {
+        body: "ok".to_string(),
+    });
+    poll_until_idle(&mut app);
+    assert!(
+        app.reports[idx]
+            .result
+            .as_ref()
+            .is_some_and(|r| r.finalized)
+    );
+
+    // Preview with other answers, then put the preview away.
+    app.reports[idx]
+        .param_values
+        .insert("REGION".into(), "eu".into());
+    app.record_result_params(idx);
+    assert!(
+        app.reports[idx]
+            .result_params
+            .iter()
+            .any(|(_, v)| v == "eu")
+    );
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    app.reports[idx].cell_cursor = Some((0, 0));
+    app.rerun_report_row_with(move |_| VarsRunner { seen: captured });
+    poll_until_idle(&mut app);
+    let sent = seen.lock().unwrap().clone();
+    assert!(!sent.is_empty(), "the row was re-sent");
+    assert!(
+        sent.iter()
+            .all(|v| v.get("REGION").map(String::as_str) == Some("au")),
+        "re-sent with the result's own answers: {sent:?}"
+    );
+}
+
+/// Stopping a run keeps what came back exactly as it was: the pinned summary,
+/// and filters that still work.
+#[test]
+fn a_stopped_run_keeps_its_summary_and_filters() {
+    use super::reports::{RowState, RunProgress};
+    use crate::report::filter::RowFilter;
+    let (text, live) = half_run_comparison();
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let id = app.reports[idx].report.id;
+    let rt = &mut app.reports[idx];
+    rt.report.set_text(&text);
+    rt.result_flow = rt.report.flow().ok();
+    rt.run_progress = Some(RunProgress {
+        states: (0..live.rows.len())
+            .map(|r| {
+                if live.pending.contains(&r) {
+                    RowState::Scheduled
+                } else {
+                    RowState::Finished
+                }
+            })
+            .collect(),
+        index: Default::default(),
+        done: live.rows.len() - 1,
+        rerun: false,
+    });
+    rt.result = Some(live);
+    app.running_reports.insert(
+        id,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    app.run_active_report(); // `r` mid-run stops it
+    let rt = &mut app.reports[idx];
+    assert!(rt.frozen());
+    assert!(rt.result.as_ref().unwrap().partial.is_some());
+    rt.refresh_live_summary();
+    let s = crate::i18n::Strings::english();
+    let head = super::reports::results_head_text(rt, s);
+    assert!(
+        head.iter()
+            .any(|l| l.contains(&format!("{} 1", s.report_metric_fixed))),
+        "{head:?}"
+    );
+    assert!(rt.result_filters().contains(&RowFilter::Fixed));
+    assert!(rt.result_filters().contains(&RowFilter::Waiting));
+    rt.results_filter = RowFilter::Fixed;
+    assert_eq!(
+        rt.visible_result_rows().len(),
+        2,
+        "both sides of the fixed case"
+    );
+}
+
+/// `r` on a stopped run asks whether to resume; resuming runs only the rows
+/// that hadn't come back, and finishes the report.
+#[test]
+fn r_on_a_stopped_run_resumes_it() {
+    use super::app::{ConfirmAction, Overlay};
+    let (mut app, idx) = report_run_with("first");
+    let rt = &mut app.reports[idx];
+    let result = rt.result.as_mut().unwrap();
+    result.finalized = false;
+    result.pending.insert(1);
+    result.partial = Some(crate::report::model::Partial {
+        rows_completed: 1,
+        rows_planned: 2,
+    });
+    assert!(rt.frozen());
+
+    app.run_active_report();
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::Confirm {
+            action: ConfirmAction::ResumeReport,
+            ..
+        })
+    ));
+    app.overlay = None;
+    app.resume_active_report_with(|_| FakeReportRunner {
+        body: "second".to_string(),
+    });
+    poll_until_idle(&mut app);
+    let result = app.reports[idx].result.as_ref().unwrap();
+    assert!(result.finalized && result.pending.is_empty() && result.partial.is_none());
+    assert_eq!(
+        result.rows[0].cells["Oauth.Response"], "first",
+        "kept as it was"
+    );
+    assert_eq!(
+        result.rows[1].cells["Oauth.Response"], "second",
+        "the missing row ran"
     );
 }

@@ -57,6 +57,11 @@ pub const MATCH: &str = "Comparison matched baseline";
 pub const NO_BASELINE: &str = "no baseline";
 /// `Result` value for a baseline row whose row key produced no candidate.
 pub const NO_CANDIDATE: &str = "no candidate";
+/// `Result` value, in a *live* run's projection only, for a candidate row
+/// whose baseline hasn't come back yet. Not a difference — the other side is
+/// on its way — so the Differences filter leaves it out; a finished report
+/// never carries it.
+pub const WAITING_BASELINE: &str = "waiting for baseline";
 /// `Result` value in a **dry run**: both sides of the comparison are rows that
 /// were never sent, so they are identical in the way two blank pages are. A
 /// diff of them would report "matched baseline" for every row, which is the
@@ -292,6 +297,13 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
                     && let Some(base) = baseline
                 {
                     result.baseline_rows.insert(out.len(), (*base).clone());
+                }
+                if let Some(base) = baseline
+                    && !base.errors.is_empty()
+                {
+                    result
+                        .baseline_errors
+                        .insert(out.len(), base.errors.clone());
                 }
                 // Copy baseline cells for each SHOW field, but only for aliases
                 // where the candidate row already emits that field.  This avoids

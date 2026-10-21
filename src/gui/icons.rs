@@ -56,6 +56,8 @@ pub const SORT_DESC: &str = p::SORT_DESCENDING;
 
 /// Run / send action (formerly `▶`).
 pub const PLAY: &str = p::PLAY;
+/// Re-run one row of a finished report.
+pub const RERUN: &str = p::ARROW_CLOCKWISE;
 /// Add action (formerly `＋`).
 pub const PLUS: &str = p::PLUS;
 /// Close / remove action (formerly `✕`).

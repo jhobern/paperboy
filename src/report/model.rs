@@ -153,6 +153,13 @@ pub struct ReportResult {
     /// looks exactly like a complete one is a trap, and the file usually
     /// outlives the terminal that would have said so.
     pub partial: Option<Partial>,
+    /// Set once [`finalize`](super::run::finalize) has run over these rows: the
+    /// comparison collapsed, truths scored, images fetched. A streaming grid is
+    /// the raw, uncollapsed projection until then — and stays that way if the
+    /// run is stopped, even after its last row has landed (requests after the
+    /// loops, cleanups and image fetches still come between that and the end).
+    /// Only a finalized result has finished rows to re-run one of.
+    pub finalized: bool,
     /// What each `ENVS` role's written target resolved to when the run actually
     /// visited it, keyed by the text as written.
     ///
@@ -177,6 +184,12 @@ pub struct ReportResult {
     pub role_targets: HashMap<String, Vec<String>>,
     /// Produced cell-column keys in first-seen order — the default column set.
     pub column_order: Vec<String>,
+    /// Produced columns whose values are settled before any request is sent:
+    /// a `REPORT` of loop variables, parameters or assignments that read no
+    /// response (`REPORT FILE AS Document`, `REPORT "{{DIR}}/{{FILE}}" AS
+    /// Path`). A row still waiting on its requests shows these as they will be,
+    /// rather than as a placeholder — they are as real as its loop variables.
+    pub planned_columns: std::collections::HashSet<String>,
     /// Row indices whose result hasn't streamed in yet — the skeleton slots a
     /// live run has not reached.
     ///
@@ -277,6 +290,15 @@ pub struct ReportResult {
     /// ([`track_baseline`](Self::track_baseline)), so a report without one
     /// carries no extra rows and is unchanged.
     pub baseline_rows: std::collections::HashMap<usize, ReportRow>,
+    /// The errors each compared row's *baseline* raised, keyed by collapsed row
+    /// index — only for rows whose baseline raised any.
+    ///
+    /// The collapse drops the baseline row, and with it the only record of
+    /// which of the run's errors were that row's: the run's own list is flat
+    /// and its wording names a step, not a row. Re-running one row has to know
+    /// which errors it is replacing, or a transient failure on the baseline
+    /// side would stay listed after the re-run fixed it.
+    pub baseline_errors: std::collections::HashMap<usize, Vec<String>>,
     /// Whether the comparison should record
     /// [`baseline_rows`](Self::baseline_rows). Set by the run's finalize phase
     /// before the collapse, because only it can see both the flow's truths and
@@ -515,7 +537,7 @@ impl ReportResult {
             } else {
                 PENDING_CELL_MARKER
             };
-            return col.pending_value(r, marker);
+            return col.pending_value(r, marker, &self.planned_columns);
         }
         col.value(r, &self.no_match_marker)
     }
@@ -524,13 +546,14 @@ impl ReportResult {
         if columns.iter().all(|c| c.stats.is_empty()) {
             return Vec::new();
         }
+        let superseded = self.superseded_baselines();
         // The coalesced, render-ready value list for a column (skipping empties
         // and the no-match marker) — what the statistic is computed over.
         let column_values = |col: &OutputColumn| -> Vec<String> {
             self.rows
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| !self.pending.contains(i))
+                .filter(|(i, _)| !self.pending.contains(i) && !superseded.contains(i))
                 .map(|(_, row)| col.value(row, &self.no_match_marker))
                 .filter(|v| !v.trim().is_empty() && *v != self.no_match_marker)
                 .collect()
@@ -587,6 +610,37 @@ impl ReportResult {
             }
         }
         out
+    }
+
+    /// Indices of baseline rows that a candidate row in this table will be
+    /// measured against — the rows the comparison collapse folds away.
+    ///
+    /// A live run's grid is the *uncollapsed* projection: each case appears
+    /// once per side, so a `STATISTICS(MEAN)` over it averaged the baseline's
+    /// times in with the candidate's and described neither. Leaving these rows
+    /// out makes the live footer measure what the finished report will — the
+    /// candidates, plus any baseline that has no candidate of its own. It is a
+    /// no-op on a collapsed result, where no baseline is left beside a
+    /// candidate of the same key and comparison.
+    fn superseded_baselines(&self) -> std::collections::HashSet<usize> {
+        let candidates: std::collections::HashSet<(&[String], Option<&str>)> = self
+            .rows
+            .iter()
+            .filter(|r| r.role == RowRole::Candidate)
+            .map(|r| (r.key.as_slice(), r.comparison.as_deref()))
+            .collect();
+        if candidates.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                r.role == RowRole::Baseline
+                    && candidates.contains(&(r.key.as_slice(), r.comparison.as_deref()))
+            })
+            .map(|(i, _)| i)
+            .collect()
     }
 }
 
@@ -910,11 +964,22 @@ impl OutputColumn {
     /// returned `0` — which is worse than admitting nothing is known. Only the
     /// parameter-derived sources are real at this point (the row's variable
     /// snapshot and `TARGET`: which file, which image, which environment this
-    /// slot is *for*), so those still resolve and everything else becomes
-    /// `placeholder`.
-    pub fn pending_value(&self, row: &ReportRow, placeholder: &str) -> String {
+    /// slot is *for*, plus the `planned` columns built from nothing else), so
+    /// those still resolve and everything else becomes `placeholder`.
+    pub fn pending_value(
+        &self,
+        row: &ReportRow,
+        placeholder: &str,
+        planned: &std::collections::HashSet<String>,
+    ) -> String {
         for src in &self.sources {
             if let Some(v) = row.vars.get(src)
+                && !v.is_empty()
+            {
+                return v.clone();
+            }
+            if planned.contains(src)
+                && let Some(v) = row.cells.get(src)
                 && !v.is_empty()
             {
                 return v.clone();
@@ -1850,6 +1915,40 @@ mod tests {
         };
         assert_eq!(get("Count").as_deref(), Some("2"), "only the finished rows");
         assert_eq!(get("Mean").as_deref(), Some("150"));
+    }
+
+    /// Only a baseline with a candidate beside it is left out: one with no
+    /// candidate survives the collapse as its own row, so it still counts, and
+    /// a baseline from another comparison is no stand-in for this one's.
+    #[test]
+    fn statistics_leave_out_only_the_baselines_a_candidate_replaces() {
+        let side = |v: &str, key: &str, role: RowRole, cmp: &str| ReportRow {
+            key: vec![key.to_string()],
+            role,
+            comparison: Some(cmp.to_string()),
+            ..row(&[("Time", v)], &[], None)
+        };
+        let res = ReportResult {
+            rows: vec![
+                side("100", "a", RowRole::Baseline, "c1"),
+                side("300", "a", RowRole::Candidate, "c1"),
+                // No candidate for key `b`: the finished report keeps this row.
+                side("500", "b", RowRole::Baseline, "c1"),
+                // Same key, different comparison: not this candidate's baseline.
+                side("700", "a", RowRole::Baseline, "c2"),
+            ],
+            ..Default::default()
+        };
+        let cols = parse_columns("Time STATISTICS(SUM, COUNT)");
+        let summary = res.summary_rows(&cols);
+        let get = |label: &str| {
+            summary
+                .iter()
+                .find(|r| r.label == label)
+                .map(|r| r.text_cell(0))
+        };
+        assert_eq!(get("Count").as_deref(), Some("3"));
+        assert_eq!(get("Sum").as_deref(), Some("1500"));
     }
 
     #[test]
