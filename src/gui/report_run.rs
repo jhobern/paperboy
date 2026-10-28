@@ -165,6 +165,10 @@ pub struct ParkedRun {
     /// tab the user last chose was chosen before there was anything to see.
     pub view: Option<super::report_editor::EditorView>,
     pub had_result: bool,
+    /// A terminal `Done` folded in while nobody was looking: the rows and
+    /// errors it reported, for the status line to announce. Taken by whoever
+    /// says so, so a finish is announced once rather than every frame.
+    pub finished: Option<(usize, usize)>,
 }
 
 impl ParkedRun {
@@ -185,6 +189,11 @@ impl ParkedRun {
                 self.run = None;
                 return false;
             }
+            // Worth announcing even though the grid it filled isn't on screen:
+            // the status line has been counting this run's rows up, and
+            // leaving it stopped one short of the total reads as a run that
+            // stalled rather than one that finished.
+            Drained::Done { rows, errors } => self.finished = Some((rows, errors)),
             // Rows changed while nobody was looking: whatever was exported
             // describes the table as it was.
             Drained::Rerun { replaced, .. } if !replaced.is_empty() => {

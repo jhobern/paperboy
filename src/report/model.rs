@@ -1080,7 +1080,15 @@ fn compute_stat(stat: StatKind, values: &[String]) -> Option<String> {
                 StatKind::StdDev => std_dev(&nums),
                 _ => unreachable!(),
             };
-            Some(format_number(v))
+            // `Sum`, `Min` and `Max` are exact — a min *is* one of the values,
+            // and a sum of values stated to n places is itself exact at n — so
+            // they print as they are. The rest are averages of a sample and
+            // can't be read to more precision than the sample was measured
+            // with, whatever the arithmetic leaves behind.
+            Some(match stat {
+                StatKind::Sum | StatKind::Min | StatKind::Max => format_number(v),
+                _ => format_number_to(v, derived_decimals(values)),
+            })
         }
     }
 }
@@ -1147,15 +1155,56 @@ fn distinct_counts(values: &[String]) -> Vec<(String, usize)> {
 /// Format a computed number for display: an integral value prints without a
 /// decimal point; otherwise up to six decimals with trailing zeros trimmed.
 pub(crate) fn format_number(n: f64) -> String {
+    format_number_to(n, MAX_DECIMALS)
+}
+
+/// As [`format_number`], but stating at most `decimals` places.
+fn format_number_to(n: f64, decimals: usize) -> String {
     if !n.is_finite() {
         return n.to_string();
     }
     if n.fract() == 0.0 && n.abs() < 1e15 {
         return format!("{}", n as i64);
     }
-    let s = format!("{n:.6}");
+    let s = format!("{n:.*}", decimals.min(MAX_DECIMALS));
     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    // Rounding can land on a whole number ("10366.000" -> "10366."), and the
+    // trim above leaves the point behind on an empty fraction.
+    if trimmed.is_empty() || trimmed == "-" {
+        return "0".to_string();
+    }
     trimmed.to_string()
+}
+
+/// The hard ceiling on a displayed number's decimals.
+const MAX_DECIMALS: usize = 6;
+
+/// The ceiling on a *derived* statistic's decimals. A mean of several hundred
+/// whole-millisecond timings printed as `10365.865672` claims a millionth of a
+/// millisecond; past about three places the digits are arithmetic, not
+/// measurement, and they cost the reader the figure's magnitude at a glance.
+const MAX_DERIVED_DECIMALS: usize = 3;
+
+/// How many decimals a statistic derived from `values` may state: one more than
+/// the values themselves carry — enough for the half an even-count median of
+/// whole numbers lands on — and never more than
+/// [`MAX_DERIVED_DECIMALS`].
+fn derived_decimals(values: &[String]) -> usize {
+    let stated = values
+        .iter()
+        .filter_map(|v| {
+            let v = v.trim();
+            crate::report::writer::parse_report_number(v)?;
+            // An exponent says nothing about the places a reader would count,
+            // so let such a column have the ceiling.
+            if v.contains(['e', 'E']) {
+                return Some(MAX_DERIVED_DECIMALS);
+            }
+            Some(v.split_once('.').map(|(_, f)| f.len()).unwrap_or(0))
+        })
+        .max()
+        .unwrap_or(0);
+    (stated + 1).min(MAX_DERIVED_DECIMALS)
 }
 
 /// One resolved output column: a display `header`, the ordered `sources` to
@@ -1759,6 +1808,74 @@ mod tests {
             truth: None,
             detail: false,
         }
+    }
+
+    /// A statistic computed from whole milliseconds used to be stated to six
+    /// decimals — a millionth of a millisecond, from values measured to the
+    /// nearest one — which buries the figure's magnitude in digits nobody can
+    /// act on.
+    #[test]
+    fn a_derived_statistic_says_no_more_than_its_inputs_did() {
+        let vals: Vec<String> = ["7834", "9455", "13004"]
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        // 10097.666666…, and the one decimal whole numbers earn.
+        assert_eq!(
+            compute_stat(StatKind::Mean, &vals).as_deref(),
+            Some("10097.7")
+        );
+        // An even count's median lands on a half, which that decimal is for.
+        let pair: Vec<String> = vec!["10".to_string(), "11".to_string()];
+        assert_eq!(
+            compute_stat(StatKind::Median, &pair).as_deref(),
+            Some("10.5")
+        );
+        // Three is the ceiling however finely the inputs were measured.
+        let fine: Vec<String> = ["1.000001", "2.000002"]
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert_eq!(
+            compute_stat(StatKind::Mean, &fine).as_deref(),
+            Some("1.5"),
+            "1.5000015 rounded to three places, with the trailing zeros dropped"
+        );
+        // A statistic that *is* one of the values, or an exact total of them,
+        // is not a measurement of its own and keeps every digit.
+        assert_eq!(
+            compute_stat(StatKind::Min, &fine).as_deref(),
+            Some("1.000001")
+        );
+        assert_eq!(
+            compute_stat(StatKind::Max, &fine).as_deref(),
+            Some("2.000002")
+        );
+        assert_eq!(
+            compute_stat(StatKind::Sum, &fine).as_deref(),
+            Some("3.000003")
+        );
+    }
+
+    /// Values stated to two places earn a third, and a mean that rounds to a
+    /// whole number says so plainly rather than trailing a bare point.
+    #[test]
+    fn decimals_in_the_data_earn_one_more_in_the_statistic() {
+        let vals: Vec<String> = ["1.25", "1.26"].iter().map(|v| v.to_string()).collect();
+        assert_eq!(
+            compute_stat(StatKind::Mean, &vals).as_deref(),
+            Some("1.255")
+        );
+
+        let round: Vec<String> = ["9.9995", "10.0005"]
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert_eq!(
+            compute_stat(StatKind::Mean, &round).as_deref(),
+            Some("10"),
+            "10.000 trimmed to a whole number, not \"10.\""
+        );
     }
 
     /// A `Mean` sat above a `Mean (baseline)` is one side of a comparison, not

@@ -276,6 +276,7 @@ strings! {
     status_copy_key => "^y", "^y", "^y";
     status_copy_hint => "copy", "copier", "kopiér";
     gui_status_copy_hint => "Click to copy this message", "Cliquez pour copier ce message", "Klik for at kopiere denne besked";
+    gui_status_running_hint => "Click to open the running report", "Cliquez pour ouvrir le rapport en cours", "Klik for at åbne rapporten, der kører";
     invalid_request_json => "Not valid Request JSON (expected an object with at least \"method\" and \"url\"); edit and try again.", "JSON de requête invalide (un objet avec au moins « method » et « url » est attendu) ; modifiez et réessayez.", "Ikke gyldig anmodnings-JSON (forventede et objekt med mindst \"method\" og \"url\"); ret og prøv igen.";
     no_requests_hint => "No requests yet \u{2014} press n to create one.", "Aucune requête \u{2014} appuyez sur n pour en créer une.", "Ingen anmodninger endnu \u{2014} tryk på n for at oprette en.";
     new_request => "\u{FF0B} New Request", "\u{FF0B} Nouvelle requête", "\u{FF0B} Ny anmodning";

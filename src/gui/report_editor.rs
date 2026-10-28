@@ -408,6 +408,8 @@ impl ReportEditor {
     /// with the editor, because it is rebuilt from the report text anyway.
     pub fn park_run(&mut self) -> ParkedRun {
         ParkedRun {
+            // Nothing to announce yet: the run is only now going out of sight.
+            finished: None,
             view: Some(self.view),
             had_result: self.result.is_some(),
             result: self.result.take(),

@@ -531,6 +531,12 @@ matrix. Both front-ends behave the same way:
   spent so far. The footer keeps its rows; this is a second reading of the same
   numbers for the reader who wants the comparison rather than the column, and
   it fills space a matrix would otherwise leave empty.
+- **A run you walked away from is still announced, and clicking it takes you
+  back.** The **Running report… 502/684** line on the menu row keeps counting
+  while the report is off screen, and says so when it finishes. Clicking it
+  reopens that report on its results — switching to its Workspace tab where it
+  came from one — so a long run started and left behind is one click away
+  rather than a hunt through the tabs.
 - **Stopping a run keeps everything that came back** — rows, summary, matrix,
   filters and sorting — and the run can be **resumed**: the **Resume** button
   beside Run in the GUI, or `r` on the stopped run in the terminal UI (`y`

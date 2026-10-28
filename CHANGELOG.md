@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.7.3] - 2026-10-28
+
+### Added
+
+- **The running-report line follows the run, and leads back to it.** Starting a
+  long report and going off to do something else is the point of running it in
+  the background, but the **Running report… 502/684** line on the menu row was
+  written by the editor on screen: navigate away and the count froze where you
+  left it, which reads as a run that stalled rather than one still going. A
+  parked run now keeps the line counting, and says so when it finishes.
+  Clicking the line goes back to the report it is about — reopening it in the
+  centre column, switching to its Workspace tab where it came from one, and
+  landing on its results rather than the blocks it was built from. A report
+  that has never been saved has no path to find it by, so for those the line
+  keeps its ordinary click-to-copy.
+
+### Fixed
+
+- **Statistics claimed more precision than the figures they were computed
+  from.** The mean of several hundred whole-millisecond timings was stated as
+  `10365.865672` — six decimals, a millionth of a millisecond, from values
+  measured to the nearest one. A derived statistic (`MEAN`, `MEDIAN`, `STDDEV`)
+  is now stated to one decimal more than its inputs carry, which keeps the half
+  an even-count median of whole numbers lands on, and never to more than three.
+  `SUM`, `MIN` and `MAX` are exact — a min *is* one of the values — and print
+  as they always did. The figures are the same everywhere they appear: the grid
+  footer, the statistics panel, the terminal UI and every export.
+
+
 ## [0.7.2] - 2026-10-28
 
 ### Added
