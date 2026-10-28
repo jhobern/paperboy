@@ -87,6 +87,9 @@ pub const EXPORT: &str = p::EXPORT;
 pub const OPEN_EXTERNAL: &str = p::ARROW_SQUARE_OUT;
 /// A row queued in the streaming results grid (formerly `·`).
 pub const ROW_SCHEDULED: &str = p::DOT_OUTLINE;
+/// A results row picked out to act on with others — a ticked box rather than
+/// a bare tick, which is already the "this row came back" mark beside it.
+pub const SELECTED: &str = p::CHECK_SQUARE;
 /// Preview a report's projected rows without sending anything (the dry run).
 /// An eye rather than a second play glyph, so it can't be mistaken for Run.
 pub const PREVIEW: &str = p::EYE;

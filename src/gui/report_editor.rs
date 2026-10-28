@@ -256,7 +256,22 @@ pub struct ReportEditor {
     /// A row whose re-run was asked for from the grid's context menu this
     /// frame, started at the end of the frame (the grid draws while the
     /// result is borrowed).
-    pending_rerun: Option<usize>,
+    pending_row_act: Option<RowAct>,
+    /// Rows picked out of the results grid to act on together — ctrl-click
+    /// adds one, shift-click a run of them, and the row menu re-runs the lot.
+    ///
+    /// Indices into the result's rows. A re-run replaces a row in place, so
+    /// they survive one; a grid replaced wholesale (a new run, a resume)
+    /// clears them, since the same index would then be a different row.
+    selected_rows: std::collections::BTreeSet<usize>,
+    /// The row a shift-click measures its range from: the last row picked on
+    /// its own.
+    select_anchor: Option<usize>,
+    /// The rows the grid showed last frame, in the order it showed them —
+    /// what a shift-click's "everything between these two" means on a sorted
+    /// or filtered grid. Kept here because the range is worked out when the
+    /// click is *carried out*, after the grid that knew the order has gone.
+    results_shown: Vec<usize>,
     /// A toolbar button pressed this frame, run *after* the body has been drawn
     /// (see [`ToolbarAct`]).
     pending_toolbar: Option<ToolbarAct>,
@@ -367,7 +382,10 @@ impl ReportEditor {
             result_run_params: Default::default(),
             queued_reruns: Vec::new(),
             live_summary: None,
-            pending_rerun: None,
+            pending_row_act: None,
+            selected_rows: Default::default(),
+            select_anchor: None,
+            results_shown: Vec::new(),
             params_seeded: false,
             params_sig: String::new(),
             params_confirmed: false,
@@ -402,6 +420,7 @@ impl ReportEditor {
             result_flow: self.result_flow.take(),
             result_run_params: std::mem::take(&mut self.result_run_params),
             queued_reruns: std::mem::take(&mut self.queued_reruns),
+            selected_rows: std::mem::take(&mut self.selected_rows),
         }
     }
 
@@ -418,6 +437,7 @@ impl ReportEditor {
         self.result_flow = parked.result_flow;
         self.result_run_params = parked.result_run_params;
         self.queued_reruns = parked.queued_reruns;
+        self.selected_rows = parked.selected_rows;
         if !parked.params.is_empty() {
             self.param_values = parked.params;
             // Already answered: don't overwrite them from the remembered set.
@@ -742,6 +762,7 @@ impl ReportEditor {
                 self.last_export = None;
                 self.result_flow = Some(flow.clone());
                 self.queued_reruns.clear();
+                self.clear_row_selection();
                 // The old result's filters and panels described the old rows.
                 self.results_filter = RowFilter::All;
                 self.results_find.clear();
@@ -938,12 +959,18 @@ impl ReportEditor {
         });
     }
 
-    /// Re-run row `r` of the run in flight straight away, beside it: someone
-    /// who notices a wrong row mid-run is keen for its answer, not for the end
-    /// of the run. Both sides of a comparison row go again, so the case's rows
-    /// that have come back are drawn running until the answer lands (see
-    /// [`report_run::RunHandle::rerun_live`]).
-    fn rerun_row_live(&mut self, app: &mut GuiApp, r: usize) {
+    /// Re-run rows `rows` of the run in flight straight away, beside it:
+    /// someone who notices a wrong row mid-run is keen for its answer, not for
+    /// the end of the run. Both sides of a comparison row go again, so the
+    /// case's rows that have come back are drawn running until the answer
+    /// lands (see [`report_run::RunHandle::rerun_live`]).
+    ///
+    /// A row the run hasn't answered yet is dropped rather than refusing the
+    /// whole batch: picking a band of rows mid-run is a gesture, and losing
+    /// the fourteen that *could* go because one of them is still out would be
+    /// the wrong reading of it. Asking for nothing but unfinished rows still
+    /// says so.
+    fn rerun_rows_live(&mut self, app: &mut GuiApp, rows: &[usize]) {
         let (Some(flow), Some(result), Some(progress)) = (
             self.result_flow.as_ref(),
             self.result.as_ref(),
@@ -951,31 +978,43 @@ impl ReportEditor {
         ) else {
             return;
         };
-        let Some(row) = result.rows.get(r) else {
-            return;
-        };
-        if progress.states.get(r) != Some(&RowState::Finished) {
+        let picked: Vec<usize> = rows
+            .iter()
+            .copied()
+            .filter(|&r| r < result.rows.len())
+            .filter(|&r| progress.states.get(r) == Some(&RowState::Finished))
+            .collect();
+        if picked.is_empty() {
             app.session.status = Some(Status::ReportRowRerunBlocked(
                 app.strings.report_rerun_not_back_yet.to_string(),
             ));
             return;
         }
-        // The case's other sides: same key, same comparison.
+        // The cases' other sides: same key, same comparison.
         let marked: Vec<usize> = result
             .rows
             .iter()
             .enumerate()
             .filter(|(i, other)| {
-                *i == r
-                    || (row.comparison.is_some()
-                        && other.comparison == row.comparison
-                        && other.key == row.key)
+                picked.contains(i)
+                    || picked.iter().any(|&p| {
+                        let row = &result.rows[p];
+                        row.comparison.is_some()
+                            && other.comparison == row.comparison
+                            && other.key == row.key
+                    })
             })
             .filter(|(i, _)| progress.states.get(*i) == Some(&RowState::Finished))
             .map(|(i, _)| i)
             .collect();
-        let refs = vec![crate::report::rerun::RowRef::of(row)];
-        let path = row.path.clone();
+        let refs: Vec<crate::report::rerun::RowRef> = picked
+            .iter()
+            .map(|&r| crate::report::rerun::RowRef::of(&result.rows[r]))
+            .collect();
+        let paths: Vec<Vec<(usize, usize)>> = picked
+            .iter()
+            .map(|&r| result.rows[r].path.clone())
+            .collect();
         let inputs = match context::report_run_inputs(
             &app.session.collections,
             &app.session.global_envs,
@@ -1000,8 +1039,9 @@ impl ReportEditor {
         for &i in &marked {
             progress.states[i] = RowState::Running;
         }
-        handle.rerun_live(inputs, vec![path], refs, marked);
-        app.session.status = Some(Status::ReportRowRerunning);
+        let started = picked.len();
+        handle.rerun_live(inputs, paths, refs, marked);
+        app.session.status = Some(Status::rerunning(started));
     }
 
     /// Whether the result on screen is a run that was stopped part-way — the
@@ -1103,12 +1143,18 @@ impl ReportEditor {
     }
 
     /// Queue row `r` to re-run once what is in flight — a run, or another
-    /// re-run — has finished, or take it off the queue if it is already on it.
-    fn toggle_queued_rerun(&mut self, app: &mut GuiApp, r: usize) {
+    /// re-run — has finished. With `toggle`, a row already on the queue comes
+    /// off it again (what picking it from the menu a second time means); a
+    /// batch passes `false`, since a batch that quietly unqueued half of what
+    /// it was handed would be unusable.
+    fn queue_rerun(&mut self, app: &mut GuiApp, r: usize, toggle: bool) {
         let Some(row) = self.result.as_ref().and_then(|res| res.rows.get(r)) else {
             return;
         };
         if let Some(at) = self.queued_reruns.iter().position(|q| q.is(row)) {
+            if !toggle {
+                return;
+            }
             self.queued_reruns.remove(at);
         } else {
             let state = self
@@ -1135,6 +1181,88 @@ impl ReportEditor {
         app.session.status = Some(Status::ReportRowRerunQueued {
             rows: self.queued_reruns.len(),
         });
+    }
+
+    /// Forget the rows picked out of the grid. Called wherever the grid is
+    /// replaced wholesale — a new run, and the moment a run's finished result
+    /// supersedes the live rows it was collecting — since the same index is
+    /// then a different row.
+    fn clear_row_selection(&mut self) {
+        self.selected_rows.clear();
+        self.select_anchor = None;
+        self.results_shown.clear();
+    }
+
+    /// Carry out what a row interaction in the grid asked for (see
+    /// [`RowAct`]).
+    fn apply_row_act(&mut self, app: &mut GuiApp, act: RowAct) {
+        match act {
+            RowAct::Rerun {
+                rows,
+                from_selection,
+            } => {
+                if rows.is_empty() {
+                    return;
+                }
+                if from_selection {
+                    // Spent: the rows are going, and a selection still lit
+                    // over them is an invitation to send them twice.
+                    self.selected_rows.clear();
+                    self.select_anchor = None;
+                }
+                if self.streaming() {
+                    self.rerun_rows_live(app, &rows);
+                } else if self.rerunning() {
+                    // One in flight already: these go as the next batch.
+                    // Queued rather than toggled — a batch that silently
+                    // unqueued half of what it was given would be unusable.
+                    for r in rows {
+                        self.queue_rerun(app, r, false);
+                    }
+                } else {
+                    self.rerun_rows(app, &rows);
+                }
+            }
+            RowAct::Toggle(r) => {
+                if !self.selected_rows.remove(&r) {
+                    self.selected_rows.insert(r);
+                    self.select_anchor = Some(r);
+                }
+                app.session.status = Some(Status::ReportRowsSelected {
+                    rows: self.selected_rows.len(),
+                });
+            }
+            RowAct::Extend(r) => {
+                // Shift-clicking with nothing picked yet starts the run here
+                // rather than doing nothing.
+                let from = self.select_anchor.unwrap_or(r);
+                let (lo, hi) = (from.min(r), from.max(r));
+                // The range is over the rows *on screen*: a sorted or
+                // filtered grid's "everything between these two" is what the
+                // reader can see between them, not a span of row indices
+                // that may include rows the view is hiding.
+                let shown = std::mem::take(&mut self.results_shown);
+                let span: Vec<usize> = if shown.is_empty() {
+                    (lo..=hi).collect()
+                } else {
+                    let at = |row: usize| shown.iter().position(|&s| s == row);
+                    match (at(from), at(r)) {
+                        (Some(a), Some(b)) => shown[a.min(b)..=a.max(b)].to_vec(),
+                        _ => (lo..=hi).collect(),
+                    }
+                };
+                self.results_shown = shown;
+                self.selected_rows.extend(span);
+                app.session.status = Some(Status::ReportRowsSelected {
+                    rows: self.selected_rows.len(),
+                });
+            }
+            RowAct::ClearSelection => {
+                self.selected_rows.clear();
+                self.select_anchor = None;
+                app.session.status = Some(Status::ReportRowsSelected { rows: 0 });
+            }
+        }
     }
 
     /// Show every row again when a re-run has left the selected filter
@@ -1206,8 +1334,9 @@ impl ReportEditor {
                 inputs.language = app.session.language.clone();
                 inputs.params = self.result_run_params.clone();
                 self.progress = Some(RunProgress::rerun(total, &rows));
+                let started = rows.len();
                 self.run = Some(report_run::spawn_rerun(inputs, paths, rows));
-                app.session.status = Some(Status::ReportRowRerunning);
+                app.session.status = Some(Status::rerunning(started));
             }
             Err(context::RunInputError::Unbound) => {
                 app.session.status = Some(Status::ReportRunBlocked(
@@ -1233,9 +1362,16 @@ impl ReportEditor {
                 app.session.status = Some(Status::ReportRunDone { rows, errors });
                 // The finished result numbers its rows afresh (a comparison
                 // folds each baseline away), so a drill-down opened during the
-                // run would now be showing some other row.
+                // run would now be showing some other row — and so would every
+                // row picked out of the live grid.
                 self.results_detail = None;
                 self.results_textures.clear();
+                // Inlined rather than calling `clear_row_selection`: the run
+                // handle is borrowed across this arm, so `&mut self` isn't
+                // available.
+                self.selected_rows.clear();
+                self.select_anchor = None;
+                self.results_shown.clear();
                 rerun_landed = true;
             }
             report_run::Drained::Rerun { replaced, errors } => {
@@ -2838,14 +2974,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // The header's buttons act here, at the end of the frame that pressed them,
     // so any inline field that committed on losing focus above has already been
     // folded into the report (see [`ToolbarAct`]).
-    if let Some(r) = ed.pending_rerun.take() {
-        if ed.streaming() {
-            ed.rerun_row_live(app, r);
-        } else if ed.rerunning() {
-            ed.toggle_queued_rerun(app, r);
-        } else {
-            ed.rerun_rows(app, &[r]);
-        }
+    if let Some(act) = ed.pending_row_act.take() {
+        ed.apply_row_act(app, act);
     }
     if let Some(rows) = ed.take_ready_reruns() {
         if rows.is_empty() {
@@ -2962,6 +3092,7 @@ fn dry_run_body(
         None,
         None,
         None,
+        &[],
     ) {
         opened = Some(ins);
     }
@@ -4355,6 +4486,16 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         (_, true) => (result, None),
         (_, false) => (result, result.metrics(&columns, &header)),
     };
+    // The baseline half of a comparison's statistics. The live grid is the
+    // uncollapsed rows, so it has no `baseline.*` columns of its own and its
+    // footer would state only the candidate's figures until the very last row
+    // landed; these put the baseline's beside them for the whole run.
+    let baseline_summary = projected
+        .map(|p| {
+            let projected_columns = p.resolved_columns(&header);
+            p.baseline_summary_rows(&projected_columns, &grid_columns)
+        })
+        .unwrap_or_default();
     let (mut filters, mut buttons) =
         crate::report::filter::all_filters(summary_of, metrics.as_ref());
     // Mid-run, the cases with one side in and the other on its way get a
@@ -4389,6 +4530,9 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     {
         crate::report::filter::sort_rows(result, col, *desc, &mut visible);
     }
+    // Kept for the interactions that are carried out after the grid has been
+    // drawn: a shift-click's range is over the rows as *shown*.
+    ed.results_shown = visible.clone();
     let pickable: &[RowFilter] = &filters;
     // The summary block scrolls inside a height of its own rather than
     // pushing the grid off the bottom. A report with a matrix per
@@ -4428,14 +4572,31 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
             );
             // The matrices sit under the bar they drive: a cell is itself a
             // filter, and picking one selects exactly the rows that cell
-            // counted.
-            if let Some(metrics) = &metrics {
-                for m in &metrics.columns {
-                    if let Some(matrix) = &m.matrix {
-                        confusion_matrix(&th, ui, app, &m.header, matrix, pickable, &mut filter);
-                    }
+            // counted. The statistics panel sits beside them, in the space a
+            // matrix leaves to its right rather than below the fold.
+            let matrices: Vec<_> = metrics
+                .iter()
+                .flat_map(|m| m.columns.iter())
+                .filter_map(|m| m.matrix.as_ref().map(|x| (m.header.clone(), x)))
+                .collect();
+            ui.horizontal_top(|ui| {
+                if !matrices.is_empty() {
+                    ui.vertical(|ui| {
+                        for (header, matrix) in &matrices {
+                            confusion_matrix(&th, ui, app, header, matrix, pickable, &mut filter);
+                        }
+                    });
+                    ui.add_space(24.0);
                 }
-            }
+                statistics_panel(
+                    &th,
+                    ui,
+                    &app.strings,
+                    result,
+                    &grid_columns,
+                    &baseline_summary,
+                );
+            });
         });
     if filter != picked_at
         && let Some(f) = filters.get(filter)
@@ -4474,8 +4635,15 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
                 blocked: rerun_blocked,
                 streaming: live,
                 queued,
-                rerun: &mut ed.pending_rerun,
+                selected: ed.selected_rows.clone(),
+                failed: visible
+                    .iter()
+                    .copied()
+                    .filter(|&r| crate::report::filter::row_failed(result, r))
+                    .collect(),
+                act: &mut ed.pending_row_act,
             }),
+            &baseline_summary,
         );
     });
     if let Some(ins) = inspector {
@@ -4997,6 +5165,183 @@ fn metric_card(
 /// The shading comes from [`crate::report::metrics::heat_rgb`], the same ramp
 /// the HTML export uses, so one matrix cannot come out looking like two.
 #[allow(clippy::too_many_arguments)]
+/// The paired halves of a run's `STATISTICS`, restated beside the confusion
+/// matrices.
+///
+/// The grid's own footer states each statistic under the column it measures,
+/// which is right but puts a comparison's two halves wherever their columns
+/// happen to sit — and when a field was renamed (`"Response Time": TimeWait`)
+/// the baseline's copy, which is named after the *query*, can land several
+/// columns away from the candidate's. Two numbers that far apart read as two
+/// unrelated figures rather than the before and after of one measurement.
+///
+/// Stated as a pair, in the space a matrix leaves beside it, "which side is
+/// faster" is one glance. The footer keeps its rows: this is a second reading
+/// of the same numbers, for the reader who wants the comparison rather than
+/// the column.
+fn statistics_panel(
+    th: &GuiTheme,
+    ui: &mut egui::Ui,
+    s: &Strings,
+    result: &ReportResult,
+    columns: &[crate::report::model::OutputColumn],
+    extra: &[crate::report::model::SummaryRow],
+) {
+    use crate::report::model::StatKind;
+
+    // Read from the same result the grid's own footer is built from, so the
+    // panel can never state a different number for the same statistic.
+    let rows = result.summary_rows(columns);
+    let paired: std::collections::HashMap<usize, usize> =
+        result.baseline_column_pairs(columns).into_iter().collect();
+
+    // One block per column that asked for statistics, each line a statistic
+    // with the two sides beside it.
+    let mut blocks: Vec<(String, Vec<(String, String, Option<String>)>)> = Vec::new();
+    for (ci, col) in columns.iter().enumerate() {
+        if col.stats.is_empty() || col.header.starts_with("baseline.") {
+            continue;
+        }
+        let mut lines = Vec::new();
+        for r in &rows {
+            let Some(cell) = r.cells.get(ci).and_then(Option::as_ref) else {
+                continue;
+            };
+            // A distribution row is one line per distinct value, already named
+            // by its own label — a tally, not a pair of measurements.
+            if cell.stat == Some(StatKind::Distribution) {
+                continue;
+            }
+            // A collapsed table pairs through its own `baseline.*` column; a
+            // live one has none, so the re-keyed rows carry the other half.
+            let other = paired
+                .get(&ci)
+                .and_then(|bi| r.cells.get(*bi))
+                .and_then(Option::as_ref)
+                .map(|v| v.text.clone())
+                .or_else(|| {
+                    extra
+                        .iter()
+                        .find(|e| e.label == format!("{} (baseline)", r.label))
+                        .and_then(|e| e.cells.get(ci).and_then(Option::as_ref))
+                        .map(|v| v.text.clone())
+                });
+            lines.push((r.label.clone(), cell.text.clone(), other));
+        }
+        if !lines.is_empty() {
+            blocks.push((col.header.clone(), lines));
+        }
+    }
+
+    // Measured on the grid's own rows rather than the projection's: the
+    // collapse folds the baseline rows away, and they are what the baseline's
+    // total is made of.
+    let (cand_ms, base_ms) = result.side_durations_ms();
+    let totals = (cand_ms > 0.0).then(|| {
+        let unit = duration_unit(cand_ms.max(base_ms.unwrap_or(0.0)));
+        (
+            unit.render(cand_ms),
+            base_ms.map(|ms| unit.render(ms)),
+            unit.suffix,
+        )
+    });
+    if blocks.is_empty() && totals.is_none() {
+        return;
+    }
+    // Only a comparison has a second side to state; an ordinary report gets
+    // one column of figures and no heading telling it which side it is.
+    let two_sided = totals.as_ref().is_some_and(|(_, b, _)| b.is_some())
+        || blocks
+            .iter()
+            .any(|(_, l)| l.iter().any(|(_, _, b)| b.is_some()));
+
+    let base = ui.text_style_height(&egui::TextStyle::Body);
+    egui::CollapsingHeader::new(
+        RichText::new(s.report_stats_title)
+            .strong()
+            .size(base * 1.1),
+    )
+    .id_salt("pb_stats_panel")
+    .default_open(true)
+    .show(ui, |ui| {
+        egui::Grid::new("pb_stats_grid")
+            .spacing(egui::vec2(18.0, 2.0))
+            .show(ui, |ui| {
+                if two_sided {
+                    ui.label("");
+                    ui.label(RichText::new(s.report_stats_comparison).color(th.dim));
+                    ui.label(RichText::new(s.report_stats_baseline).color(th.dim));
+                    ui.end_row();
+                }
+                for (header, lines) in &blocks {
+                    ui.label(RichText::new(header).color(th.dim).italics());
+                    ui.end_row();
+                    for (label, cand, other) in lines {
+                        ui.label(RichText::new(format!("   {label}")));
+                        ui.label(RichText::new(cand).strong());
+                        if two_sided {
+                            ui.label(RichText::new(other.as_deref().unwrap_or("")));
+                        }
+                        ui.end_row();
+                    }
+                }
+                if let Some((cand, other, suffix)) = &totals {
+                    ui.label(
+                        RichText::new(s.report_stats_total_time)
+                            .color(th.dim)
+                            .italics(),
+                    );
+                    ui.end_row();
+                    ui.label(RichText::new(format!("   {suffix}")));
+                    ui.label(RichText::new(cand).strong());
+                    if two_sided {
+                        ui.label(RichText::new(other.as_deref().unwrap_or("")));
+                    }
+                    ui.end_row();
+                }
+            });
+    });
+}
+
+/// The unit a pair of durations is stated in.
+///
+/// Chosen once, from the larger of the two, and then applied to both: the
+/// panel exists to be compared down the row, and two totals in different units
+/// are exactly the comparison the reader has to stop and do by hand.
+struct DurationUnit {
+    per_ms: f64,
+    decimals: usize,
+    suffix: &'static str,
+}
+
+impl DurationUnit {
+    fn render(&self, ms: f64) -> String {
+        format!("{:.*}", self.decimals, ms / self.per_ms)
+    }
+}
+
+fn duration_unit(largest_ms: f64) -> DurationUnit {
+    if largest_ms >= 60_000.0 {
+        DurationUnit {
+            per_ms: 60_000.0,
+            decimals: 1,
+            suffix: "min",
+        }
+    } else if largest_ms >= 1_000.0 {
+        DurationUnit {
+            per_ms: 1_000.0,
+            decimals: 2,
+            suffix: "s",
+        }
+    } else {
+        DurationUnit {
+            per_ms: 1.0,
+            decimals: 0,
+            suffix: "ms",
+        }
+    }
+}
+
 fn confusion_matrix(
     th: &GuiTheme,
     ui: &mut egui::Ui,
@@ -5181,6 +5526,7 @@ fn filter_bar(
 fn filter_label(s: &crate::i18n::Strings, f: &RowFilter) -> String {
     match f {
         RowFilter::All => s.report_filter_all.to_string(),
+        RowFilter::Failed => s.report_filter_failed.to_string(),
         RowFilter::Differ => s.report_filter_differences.to_string(),
         RowFilter::Correct => s.report_filter_correct.to_string(),
         RowFilter::Incorrect => s.report_filter_incorrect.to_string(),
@@ -5483,6 +5829,7 @@ fn results_grid(
     mut overrides: Option<&mut ColumnWidths>,
     mut sort: Option<&mut Option<(String, bool)>>,
     mut row_menu: Option<RowMenu<'_>>,
+    extra_summary: &[crate::report::model::SummaryRow],
 ) -> Option<CellInspector> {
     // A real result's grid always keeps its status column — empty once the
     // run is over — so the cells don't jump sideways when a run starts, ends,
@@ -5508,6 +5855,10 @@ fn results_grid(
         .as_ref()
         .map(|m| m.queued.clone())
         .unwrap_or_default();
+    let selected: std::collections::BTreeSet<usize> = row_menu
+        .as_ref()
+        .map(|m| m.selected.clone())
+        .unwrap_or_default();
     let mut opened: Option<CellInspector> = None;
     // Drop any pins that no longer name a live column before they are read, so a
     // width pinned against last run's columns can't leak onto this run's.
@@ -5522,7 +5873,7 @@ fn results_grid(
         .as_deref()
         .map(|ov| ov.per_column(columns))
         .unwrap_or_default();
-    let widths = fitted_column_widths(ui, result, columns, show_icons, &pin_vec);
+    let widths = fitted_column_widths(ui, result, columns, show_icons, &pin_vec, extra_summary);
     let row_h = ui.text_style_height(&egui::TextStyle::Body);
 
     // The header is a grid of its own, outside the rows' scroll area, so it
@@ -5664,6 +6015,20 @@ fn results_grid(
                                 }
                                 r
                             });
+                        // A picked row is tinted across its whole width,
+                        // painted under the cells (the target was reserved
+                        // before them, so its rect is the row's). The glyph
+                        // in the status column says the same thing for a
+                        // reader who can't tell the tint from the stripe.
+                        if selected.contains(&i)
+                            && let Some(target) = &row_target
+                        {
+                            ui.painter().rect_filled(
+                                target.rect,
+                                2.0,
+                                th.select_bg.gamma_multiply(0.45),
+                            );
+                        }
                         if show_expanders {
                             let has = expandable.contains(&i);
                             let open = *open_detail == Some(i);
@@ -5704,6 +6069,20 @@ fn results_grid(
                                     ui.colored_label(th.accent, super::icons::RERUN)
                                         .on_hover_text(s.report_rerun_queued_hint);
                                 }
+                                // Picked out to re-run with others. Shown over
+                                // a settled row's mark (which the tint and the
+                                // cells still say) but not over one that is
+                                // going or still to come: "what is this row
+                                // doing" outranks "is it in the selection".
+                                _ if selected.contains(&i)
+                                    && !matches!(
+                                        state,
+                                        Some(RowState::Running | RowState::Scheduled)
+                                    ) =>
+                                {
+                                    ui.colored_label(th.accent, super::icons::SELECTED)
+                                        .on_hover_text(s.report_select_hint);
+                                }
                                 // Turning, so a row waiting on a slow endpoint
                                 // says "still going" rather than sitting there
                                 // looking like a result.
@@ -5738,6 +6117,16 @@ fn results_grid(
                                 let resp = result_cell(ui, text_col, &full);
                                 row_context_menu(&resp, s, row_menu.as_mut(), i, state);
                                 if resp.clicked() {
+                                    // Ctrl/Shift pick rows out instead of
+                                    // opening anything: the gesture every
+                                    // table uses, and the drill-down is one
+                                    // plain click away as it always was.
+                                    if let Some(act) = pick_act(ui, i) {
+                                        if let Some(menu) = row_menu.as_mut() {
+                                            *menu.act = Some(act);
+                                        }
+                                        return;
+                                    }
                                     let ins = CellInspector {
                                         title: col.header.clone(),
                                         content: pretty_json_cell(&full),
@@ -5760,15 +6149,23 @@ fn results_grid(
                         }
                         if let Some(target) = &row_target {
                             row_context_menu(target, s, row_menu.as_mut(), i, state);
-                            if target.clicked() && expandable.contains(&i) {
-                                *open_detail = Some(i);
+                            if target.clicked() {
+                                match pick_act(ui, i) {
+                                    Some(act) => {
+                                        if let Some(menu) = row_menu.as_mut() {
+                                            *menu.act = Some(act);
+                                        }
+                                    }
+                                    None if expandable.contains(&i) => *open_detail = Some(i),
+                                    None => {}
+                                }
                             }
                         }
                         ui.end_row();
                     }
 
                     // STATISTICS summary rows (a footer, distinguished by italic accent).
-                    for srow in result.summary_rows(columns) {
+                    for srow in result.summary_with_baseline(columns, extra_summary) {
                         if show_expanders {
                             cell_slot(ui, EXPANDER_W, row_h, |_| {});
                         }
@@ -5932,11 +6329,12 @@ fn fitted_column_widths(
     columns: &[crate::report::model::OutputColumn],
     show_icons: bool,
     pins: &[Option<f32>],
+    extra_summary: &[crate::report::model::SummaryRow],
 ) -> Vec<f32> {
     // The status-glyph column is a fixed narrow gutter, not a data column, so
     // it is taken off the top of the budget rather than shared in it.
     let icon_w = if show_icons { ICON_W + SPACING_X } else { 0.0 };
-    let natural = cached_natural_widths(ui, result, columns);
+    let natural = cached_natural_widths(ui, result, columns, extra_summary);
     let avail = (ui.available_width() - icon_w).max(0.0);
     // Fitting is pure arithmetic over the naturals, so it stays uncached and
     // the grid still follows the window as it is dragged.
@@ -5957,15 +6355,16 @@ fn cached_natural_widths(
     ui: &egui::Ui,
     result: &ReportResult,
     columns: &[crate::report::model::OutputColumn],
+    extra_summary: &[crate::report::model::SummaryRow],
 ) -> Vec<f32> {
-    let key = widths_fingerprint(ui, result, columns);
+    let key = widths_fingerprint(ui, result, columns, extra_summary);
     let id = egui::Id::new("report_grid_widths");
     if let Some((cached_key, widths)) = ui.data(|d| d.get_temp::<(u64, Vec<f32>)>(id))
         && cached_key == key
     {
         return widths;
     }
-    let widths = natural_column_widths(ui, result, columns);
+    let widths = natural_column_widths(ui, result, columns, extra_summary);
     ui.data_mut(|d| d.insert_temp(id, (key, widths.clone())));
     widths
 }
@@ -6005,6 +6404,7 @@ fn widths_fingerprint(
     ui: &egui::Ui,
     result: &ReportResult,
     columns: &[crate::report::model::OutputColumn],
+    extra_summary: &[crate::report::model::SummaryRow],
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -6032,6 +6432,14 @@ fn widths_fingerprint(
         }
         cells.hash(&mut h);
         row.target.hash(&mut h);
+    }
+    // The appended baseline footer is measured into the widths too, and it
+    // grows a cell at a time as the comparison streams.
+    for srow in extra_summary {
+        srow.label.hash(&mut h);
+        for cell in &srow.cells {
+            cell.as_ref().map(|c| &c.text).hash(&mut h);
+        }
     }
     h.finish()
 }
@@ -6071,12 +6479,13 @@ fn natural_column_widths(
     ui: &egui::Ui,
     result: &ReportResult,
     columns: &[crate::report::model::OutputColumn],
+    extra_summary: &[crate::report::model::SummaryRow],
 ) -> Vec<f32> {
     let font = egui::TextStyle::Body.resolve(ui.style());
     // Computed once, not once per column: `summary_rows` walks every row of
     // every column, so calling it inside the per-column loop below made finding
     // the widths quadratic in the number of columns.
-    let summary = result.summary_rows(columns);
+    let summary = result.summary_with_baseline(columns, extra_summary);
     // Leave room for the cell's own padding so text isn't flush against the
     // next column.
     let pad = 6.0;
@@ -6128,6 +6537,28 @@ fn result_cell(ui: &mut egui::Ui, text_col: Color32, full: &str) -> egui::Respon
     .on_hover_text(cell)
 }
 
+/// What a row interaction in the results grid asked for.
+///
+/// Carried out at the end of the frame rather than where it is noticed: the
+/// grid draws while the result is borrowed, and every one of these either
+/// starts a run or edits the state the grid was drawn from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RowAct {
+    /// Re-run these rows (one, the selection, or every failed row shown).
+    /// `from_selection` says whether they came from the selection, which is
+    /// then spent — leaving it lit would invite re-running it twice.
+    Rerun {
+        rows: Vec<usize>,
+        from_selection: bool,
+    },
+    /// Put the row in the selection, or take it out (ctrl-click, or the menu).
+    Toggle(usize),
+    /// Select every row from the anchor to this one (shift-click).
+    Extend(usize),
+    /// Forget the selection.
+    ClearSelection,
+}
+
 /// The results grid's per-row right-click menu, and what picking from it does.
 pub(super) struct RowMenu<'a> {
     /// Why a row can't be re-run right now — the item is shown disabled with
@@ -6139,8 +6570,29 @@ pub(super) struct RowMenu<'a> {
     pub streaming: bool,
     /// The rows queued that way, by index into this grid.
     pub queued: std::collections::HashSet<usize>,
-    /// Set to the row whose re-run was picked.
-    pub rerun: &'a mut Option<usize>,
+    /// The rows picked out to act on together, by index into this grid.
+    pub selected: std::collections::BTreeSet<usize>,
+    /// The failed rows the grid is *showing*, in the order it shows them —
+    /// what "re-run the failed rows" means. Filtered rows are left out: the
+    /// action does what the view says it will.
+    pub failed: Vec<usize>,
+    /// Set to what the row interaction asked for.
+    pub act: &'a mut Option<RowAct>,
+}
+
+/// What a click on row `row` means given the modifiers held: ctrl (command on
+/// macOS) adds or removes it, shift takes the run from the anchor to it, and a
+/// plain click asks for neither — it keeps the drill-down and the cell
+/// inspector it always opened.
+fn pick_act(ui: &egui::Ui, row: usize) -> Option<RowAct> {
+    let mods = ui.input(|i| i.modifiers);
+    if mods.command {
+        Some(RowAct::Toggle(row))
+    } else if mods.shift {
+        Some(RowAct::Extend(row))
+    } else {
+        None
+    }
 }
 
 /// Attach the row menu (if any) to `resp`, a cell of row `row` or the row's
@@ -6178,7 +6630,76 @@ fn row_context_menu(
             None => item,
         };
         if item.clicked() {
-            *menu.rerun = Some(row);
+            *menu.act = Some(RowAct::Rerun {
+                rows: vec![row],
+                from_selection: false,
+            });
+            ui.close();
+        }
+        // The batch items sit under the single-row one, which is still the
+        // common case. Both are offered whenever the single-row re-run is,
+        // so the menu doesn't change shape from row to row.
+        if !menu.selected.is_empty() {
+            let rows: Vec<usize> = menu.selected.iter().copied().collect();
+            let label = s
+                .report_rerun_selected
+                .replace("{n}", &rows.len().to_string());
+            let item = ui.add_enabled(
+                blocked.is_none(),
+                egui::Button::new(format!("{} {}", super::icons::RERUN, label)),
+            );
+            let item = match blocked {
+                Some(why) => item.on_disabled_hover_text(why),
+                None => item,
+            };
+            if item.clicked() {
+                *menu.act = Some(RowAct::Rerun {
+                    rows,
+                    from_selection: true,
+                });
+                ui.close();
+            }
+        }
+        // The answer to a network blip that spoiled a band of rows: they are
+        // all failures, and they all want the same thing.
+        let no_failures = menu.failed.is_empty().then_some(s.report_rerun_no_failed);
+        let why = blocked.or(no_failures);
+        let item = ui.add_enabled(
+            why.is_none(),
+            egui::Button::new(format!(
+                "{} {}",
+                super::icons::RERUN,
+                s.report_rerun_failed_rows
+            )),
+        );
+        let item = match why {
+            Some(why) => item.on_disabled_hover_text(why),
+            None => item,
+        };
+        if item.clicked() {
+            *menu.act = Some(RowAct::Rerun {
+                rows: menu.failed.clone(),
+                from_selection: false,
+            });
+            ui.close();
+        }
+        ui.separator();
+        let picked = menu.selected.contains(&row);
+        let label = if picked {
+            s.report_deselect_row
+        } else {
+            s.report_select_row
+        };
+        if ui
+            .button(format!("{} {label}", super::icons::SELECTED))
+            .on_hover_text(s.report_select_hint)
+            .clicked()
+        {
+            *menu.act = Some(RowAct::Toggle(row));
+            ui.close();
+        }
+        if !menu.selected.is_empty() && ui.button(s.report_clear_selection).clicked() {
+            *menu.act = Some(RowAct::ClearSelection);
             ui.close();
         }
     });
@@ -10928,6 +11449,141 @@ mod tests {
     use super::*;
     use crate::i18n::{Language, Strings};
 
+    /// Every piece of text the panel painted, with where it was painted, so a
+    /// test can assert not just that a figure is shown but which side of the
+    /// panel it is on — the whole point being that the two halves of one
+    /// measurement end up beside each other.
+    fn painted(
+        result: &crate::report::model::ReportResult,
+        columns: &[crate::report::model::OutputColumn],
+        extra: &[crate::report::model::SummaryRow],
+    ) -> Vec<(String, f32)> {
+        let strings = Strings::for_language(&Language::English);
+        let th = GuiTheme::from_spec(&crate::session::Session::default().active_theme_spec());
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1200.0, 800.0),
+        ));
+        let out = ctx.run_ui(input, |ui| {
+            statistics_panel(&th, ui, &strings, result, columns, extra);
+        });
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, f32)>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    out.push((t.galley.text().to_string(), t.visual_bounding_rect().left()))
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for c in &out.shapes {
+            walk(&c.shape, &mut found);
+        }
+        found
+    }
+
+    /// The panel's reason to exist: a comparison's two means stated on one
+    /// line, candidate then baseline, however far apart the columns carrying
+    /// them sit in the grid.
+    #[test]
+    fn the_statistics_panel_states_both_sides_of_a_comparison_side_by_side() {
+        use crate::report::model::{StatKind, StatValue, SummaryRow};
+
+        let mut result = crate::report::model::ReportResult::default();
+        result.column_order = vec!["dfa.TimeWait".into(), "dfa.Response Time".into()];
+        let columns = result.resolved_columns(&Default::default());
+        let mut columns = columns;
+        columns[1].stats = vec![StatKind::Mean];
+
+        // The live grid has no `baseline.*` column, so the baseline's half
+        // arrives re-keyed, exactly as the footer receives it.
+        let cell = |t: &str| {
+            Some(StatValue {
+                text: t.to_string(),
+                stat: Some(StatKind::Mean),
+                numeric: true,
+                match_value: None,
+            })
+        };
+        let extra = [SummaryRow {
+            label: "Mean (baseline)".to_string(),
+            cells: vec![None, cell("8954.85")],
+        }];
+        result.rows = vec![
+            crate::report::model::ReportRow {
+                cells: [("dfa.Response Time".to_string(), "9454".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            crate::report::model::ReportRow {
+                cells: [("dfa.Response Time".to_string(), "9455".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        ];
+
+        let painted = painted(&result, &columns, &extra);
+        let at = |needle: &str| {
+            painted
+                .iter()
+                .find(|(t, _)| t.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} was never painted: {painted:?}"))
+                .1
+        };
+        // Both headings, both figures.
+        at("Comparison");
+        at("Baseline");
+        let cand = at("9454.5");
+        let base = at("8954.85");
+        assert!(
+            base > cand,
+            "the baseline's mean belongs to the right of the candidate's, \
+             on the same line: candidate at {cand}, baseline at {base}"
+        );
+        // And the statistic is named once, for the pair.
+        assert_eq!(
+            painted.iter().filter(|(t, _)| t.trim() == "Mean").count(),
+            1,
+            "{painted:?}"
+        );
+    }
+
+    /// An ordinary report has no second side, and must not be given a
+    /// `Baseline` column of blanks to read past.
+    #[test]
+    fn a_report_without_a_comparison_gets_one_column_of_figures() {
+        use crate::report::model::StatKind;
+
+        let mut result = crate::report::model::ReportResult::default();
+        result.column_order = vec!["dfa.Time".into()];
+        let mut columns = result.resolved_columns(&Default::default());
+        columns[0].stats = vec![StatKind::Mean];
+        result.rows = vec![crate::report::model::ReportRow {
+            cells: [("dfa.Time".to_string(), "250".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        }];
+
+        let painted = painted(&result, &columns, &[]);
+        assert!(
+            !painted.iter().any(|(t, _)| t.contains("Baseline")),
+            "{painted:?}"
+        );
+        // The run's own time is still worth stating.
+        assert!(
+            painted
+                .iter()
+                .any(|(t, _)| t.contains("Total request time")),
+            "{painted:?}"
+        );
+    }
+
     /// Enter at the end of an indented line carries that indentation over, so a
     /// statement typed inside a loop body stays inside it visually.
     #[test]
@@ -14567,7 +15223,7 @@ mod results_render_tests {
                     ui.set_min_width(4000.0);
                     // The *natural* widths are what is cached; fitting them to
                     // the window is pure arithmetic on top.
-                    *out = super::cached_natural_widths(ui, result, &columns);
+                    *out = super::cached_natural_widths(ui, result, &columns, &[]);
                 });
             }
         };
@@ -14615,7 +15271,7 @@ mod results_render_tests {
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             let (base_res, base_cols) = fixture(&["A"], &["one"], 2);
-            let base = super::widths_fingerprint(ui, &base_res, &base_cols);
+            let base = super::widths_fingerprint(ui, &base_res, &base_cols, &[]);
 
             let mut r = base_res.clone();
             r.rows[0]
@@ -14623,7 +15279,7 @@ mod results_render_tests {
                 .insert("A".to_string(), "changed".to_string());
             assert_ne!(
                 base,
-                super::widths_fingerprint(ui, &r, &base_cols),
+                super::widths_fingerprint(ui, &r, &base_cols, &[]),
                 "a cell's text"
             );
 
@@ -14631,7 +15287,7 @@ mod results_render_tests {
             r.rows.push(ReportRow::default());
             assert_ne!(
                 base,
-                super::widths_fingerprint(ui, &r, &base_cols),
+                super::widths_fingerprint(ui, &r, &base_cols, &[]),
                 "a new row"
             );
 
@@ -14639,7 +15295,7 @@ mod results_render_tests {
             r.no_match_marker = "\u{2014}".to_string();
             assert_ne!(
                 base,
-                super::widths_fingerprint(ui, &r, &base_cols),
+                super::widths_fingerprint(ui, &r, &base_cols, &[]),
                 "the no-match marker, which is what an empty cell renders as"
             );
 
@@ -14647,7 +15303,7 @@ mod results_render_tests {
             r.rows[0].target = Some("staging".to_string());
             assert_ne!(
                 base,
-                super::widths_fingerprint(ui, &r, &base_cols),
+                super::widths_fingerprint(ui, &r, &base_cols, &[]),
                 "the row's ENVS target"
             );
 
@@ -14655,14 +15311,14 @@ mod results_render_tests {
             r.rows[0].vars.insert("v".to_string(), "x".to_string());
             assert_ne!(
                 base,
-                super::widths_fingerprint(ui, &r, &base_cols),
+                super::widths_fingerprint(ui, &r, &base_cols, &[]),
                 "a variable a columns: directive could show"
             );
 
             let (_, wider) = fixture(&["A Much Longer Header"], &["one"], 2);
             assert_ne!(
                 base,
-                super::widths_fingerprint(ui, &base_res, &wider),
+                super::widths_fingerprint(ui, &base_res, &wider, &[]),
                 "the column header"
             );
 
@@ -14670,7 +15326,7 @@ mod results_render_tests {
             cols[0].stats = vec![crate::report::model::StatKind::Count];
             assert_ne!(
                 base,
-                super::widths_fingerprint(ui, &base_res, &cols),
+                super::widths_fingerprint(ui, &base_res, &cols, &[]),
                 "statistics, which add summary rows to measure"
             );
 
@@ -14685,8 +15341,8 @@ mod results_render_tests {
             row.cells.insert("A".to_string(), "one".to_string());
             b.rows.push(row);
             assert_eq!(
-                super::widths_fingerprint(ui, &a, &cols2),
-                super::widths_fingerprint(ui, &b, &cols2),
+                super::widths_fingerprint(ui, &a, &cols2, &[]),
+                super::widths_fingerprint(ui, &b, &cols2, &[]),
                 "insertion order is not a difference"
             );
         });
@@ -14703,7 +15359,7 @@ mod results_render_tests {
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui.set_max_width(avail);
                 ui.set_min_width(avail);
-                widths = fitted_column_widths(ui, result, columns, false, &[]);
+                widths = fitted_column_widths(ui, result, columns, false, &[], &[]);
             });
         }
         let span = widths.iter().sum::<f32>() + SPACING_X * (widths.len() as f32 - 1.0);
@@ -14809,6 +15465,7 @@ mod results_render_tests {
                 None,
                 None,
                 None,
+                &[],
             );
         });
     }
@@ -14947,6 +15604,7 @@ mod results_render_tests {
                 Some(&mut overrides),
                 None,
                 None,
+                &[],
             );
         });
     }
@@ -14985,17 +15643,26 @@ mod results_render_tests {
     }
 
     fn click(at: egui::Pos2, button: egui::PointerButton) -> Vec<egui::Event> {
+        click_with(at, button, Default::default())
+    }
+
+    fn click_with(
+        at: egui::Pos2,
+        button: egui::PointerButton,
+        modifiers: egui::Modifiers,
+    ) -> Vec<egui::Event> {
         let press = |pressed| egui::Event::PointerButton {
             pos: at,
             button,
             pressed,
-            modifiers: Default::default(),
+            modifiers,
         };
         vec![egui::Event::PointerMoved(at), press(true), press(false)]
     }
 
     /// Right-clicking a row offers to re-run it, and picking that names the
-    /// row; clicking a header sorts by it, ascending first.
+    /// row; ctrl-clicking picks the row out instead of opening it; clicking a
+    /// header sorts by it, ascending first.
     #[test]
     fn a_row_menu_offers_a_rerun_and_a_header_click_sorts() {
         let (mut result, columns) = fixture(&["Name"], &["x"], 2);
@@ -15006,8 +15673,10 @@ mod results_render_tests {
         let ctx = egui::Context::default();
         let mut rerun = None;
         let mut sort = None;
-        let frame = |events: Vec<egui::Event>,
-                     rerun: &mut Option<usize>,
+        // `modifiers` is carried on the RawInput rather than only on the
+        // events: that is where egui reads "is ctrl down" from.
+        let frame = |(events, modifiers): (Vec<egui::Event>, egui::Modifiers),
+                     rerun: &mut Option<super::RowAct>,
                      sort: &mut Option<(String, bool)>| {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -15015,6 +15684,7 @@ mod results_render_tests {
                     egui::vec2(800.0, 400.0),
                 )),
                 events,
+                modifiers,
                 ..Default::default()
             };
             ctx.run_ui(input, |ui| {
@@ -15035,35 +15705,70 @@ mod results_render_tests {
                         blocked: None,
                         streaming: false,
                         queued: Default::default(),
-                        rerun,
+                        selected: Default::default(),
+                        failed: Vec::new(),
+                        act: rerun,
                     }),
+                    &[],
                 );
             })
         };
 
-        frame(vec![], &mut rerun, &mut sort);
-        let out = frame(vec![], &mut rerun, &mut sort);
+        frame((vec![], Default::default()), &mut rerun, &mut sort);
+        let out = frame((vec![], Default::default()), &mut rerun, &mut sort);
         let bravo = text_rect(&out, "bravo").expect("row 1 is drawn").center();
         frame(
-            click(bravo, egui::PointerButton::Secondary),
+            (
+                click(bravo, egui::PointerButton::Secondary),
+                Default::default(),
+            ),
             &mut rerun,
             &mut sort,
         );
-        let out = frame(vec![], &mut rerun, &mut sort);
+        let out = frame((vec![], Default::default()), &mut rerun, &mut sort);
         let item = text_rect(&out, s.report_rerun_row)
             .expect("the right-click opened the row menu")
             .center();
         frame(
-            click(item, egui::PointerButton::Primary),
+            (
+                click(item, egui::PointerButton::Primary),
+                Default::default(),
+            ),
             &mut rerun,
             &mut sort,
         );
-        assert_eq!(rerun, Some(1));
+        assert!(matches!(
+            rerun,
+            Some(super::RowAct::Rerun { ref rows, .. }) if rows == &vec![1]
+        ));
+        rerun = None;
 
-        let out = frame(vec![], &mut rerun, &mut sort);
+        // Ctrl-clicking a row picks it out rather than opening its cell: the
+        // gesture every table in the world uses for "and this one too".
+        let out = frame((vec![], Default::default()), &mut rerun, &mut sort);
+        let bravo = text_rect(&out, "bravo").expect("row 1 is drawn").center();
+        frame(
+            (
+                click_with(
+                    bravo,
+                    egui::PointerButton::Primary,
+                    egui::Modifiers::COMMAND,
+                ),
+                egui::Modifiers::COMMAND,
+            ),
+            &mut rerun,
+            &mut sort,
+        );
+        assert!(matches!(rerun, Some(super::RowAct::Toggle(1))));
+        rerun = None;
+
+        let out = frame((vec![], Default::default()), &mut rerun, &mut sort);
         let header = text_rect(&out, "Name").expect("header drawn").center();
         frame(
-            click(header, egui::PointerButton::Primary),
+            (
+                click(header, egui::PointerButton::Primary),
+                Default::default(),
+            ),
             &mut rerun,
             &mut sort,
         );
@@ -15125,8 +15830,11 @@ mod results_render_tests {
                             blocked: None,
                             streaming: true,
                             queued: Default::default(),
-                            rerun: &mut rerun,
+                            selected: Default::default(),
+                            failed: Vec::new(),
+                            act: &mut rerun,
                         }),
+                        &[],
                     );
                 }));
             }
@@ -16357,13 +17065,13 @@ pub(crate) mod stop_run_tests {
         });
         assert!(ed.streaming());
 
-        ed.rerun_row_live(&mut app, 2);
+        ed.rerun_rows_live(&mut app, &[2]);
         assert!(matches!(
             app.session.status,
             Some(Status::ReportRowRerunBlocked(_))
         ));
 
-        ed.rerun_row_live(&mut app, 1);
+        ed.rerun_rows_live(&mut app, &[1]);
         assert_eq!(
             ed.progress.as_ref().unwrap().states,
             vec![RowState::Running, RowState::Running, RowState::Scheduled],
@@ -16496,9 +17204,9 @@ pub(crate) mod stop_run_tests {
         ed.progress = Some(crate::gui::report_run::RunProgress::rerun(2, &[0]));
         assert!(ed.rerunning() && !ed.streaming());
 
-        ed.toggle_queued_rerun(&mut app, 0);
+        ed.queue_rerun(&mut app, 0, true);
         assert!(ed.queued_reruns.is_empty(), "already re-running");
-        ed.toggle_queued_rerun(&mut app, 1);
+        ed.queue_rerun(&mut app, 1, true);
         assert_eq!(ed.queued_reruns.len(), 1);
         assert!(matches!(
             app.session.status,
@@ -16509,6 +17217,65 @@ pub(crate) mod stop_run_tests {
         ed.run = None;
         ed.progress = None;
         assert_eq!(ed.take_ready_reruns(), Some(vec![1]));
+    }
+
+    /// Picking rows and re-running them sends the lot, and spends the
+    /// selection: rows still lit over requests already on their way are an
+    /// invitation to send them twice.
+    #[test]
+    fn a_batch_of_picked_rows_reruns_together_and_spends_the_selection() {
+        let (mut app, mut ed) = editor();
+        let (handle, _tx) = test_handle();
+        let mut finished = result_with("200");
+        finished.rows.push(finished.rows[0].clone());
+        finished.rows[0].path = vec![(0, 0)];
+        finished.rows[1].path = vec![(0, 1)];
+        finished.finalized = true;
+        ed.result = Some(finished);
+        ed.run = Some(handle);
+        ed.progress = Some(crate::gui::report_run::RunProgress::rerun(2, &[]));
+
+        ed.apply_row_act(&mut app, RowAct::Toggle(0));
+        ed.apply_row_act(&mut app, RowAct::Toggle(1));
+        assert!(matches!(
+            app.session.status,
+            Some(Status::ReportRowsSelected { rows: 2 })
+        ));
+
+        ed.apply_row_act(
+            &mut app,
+            RowAct::Rerun {
+                rows: vec![0, 1],
+                from_selection: true,
+            },
+        );
+        assert!(ed.selected_rows.is_empty(), "the selection is spent");
+        // A re-run is already in flight, so the batch queues rather than
+        // going now — and queues *both* rows.
+        assert_eq!(ed.queued_reruns.len(), 2);
+    }
+
+    /// Shift-clicking takes the rows between the two *as shown*: a sorted or
+    /// filtered grid's "everything between these" is what the reader can see
+    /// between them, not a span of the underlying row numbers.
+    #[test]
+    fn extending_a_selection_follows_the_order_on_screen() {
+        let (mut app, mut ed) = editor();
+        let mut result = result_with("200");
+        while result.rows.len() < 4 {
+            result.rows.push(result.rows[0].clone());
+        }
+        ed.result = Some(result);
+        // The grid is sorted, so row 3 sits next to row 1 on screen.
+        ed.results_shown = vec![2, 1, 3, 0];
+
+        ed.apply_row_act(&mut app, RowAct::Toggle(1));
+        ed.apply_row_act(&mut app, RowAct::Extend(3));
+        assert_eq!(
+            ed.selected_rows.iter().copied().collect::<Vec<_>>(),
+            vec![1, 3],
+            "row 2 is above both on screen, so it is not between them"
+        );
     }
 
     /// A filter that a re-run has left selecting nothing gives way to the

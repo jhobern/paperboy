@@ -8,6 +8,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.7.2] - 2026-10-28
+
+### Added
+
+- **Re-run many rows at once.** Re-running rows one right-click at a time was
+  the wrong tool for what actually goes wrong: a network blip takes out dozens
+  of rows together. Rows can now be picked out of the results grid —
+  **ctrl-click** (command on macOS) a row in the GUI, **shift-click** to take
+  everything between it and the last one picked (following the order *on
+  screen*, so a sorted or filtered grid takes what the reader can see between
+  them), or **`Space`** on a row in the terminal UI, with `Esc` to drop the lot.
+  **Re-run the N selected rows** in the GUI's right-click menu, or `x` in the
+  terminal UI, then sends them all as one batch: beside a run in flight, queued
+  (↻) behind a re-run already going, or straight away otherwise. Picking the
+  rows is spent by re-running them, so a selection still lit over requests
+  already on their way can't send them twice.
+- **Re-run the failed rows.** A report with a failed row offers a **Failed**
+  filter — first on the bar, in `/`'s cycle in the terminal UI, and in the HTML
+  export — and a **Re-run the failed rows** action beside it: in the GUI's
+  right-click menu, or `Shift+X` in the terminal UI. It takes the failed rows
+  the grid is *showing*, so narrowing with a filter or a sort narrows what goes
+  again. A row counts as failed when its own request errored or when the
+  baseline side of a comparison did.
+- **Both sides' statistics, for the whole run.** A comparison's finished report
+  states `STATISTICS(…)` twice — once for the candidate and once, in a
+  `baseline.…` column, for the baseline it was measured against — so the reader
+  can see whether the mean moved. The grid shown *while* a run streams is the
+  uncollapsed rows, which have no such column, so until now the baseline's half
+  only appeared when the very last row landed: a long comparison had to finish
+  before it could be judged. The live footer now carries the baseline's figures
+  too, as extra **`Mean (baseline)`**-style rows beneath the candidate's and
+  under the same column, in both front-ends, and they keep their place on a run
+  that was stopped part-way. The candidate's own row is named to match
+  (**`Mean (comparison)`**) wherever the baseline's is there beside it, so
+  neither half reads as the run's overall figure; a report with one side only
+  keeps the plain `Mean`.
+
+  The two halves now meet even when a field was renamed. A comparison names its
+  copied column after the *query* it read (`baseline.dfa.TimeWait`), while the
+  candidate's statistics are often declared on an alias of that same query
+  (`"Response Time": TimeWait STATISTICS(MEAN)`) — so the baseline's mean used
+  to land under the raw column, several columns away from the candidate's,
+  where two halves of one measurement read as two unrelated numbers. The run
+  now records what each field was renamed from, and the footer states the
+  baseline's figures under the column that carries the candidate's.
+- **A statistics panel beside the confusion matrix.** The GUI restates the
+  footer's figures next to the matrix: one line per statistic, a comparison's
+  two sides side by side under **Comparison** and **Baseline**, and the **total
+  request time** each side has spent so far (live, so a run that is going to be
+  slower says so long before the last row lands). The grid keeps its footer
+  rows — this is a second reading of the same numbers, for the reader who wants
+  the comparison rather than the column, and it uses space a matrix would
+  otherwise leave empty to its right.
+
 ## [0.7.1] - 2026-10-21
 
 ### Added

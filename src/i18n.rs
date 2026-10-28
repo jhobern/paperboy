@@ -783,7 +783,16 @@ strings! {
     report_running_progress => "Running report… {done}/{total} (r to cancel)", "Exécution du rapport… {done}/{total} (r pour annuler)", "Kører rapport… {done}/{total} (r for at annullere)";
     report_run_stopped => "Run stopped — partial results kept", "Exécution interrompue — résultats partiels conservés", "Kørsel stoppet — delvise resultater beholdt";
     report_rerun_row => "Re-run this row", "Relancer cette ligne", "Kør denne række igen";
+    report_rerun_selected => "Re-run the {n} selected rows", "Relancer les {n} lignes sélectionnées", "Kør de {n} valgte rækker igen";
+    report_rerun_failed_rows => "Re-run the failed rows", "Relancer les lignes en échec", "Kør de fejlede rækker igen";
+    report_select_row => "Select this row", "Sélectionner cette ligne", "Vælg denne række";
+    report_deselect_row => "Deselect this row", "Désélectionner cette ligne", "Fravælg denne række";
+    report_clear_selection => "Clear the selection", "Effacer la sélection", "Ryd markeringen";
+    report_select_hint => "Ctrl-click a row to add it to the selection, Shift-click for a run of them", "Ctrl-clic sur une ligne pour l'ajouter à la sélection, Maj-clic pour une plage", "Ctrl-klik på en række for at føje den til markeringen, Shift-klik for et udsnit";
+    report_rerun_no_failed => "no failed row is shown", "aucune ligne en échec n'est affichée", "der vises ingen fejlede rækker";
+    report_rows_selected => "{n} row(s) selected", "{n} ligne(s) sélectionnée(s)", "{n} række(r) valgt";
     report_row_rerunning => "Re-running row…", "Relance de la ligne…", "Kører rækken igen…";
+    report_rows_rerunning => "Re-running {n} rows…", "Relance de {n} lignes…", "Kører {n} rækker igen…";
     report_row_rerun_done => "Re-run finished — results updated", "Relance terminée — résultats mis à jour", "Genkørslen er færdig — resultaterne er opdateret";
     report_row_rerun_still_failing => "Re-run finished, but it failed again ({n} error(s))", "Relance terminée, mais elle a de nouveau échoué ({n} erreur(s))", "Genkørslen er færdig, men fejlede igen ({n} fejl)";
     report_rerun_unqueue => "Don't re-run when the run finishes", "Ne pas relancer à la fin de l'exécution", "Kør ikke igen, når kørslen er færdig";
@@ -1496,6 +1505,14 @@ strings! {
     // deliberately English -- it names buttons in an exported document that has
     // no language -- so the in-app bar labels its own buttons from here.
     report_filter_all => "All", "Tout", "Alle";
+    report_filter_failed => "Failed", "Échecs", "Fejlede";
+    // The statistics panel beside the confusion matrices: both sides of a
+    // comparison's STATISTICS, stated as a pair so the reader can see which
+    // way a measurement moved without hunting across the grid's columns.
+    report_stats_title => "Statistics", "Statistiques", "Statistik";
+    report_stats_comparison => "Comparison", "Comparaison", "Sammenligning";
+    report_stats_baseline => "Baseline", "Référence", "Basislinje";
+    report_stats_total_time => "Total request time", "Temps de requête total", "Samlet anmodningstid";
     report_filter_differences => "Differences", "Différences", "Forskelle";
     report_filter_correct => "Correct", "Correctes", "Rigtige";
     report_filter_incorrect => "Incorrect", "Incorrect", "Forkerte";
@@ -1539,6 +1556,8 @@ strings! {
     help_report_filter => "Show only the rows this filter selects", "N'afficher que les lignes sélectionnées par ce filtre", "Vis kun de rækker, dette filter vælger";
     help_report_sort => "Sort the results by the cursor's column: ascending, descending, run order", "Trier les résultats par la colonne du curseur : croissant, décroissant, ordre d'exécution", "Sortér resultaterne efter markørens kolonne: stigende, faldende, kørselsrækkefølge";
     help_report_rerun_row => "Re-run the cursor's row and update it in place (e.g. after a transient failure)", "Relancer la ligne du curseur et la mettre à jour sur place (par ex. après une panne passagère)", "Kør markørens række igen og opdatér den på stedet (f.eks. efter en forbigående fejl)";
+    help_report_mark_row => "Mark the cursor's row — a re-run then takes every marked row at once", "Marquer la ligne du curseur — une relance prend alors toutes les lignes marquées d'un coup", "Markér markørens række — en genkørsel tager så alle markerede rækker på én gang";
+    help_report_rerun_failed => "Re-run every failed row the grid is showing", "Relancer toutes les lignes en échec affichées", "Kør alle de fejlede rækker, der vises, igen";
     // Git remote flow (used by remote.rs).
     gui_git_repo_url => "Repository URL", "URL du dépôt", "Lager-URL";
     gui_git_token => "Access token (optional)", "Jeton d'accès (facultatif)", "Adgangstoken (valgfrit)";
@@ -2312,6 +2331,15 @@ pub enum Status {
     ReportRunStopped,
     /// One row of a finished report is being re-run in the background.
     ReportRowRerunning,
+    /// Several rows of a finished report are being re-run in the background.
+    ReportRowsRerunning {
+        rows: usize,
+    },
+    /// The set of rows picked out for the next re-run changed; `rows` is how
+    /// many are in it now (0 = the selection was cleared).
+    ReportRowsSelected {
+        rows: usize,
+    },
     /// A row re-run finished and its fresh result replaced the old one;
     /// `errors` is how many errors the fresh row carries (0 = it succeeded).
     ReportRowRerunDone {
@@ -2384,6 +2412,17 @@ pub fn preflight_status(warnings: Vec<Status>) -> Option<Status> {
 }
 
 impl Status {
+    /// "A re-run is going", worded for one row or for several — the two
+    /// front-ends both start batches, and a message saying "row" over
+    /// fourteen of them reads as a bug.
+    pub fn rerunning(rows: usize) -> Status {
+        if rows > 1 {
+            Status::ReportRowsRerunning { rows }
+        } else {
+            Status::ReportRowRerunning
+        }
+    }
+
     /// Whether this represents a successful outcome (green) vs a problem (red).
     pub fn is_ok(&self) -> bool {
         match self {
@@ -2635,6 +2674,12 @@ impl Status {
                 .replace("{total}", &total.to_string()),
             Status::ReportRunStopped => s.report_run_stopped.to_string(),
             Status::ReportRowRerunning => s.report_row_rerunning.to_string(),
+            Status::ReportRowsRerunning { rows } => {
+                s.report_rows_rerunning.replace("{n}", &rows.to_string())
+            }
+            Status::ReportRowsSelected { rows } => {
+                s.report_rows_selected.replace("{n}", &rows.to_string())
+            }
             Status::ReportRowRerunDone { errors: 0 } => s.report_row_rerun_done.to_string(),
             Status::ReportRowRerunDone { errors } => s
                 .report_row_rerun_still_failing

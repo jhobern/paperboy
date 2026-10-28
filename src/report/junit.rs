@@ -231,50 +231,7 @@ impl Case {
             failures.push("the row's answer did not match its ground truth".to_string());
         }
 
-        // Only the *totals*: `…Time` under its own name, plus whatever a field
-        // aliased the `Time` intrinsic to (recorded per run, since the alias is
-        // the user's name and says nothing about what it holds). Adding the
-        // setup/wait/download slices as well would count the same milliseconds
-        // two or three times over.
-        //
-        // And a request is only allowed to spend its total once, which is why
-        // the totals are collected per *step* before they are added up. Nothing
-        // stops a flow naming the same intrinsic twice — `[Reports]` with both
-        // `took = Time` and `elapsed = Time`, or an alias beside the plain
-        // `Time` column — and every one of those columns holds the very same
-        // milliseconds. Summing the columns made a case that reported its
-        // duration twice appear to have taken twice as long, which is worse
-        // than not reporting it at all: it is a plausible number.
-        let mut totals: Vec<(&str, f64)> = Vec::new();
-        for (k, v) in &row.cells {
-            let is_total =
-                k.as_str() == "Time" || k.ends_with(".Time") || result.duration_columns.contains(k);
-            if !is_total {
-                continue;
-            }
-            // A duration that is negative, infinite or NaN is not a duration;
-            // JUnit's `time` is a plain non-negative number and some consumers
-            // reject the document outright over one.
-            let Ok(n) = v.trim().parse::<f64>() else {
-                continue;
-            };
-            if !n.is_finite() || n < 0.0 {
-                continue;
-            }
-            // Cells are keyed `<step>.<field>`; a bare `Time` belongs to no
-            // named step and stands alone.
-            let step = k.rsplit_once('.').map(|(s, _)| s).unwrap_or("");
-            match totals.iter_mut().find(|(s, _)| *s == step) {
-                // Equal in every case the interpreter can produce — they are
-                // the same `duration_ms` read twice. The larger is taken rather
-                // than the first so a hand-built or imported result, where they
-                // might not be, still reports a duration no shorter than the
-                // longest thing the step is known to have done.
-                Some((_, seen)) => *seen = seen.max(n),
-                None => totals.push((step, n)),
-            }
-        }
-        let ms: f64 = totals.iter().map(|(_, n)| n).sum();
+        let ms = result.row_duration_ms(row);
 
         let context = columns
             .iter()
