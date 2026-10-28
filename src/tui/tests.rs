@@ -36155,6 +36155,91 @@ fn x_reruns_only_the_row_under_the_cursor() {
     ));
 }
 
+/// Space marks rows, and `x` then sends every marked row round again rather
+/// than only the one under the cursor — the point being that a network blip
+/// that failed a dozen rows takes one keystroke per row to mark and one to
+/// re-run them all.
+#[test]
+fn space_marks_rows_and_x_reruns_all_of_them() {
+    let (mut app, idx) = report_run_with("first");
+    let response = |app: &TuiApp, r: usize| {
+        app.reports[idx].result.as_ref().unwrap().rows[r].cells["Oauth.Response"].clone()
+    };
+    app.reports[idx].cell_cursor = Some((0, 0));
+    press(&mut app, KeyCode::Char(' '));
+    app.reports[idx].cell_cursor = Some((1, 0));
+    press(&mut app, KeyCode::Char(' '));
+    assert_eq!(app.reports[idx].marked_rows.len(), 2);
+
+    app.rerun_report_row_with(|_| FakeReportRunner {
+        body: "second".to_string(),
+    });
+    poll_until_idle(&mut app);
+
+    assert_eq!(response(&app, 0), "second");
+    assert_eq!(response(&app, 1), "second");
+    // Spent: marks still lit over rows already sent would invite sending them
+    // twice.
+    assert!(app.reports[idx].marked_rows.is_empty());
+}
+
+/// Space is a toggle, and Esc drops the marks wholesale.
+#[test]
+fn space_unmarks_a_marked_row_and_esc_clears_the_lot() {
+    let (mut app, idx) = report_run_with("first");
+    app.reports[idx].cell_cursor = Some((0, 0));
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Char(' '));
+    assert!(app.reports[idx].marked_rows.is_empty(), "space toggles");
+
+    press(&mut app, KeyCode::Char(' '));
+    app.reports[idx].cell_cursor = Some((1, 0));
+    press(&mut app, KeyCode::Char(' '));
+    assert_eq!(app.reports[idx].marked_rows.len(), 2);
+    press(&mut app, KeyCode::Esc);
+    assert!(app.reports[idx].marked_rows.is_empty());
+    assert!(!app.quit, "Esc backed out of the marks, not the app");
+}
+
+/// `X` re-runs the failed rows the grid is showing, and leaves the rows that
+/// came back fine alone.
+#[test]
+fn shift_x_reruns_every_failed_row_on_show() {
+    let (mut app, idx) = report_run_with("first");
+    let response = |app: &TuiApp, r: usize| {
+        app.reports[idx].result.as_ref().unwrap().rows[r].cells["Oauth.Response"].clone()
+    };
+    app.reports[idx].result.as_mut().unwrap().rows[1]
+        .errors
+        .push("connection reset".to_string());
+
+    app.rerun_failed_report_rows_with(|_| FakeReportRunner {
+        body: "second".to_string(),
+    });
+    poll_until_idle(&mut app);
+
+    assert_eq!(
+        response(&app, 0),
+        "first",
+        "a row that passed is left alone"
+    );
+    assert_eq!(response(&app, 1), "second", "the failed row went again");
+}
+
+/// `X` on a report where nothing failed says so rather than re-running the
+/// whole table.
+#[test]
+fn shift_x_with_nothing_failed_says_so() {
+    let (mut app, _idx) = report_run_with("first");
+    press(&mut app, KeyCode::Char('X'));
+    let s = crate::i18n::Strings::for_language(&app.language);
+    assert!(matches!(
+        &app.status,
+        Some(crate::i18n::Status::ReportRowRerunBlocked(why))
+            if why == s.report_rerun_no_failed
+    ));
+}
+
 /// A row is identified by its place in the flow that produced it, so a re-run
 /// after the report has been edited still runs *that* flow — here, the edit
 /// removed the row's loop value altogether.

@@ -5479,6 +5479,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("/ (report)", s.help_report_filter),
                             ("o (grid)", s.help_report_sort),
                             ("x (grid)", s.help_report_rerun_row),
+                            ("Space (grid)", s.help_report_mark_row),
+                            ("X (grid)", s.help_report_rerun_failed),
                             ("Ctrl+E (report)", s.help_report_export),
                             ("Ctrl+O (report)", s.help_report_open_export),
                             ("B (report)", s.help_report_baseline),

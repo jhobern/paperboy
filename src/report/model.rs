@@ -259,6 +259,21 @@ pub struct ReportResult {
     /// writer does — must add up the totals alone or count the same
     /// milliseconds several times.
     pub duration_columns: std::collections::HashSet<String>,
+    /// The field query each produced column was *renamed from*, for the columns
+    /// a `[Reports]` or `WITH` field aliased under a name of its own —
+    /// `dfa_result.Response Time` → `TimeWait`. Identity renames are not
+    /// recorded, so a column named after its own query is absent.
+    ///
+    /// Needed because a comparison names its copied baseline column after the
+    /// *query* (`baseline.<alias>.TimeWait`, see `compare::apply`) while the
+    /// candidate's own statistics may be declared on the alias
+    /// (`"Response Time": TimeWait STATISTICS(MEAN)`). The two are the same
+    /// measurement and belong under one column, but nothing in the headers
+    /// says so — the alias is the user's word and carries no trace of what it
+    /// was renamed from. Without this map the live footer states the two
+    /// halves of one comparison columns apart, which reads as two unrelated
+    /// figures. See [`Self::baseline_summary_rows`].
+    pub column_sources: std::collections::HashMap<String, String>,
     /// Resolved picture bytes for `IMAGE` columns, keyed by `(row index within
     /// [`rows`](Self::rows), output-column header)`.
     ///
@@ -610,6 +625,249 @@ impl ReportResult {
             }
         }
         out
+    }
+
+    /// The baseline side's statistics, re-keyed onto a *live* grid's columns.
+    ///
+    /// A finished comparison carries two columns per shown field — `proc.Time`
+    /// for the candidate and `baseline.proc.Time` for the baseline it was
+    /// measured against — so its footer states both sides' MEAN/MEDIAN side by
+    /// side. Those `baseline.*` columns only exist after the collapse, so a run
+    /// in progress shows the candidate's half and nothing else, and the reader
+    /// has to wait for the very last row to land before learning whether the
+    /// comparison went well at all.
+    ///
+    /// Called on the *projection* (`run::project_live`), which is collapsed and
+    /// therefore does carry those columns, this returns its `baseline.*` cells
+    /// laid out under `live_columns` — the uncollapsed grid's own columns — by
+    /// matching each projected header against the live header it mirrors. The
+    /// caller appends the result after [`Self::summary_rows`], giving a footer
+    /// that reads e.g. `Mean` then `Mean (baseline)` under the same column.
+    ///
+    /// The "(baseline)" suffix is deliberately English, like the stat labels it
+    /// extends (`StatKind::label`), so one footer row isn't half-translated.
+    pub fn baseline_summary_rows(
+        &self,
+        projected_columns: &[OutputColumn],
+        live_columns: &[OutputColumn],
+    ) -> Vec<SummaryRow> {
+        // Where each projected `baseline.<header>` column's numbers belong in
+        // the live grid. Columns without a live counterpart (and the candidate
+        // columns, which the live footer already states) are left out.
+        let mut target = vec![None; projected_columns.len()];
+        for (pi, col) in projected_columns.iter().enumerate() {
+            let Some(mirrored) = col.header.strip_prefix("baseline.") else {
+                continue;
+            };
+            // Already collapsed: the grid carries the `baseline.*` column
+            // itself and its own footer states these numbers under it. Mapping
+            // them onto the candidate column as well would double them up.
+            if live_columns.iter().any(|l| l.header == col.header) {
+                continue;
+            }
+            target[pi] = self.live_target_for_baseline(mirrored, live_columns);
+        }
+        if target.iter().all(Option::is_none) {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        for srow in self.summary_rows(projected_columns) {
+            let mut cells = vec![None; live_columns.len()];
+            let mut distribution = false;
+            for (pi, cell) in srow.cells.iter().enumerate() {
+                let (Some(cell), Some(li)) = (cell, target[pi]) else {
+                    continue;
+                };
+                distribution |= cell.stat == Some(StatKind::Distribution);
+                cells[li] = Some(cell.clone());
+            }
+            if !cells.iter().any(Option::is_some) {
+                continue;
+            }
+            // A distribution row's label is already the column and value it
+            // counts (`baseline.proc.Time = 7`), so it names its own side.
+            let label = if distribution {
+                srow.label.clone()
+            } else {
+                format!("{} (baseline)", srow.label)
+            };
+            out.push(SummaryRow { label, cells });
+        }
+        out
+    }
+
+    /// The footer as the reader sees it: this report's own statistics followed
+    /// by the baseline's (from [`Self::baseline_summary_rows`]).
+    ///
+    /// Where the two halves meet, the candidate's row is named too. On its own
+    /// a bare `Mean` reads as the mean of the run; sat above a
+    /// `Mean (baseline)` it is one side of a comparison, and saying so is what
+    /// stops the reader taking the unlabelled row for the total. Rows with no
+    /// opposite number (a column only one side measures, or a distribution,
+    /// which names itself) keep their plain label. English, like the
+    /// `(baseline)` suffix it mirrors.
+    pub fn summary_with_baseline(
+        &self,
+        columns: &[OutputColumn],
+        baseline: &[SummaryRow],
+    ) -> Vec<SummaryRow> {
+        let mut rows = self.summary_rows(columns);
+        for r in rows.iter_mut() {
+            if baseline
+                .iter()
+                .any(|b| b.label == format!("{} (baseline)", r.label))
+            {
+                r.label = format!("{} (comparison)", r.label);
+            }
+        }
+        rows.extend(baseline.iter().cloned());
+        rows
+    }
+
+    /// Which live column a baseline copy named `baseline.<mirrored>` belongs
+    /// under.
+    ///
+    /// Usually the column it mirrors by name. But a comparison names the copy
+    /// after the *query* it read (`baseline.dfa_result.TimeWait`), while the
+    /// candidate's statistics may be declared on a field that renamed that same
+    /// query (`"Response Time": TimeWait STATISTICS(MEAN)`). Then the mirror is
+    /// a column carrying no statistics at all and the alias beside it carries
+    /// both — so putting the baseline's figures under the mirror states the two
+    /// halves of one comparison columns apart, where they read as two unrelated
+    /// numbers rather than the before and after of one.
+    ///
+    /// So: the mirror when it states this measurement itself, else the column
+    /// within the same request alias that the run recorded as a rename of the
+    /// same query (see [`Self::column_sources`]), else the mirror anyway.
+    fn live_target_for_baseline(
+        &self,
+        mirrored: &str,
+        live_columns: &[OutputColumn],
+    ) -> Option<usize> {
+        let direct = live_columns.iter().position(|l| l.header == mirrored);
+        if direct.is_some_and(|i| !live_columns[i].stats.is_empty()) {
+            return direct;
+        }
+        // Confined to the same request alias: two requests may each rename
+        // their own `TimeWait`, and the baseline copy belongs to exactly one.
+        if let Some((alias, field)) = mirrored.rsplit_once('.') {
+            let prefix = format!("{alias}.");
+            if let Some(i) = live_columns.iter().position(|l| {
+                l.header.starts_with(&prefix)
+                    && !l.stats.is_empty()
+                    && self
+                        .column_sources
+                        .get(&l.header)
+                        .is_some_and(|q| q == field)
+            }) {
+                return Some(i);
+            }
+        }
+        direct
+    }
+
+    /// `(candidate column, the `baseline.*` column stating the other half of
+    /// the same measurement)`, as indices into `columns`.
+    ///
+    /// Only meaningful on a *collapsed* table, which is the only one carrying
+    /// `baseline.*` columns at all; a live grid pairs its halves through
+    /// [`Self::baseline_summary_rows`] instead. Pairing follows exactly the
+    /// same rule, so a renamed field is paired the same way in both.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn baseline_column_pairs(&self, columns: &[OutputColumn]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (bi, col) in columns.iter().enumerate() {
+            let Some(mirrored) = col.header.strip_prefix("baseline.") else {
+                continue;
+            };
+            if let Some(ci) = self.live_target_for_baseline(mirrored, columns)
+                && ci != bi
+            {
+                out.push((ci, bi));
+            }
+        }
+        out
+    }
+
+    /// How long one row's requests took, in milliseconds.
+    ///
+    /// Only the *totals*: `…Time` under its own name, plus whatever a field
+    /// aliased the `Time` intrinsic to (recorded per run, since the alias is
+    /// the user's name and says nothing about what it holds). Adding the
+    /// setup/wait/download slices as well would count the same milliseconds
+    /// two or three times over.
+    ///
+    /// And a request is only allowed to spend its total once, which is why the
+    /// totals are collected per *step* before they are added up. Nothing stops
+    /// a flow naming the same intrinsic twice — `[Reports]` with both
+    /// `took = Time` and `elapsed = Time`, or an alias beside the plain `Time`
+    /// column — and every one of those columns holds the very same
+    /// milliseconds. Summing the columns made a case that reported its duration
+    /// twice appear to have taken twice as long, which is worse than not
+    /// reporting it at all: it is a plausible number.
+    pub fn row_duration_ms(&self, row: &ReportRow) -> f64 {
+        let mut totals: Vec<(&str, f64)> = Vec::new();
+        for (k, v) in &row.cells {
+            let is_total =
+                k.as_str() == "Time" || k.ends_with(".Time") || self.duration_columns.contains(k);
+            if !is_total {
+                continue;
+            }
+            // A duration that is negative, infinite or NaN is not a duration;
+            // JUnit's `time` is a plain non-negative number and some consumers
+            // reject the document outright over one.
+            let Ok(n) = v.trim().parse::<f64>() else {
+                continue;
+            };
+            if !n.is_finite() || n < 0.0 {
+                continue;
+            }
+            // Cells are keyed `<step>.<field>`; a bare `Time` belongs to no
+            // named step and stands alone.
+            let step = k.rsplit_once('.').map(|(s, _)| s).unwrap_or("");
+            match totals.iter_mut().find(|(s, _)| *s == step) {
+                // Equal in every case the interpreter can produce — they are
+                // the same `duration_ms` read twice. The larger is taken rather
+                // than the first so a hand-built or imported result, where they
+                // might not be, still reports a duration no shorter than the
+                // longest thing the step is known to have done.
+                Some((_, seen)) => *seen = seen.max(n),
+                None => totals.push((step, n)),
+            }
+        }
+        totals.iter().map(|(_, n)| n).sum()
+    }
+
+    /// The request time this run has spent so far, as
+    /// `(candidate side, baseline side)` milliseconds.
+    ///
+    /// The baseline half is `None` when the table has no baseline rows to
+    /// measure — an ordinary report, or a comparison whose baseline rows the
+    /// collapse has already folded away. On a *live* grid both halves are
+    /// present for the whole run, which is the point: a comparison that is
+    /// going to be slower says so long before the last row lands.
+    ///
+    /// Rows still on their way are skipped: their cells are dry placeholders
+    /// (`Time` 0), and adding them in makes a total that is simply wrong.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn side_durations_ms(&self) -> (f64, Option<f64>) {
+        let mut candidate = 0.0;
+        let mut baseline = 0.0;
+        let mut any_baseline = false;
+        for (i, row) in self.rows.iter().enumerate() {
+            if self.pending.contains(&i) {
+                continue;
+            }
+            let ms = self.row_duration_ms(row);
+            if row.role == RowRole::Baseline {
+                any_baseline = true;
+                baseline += ms;
+            } else {
+                candidate += ms;
+            }
+        }
+        (candidate, any_baseline.then_some(baseline))
     }
 
     /// Indices of baseline rows that a candidate row in this table will be
@@ -1490,6 +1748,241 @@ fn unquote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A helper: an output column with the given header, source and statistics.
+    fn col(header: &str, stats: &[StatKind]) -> OutputColumn {
+        OutputColumn {
+            header: header.to_string(),
+            sources: vec![header.to_string()],
+            stats: stats.to_vec(),
+            image: None,
+            truth: None,
+            detail: false,
+        }
+    }
+
+    /// A `Mean` sat above a `Mean (baseline)` is one side of a comparison, not
+    /// the run's overall figure, and the footer has to say so — but only where
+    /// there is a second half to be confused with.
+    #[test]
+    fn a_footer_with_both_sides_names_the_candidates_half_too() {
+        let mut live = ReportResult::default();
+        live.rows = vec![
+            row(&[("proc.Time", "10"), ("proc.Size", "1")], &[], None),
+            row(&[("proc.Time", "30"), ("proc.Size", "3")], &[], None),
+        ];
+        let columns = [
+            col("proc.Time", &[StatKind::Mean]),
+            col("proc.Size", &[StatKind::Mean]),
+        ];
+        // The baseline measured the time only.
+        let baseline = [SummaryRow {
+            label: "Mean (baseline)".to_string(),
+            cells: vec![
+                Some(StatValue {
+                    text: "50".to_string(),
+                    stat: Some(StatKind::Mean),
+                    numeric: true,
+                    match_value: None,
+                }),
+                None,
+            ],
+        }];
+
+        let rows = live.summary_with_baseline(&columns, &baseline);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].label, "Mean (comparison)");
+        assert_eq!(rows[1].label, "Mean (baseline)");
+
+        // With nothing to compare against, the plain label stands.
+        let rows = live.summary_with_baseline(&columns, &[]);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].label, "Mean");
+    }
+
+    /// The whole point of the feature: a comparison's *collapsed* projection
+    /// states both sides' statistics, but the grid shown while the run streams
+    /// is the uncollapsed rows and has no `baseline.*` column to put the
+    /// baseline's under. Re-keying them onto the candidate's column — under a
+    /// label that says which side they are — is what makes both halves
+    /// readable for the whole run instead of only after the last row lands.
+    #[test]
+    fn baseline_statistics_land_under_the_column_they_mirror() {
+        let mut projected = ReportResult::default();
+        projected.rows = vec![
+            row(
+                &[("proc.Time", "10"), ("baseline.proc.Time", "20")],
+                &[],
+                None,
+            ),
+            row(
+                &[("proc.Time", "30"), ("baseline.proc.Time", "40")],
+                &[],
+                None,
+            ),
+        ];
+        let projected_columns = [
+            col("proc.Time", &[StatKind::Mean]),
+            col("baseline.proc.Time", &[StatKind::Mean]),
+        ];
+        // The live grid has the candidate column only.
+        let live_columns = [col("proc.Time", &[StatKind::Mean])];
+
+        let rows = projected.baseline_summary_rows(&projected_columns, &live_columns);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].label, "Mean (baseline)");
+        assert_eq!(
+            rows[0].cells[0].as_ref().map(|c| c.text.as_str()),
+            Some("30"),
+            "the baseline's own mean, not the candidate's: {rows:?}"
+        );
+        // And it renders in the column it mirrors, with the label leading.
+        assert_eq!(rows[0].text_cell(0), "30");
+    }
+
+    /// A comparison names its copied baseline column after the *query* it read
+    /// (`baseline.dfa_result.TimeWait`), but the candidate's statistics are
+    /// often declared on a field that renamed that query
+    /// (`"Response Time": TimeWait STATISTICS(MEAN)`). The mirror is then a
+    /// column with no statistics at all, and putting the baseline's mean under
+    /// it states the two halves of one measurement columns apart — which reads
+    /// as two unrelated numbers rather than the before and after of one.
+    #[test]
+    fn baseline_statistics_follow_the_alias_their_candidate_was_renamed_to() {
+        let mut projected = ReportResult::default();
+        projected.rows = vec![
+            row(
+                &[
+                    ("dfa.TimeWait", "10"),
+                    ("dfa.Response Time", "10"),
+                    ("baseline.dfa.TimeWait", "20"),
+                ],
+                &[],
+                None,
+            ),
+            row(
+                &[
+                    ("dfa.TimeWait", "30"),
+                    ("dfa.Response Time", "30"),
+                    ("baseline.dfa.TimeWait", "40"),
+                ],
+                &[],
+                None,
+            ),
+        ];
+        projected
+            .column_sources
+            .insert("dfa.Response Time".to_string(), "TimeWait".to_string());
+        let projected_columns = [
+            col("dfa.TimeWait", &[]),
+            col("dfa.Response Time", &[StatKind::Mean]),
+            col("baseline.dfa.TimeWait", &[StatKind::Mean]),
+        ];
+        // The live grid carries the raw column and the alias, but no copy —
+        // and it is the alias that states a mean, exactly as the candidate's
+        // own footer does.
+        let live_columns = [
+            col("dfa.TimeWait", &[]),
+            col("dfa.Response Time", &[StatKind::Mean]),
+        ];
+
+        let rows = projected.baseline_summary_rows(&projected_columns, &live_columns);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].label, "Mean (baseline)");
+        assert_eq!(
+            rows[0].cells[0], None,
+            "not under the raw column it mirrors by name: {rows:?}"
+        );
+        assert_eq!(
+            rows[0].cells[1].as_ref().map(|c| c.text.as_str()),
+            Some("30"),
+            "under the alias the candidate's own mean is stated on: {rows:?}"
+        );
+    }
+
+    /// The finished grid has both columns, so the panel pairs them through the
+    /// columns themselves — and by the same rule the live footer uses, so a
+    /// renamed field is paired the same way whether the run is going or done.
+    #[test]
+    fn a_collapsed_grid_pairs_its_two_halves_by_column() {
+        let mut res = ReportResult::default();
+        res.column_sources
+            .insert("dfa.Response Time".to_string(), "TimeWait".to_string());
+        let columns = [
+            col("dfa.TimeWait", &[]),
+            col("dfa.Response Time", &[StatKind::Mean]),
+            col("baseline.dfa.TimeWait", &[StatKind::Mean]),
+        ];
+        // The copy is named after the query, the statistic is on the alias.
+        assert_eq!(res.baseline_column_pairs(&columns), vec![(1, 2)]);
+    }
+
+    /// A run's time is spent on both sides of a comparison, and the live grid
+    /// is the only place both are still visible — the collapse folds the
+    /// baseline rows away. Rows still on their way hold dry placeholders, so
+    /// counting them would make a total that is simply wrong.
+    #[test]
+    fn each_side_of_a_comparison_totals_its_own_request_time() {
+        let mut res = ReportResult::default();
+        let mk = |ms: &str, role: RowRole| {
+            let mut r = row(&[("dfa.Time", ms)], &[], None);
+            r.role = role;
+            r
+        };
+        res.rows = vec![
+            mk("100", RowRole::Baseline),
+            mk("300", RowRole::Candidate),
+            mk("900", RowRole::Candidate),
+        ];
+        res.pending = [2usize].into_iter().collect();
+        assert_eq!(res.side_durations_ms(), (300.0, Some(100.0)));
+    }
+
+    /// A report with no baseline has no second total to stand beside the
+    /// first, and must not grow a column of zeroes for one.
+    #[test]
+    fn a_run_without_a_baseline_totals_one_side_only() {
+        let mut res = ReportResult::default();
+        res.rows = vec![row(&[("dfa.Time", "250")], &[], None)];
+        assert_eq!(res.side_durations_ms(), (250.0, None));
+    }
+
+    /// Once the run finishes the grid *is* the collapsed table: it carries the
+    /// `baseline.*` column itself and its own footer already states these
+    /// numbers under it. Copying them onto the candidate column as well would
+    /// show the baseline's mean twice, once in the wrong place.
+    #[test]
+    fn a_collapsed_grid_is_left_alone() {
+        let mut projected = ReportResult::default();
+        projected.rows = vec![row(
+            &[("proc.Time", "10"), ("baseline.proc.Time", "20")],
+            &[],
+            None,
+        )];
+        let columns = [
+            col("proc.Time", &[StatKind::Mean]),
+            col("baseline.proc.Time", &[StatKind::Mean]),
+        ];
+        assert!(
+            projected
+                .baseline_summary_rows(&columns, &columns)
+                .is_empty()
+        );
+    }
+
+    /// An ordinary report has no baseline at all, and must not grow a footer
+    /// row for one.
+    #[test]
+    fn a_report_without_a_comparison_gains_nothing() {
+        let mut projected = ReportResult::default();
+        projected.rows = vec![row(&[("proc.Time", "10")], &[], None)];
+        let columns = [col("proc.Time", &[StatKind::Mean])];
+        assert!(
+            projected
+                .baseline_summary_rows(&columns, &columns)
+                .is_empty()
+        );
+    }
 
     /// The flag takes no argument, so it can only be recognised as the last
     /// thing on the line -- otherwise a column source that merely ends in the

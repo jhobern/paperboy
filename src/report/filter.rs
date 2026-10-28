@@ -78,6 +78,14 @@ impl RowFacts {
 pub enum RowFilter {
     /// Every row (the default).
     All,
+    /// Rows something went wrong on — a request that didn't come back, an
+    /// assertion that didn't hold, a step that couldn't be resolved.
+    ///
+    /// The one filter that isn't about what the run *found*: it is about the
+    /// run itself, and it is what a network blip leaves behind. Gathering
+    /// those rows in one place is what makes re-running them one action
+    /// instead of hunting them down a sorted column.
+    Failed,
     /// Rows the comparison found a difference on.
     Differ,
     /// Rows whose ground-truth roll-up is `correct` — the other half of the
@@ -121,6 +129,7 @@ impl RowFilter {
     pub fn label(&self) -> String {
         match self {
             RowFilter::All => "All".to_string(),
+            RowFilter::Failed => "Failed".to_string(),
             RowFilter::Differ => "Differences".to_string(),
             RowFilter::Correct => "Correct".to_string(),
             RowFilter::Incorrect => "Incorrect".to_string(),
@@ -146,6 +155,13 @@ impl RowFilter {
     pub fn available(result: &ReportResult) -> Vec<RowFilter> {
         let has = |c: &str| result.column_order.iter().any(|k| k == c);
         let mut out = vec![RowFilter::All];
+        // Failed reads no column — nothing declares that a report might fail —
+        // so it is offered by the rows themselves, as soon as one has failed.
+        // It comes first because it is the one a reader reaches for when a run
+        // has gone wrong, and that is a bad moment to go hunting.
+        if (0..result.rows.len()).any(|r| row_failed(result, r)) {
+            out.push(RowFilter::Failed);
+        }
         let facts: Vec<RowFacts> = (0..result.rows.len())
             .map(|r| RowFacts::of(result, r))
             .collect();
@@ -179,6 +195,7 @@ impl RowFilter {
     ) -> bool {
         match self {
             RowFilter::All => true,
+            RowFilter::Failed => row_failed(result, r),
             RowFilter::Differ => RowFacts::of(result, r).differs,
             RowFilter::Correct => RowFacts::of(result, r).verdict == Some(Verdict::Correct),
             RowFilter::Incorrect => RowFacts::of(result, r).verdict == Some(Verdict::Incorrect),
@@ -209,6 +226,20 @@ impl RowFilter {
             }
         }
     }
+}
+
+/// Whether anything went wrong on row `r` — its own errors, or those of the
+/// baseline it was measured against.
+///
+/// The baseline counts because a collapsed comparison row *is* the pair: a
+/// candidate that came back fine beside a baseline that didn't is a row whose
+/// `Result` is wrong, and re-running it runs both sides again anyway.
+pub fn row_failed(result: &ReportResult, r: usize) -> bool {
+    result.rows.get(r).is_some_and(|row| !row.errors.is_empty())
+        || result
+            .baseline_errors
+            .get(&r)
+            .is_some_and(|e| !e.is_empty())
 }
 
 /// Every filter a report offers, and how many of them are toolbar buttons.
@@ -737,6 +768,42 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(RowFilter::available(&plain), vec![RowFilter::All]);
+    }
+
+    /// A row that failed is one whose own request errored *or* whose baseline
+    /// side did: in a comparison the baseline's errors are held apart from the
+    /// row, and a reader looking for "what went wrong" means both.
+    #[test]
+    fn failed_selects_rows_that_errored_on_either_side() {
+        let mut res = fixture();
+        res.rows[1].errors.push("connection reset".into());
+        res.baseline_errors.insert(3, vec!["timeout".into()]);
+        assert!(!row_failed(&res, 0));
+        assert!(row_failed(&res, 1));
+        assert!(!row_failed(&res, 2));
+        assert!(row_failed(&res, 3), "the baseline side failed");
+        let cols = vec![col("Name")];
+        let labels = LabelMap::default();
+        assert_eq!(
+            visible_rows(&res, &cols, &labels, &RowFilter::Failed, ""),
+            vec![1, 3]
+        );
+    }
+
+    /// Nothing declares that a report *might* fail, so the Failed filter is
+    /// offered by the rows themselves — and first, because it is what a reader
+    /// reaches for when a run has gone wrong.
+    #[test]
+    fn failed_is_offered_once_a_row_has_failed_and_comes_first() {
+        let mut res = fixture();
+        assert!(!RowFilter::available(&res).contains(&RowFilter::Failed));
+        res.rows[2].errors.push("connection reset".into());
+        assert_eq!(
+            RowFilter::available(&res).first(),
+            Some(&RowFilter::All),
+            "All stays the first of them"
+        );
+        assert_eq!(RowFilter::available(&res).get(1), Some(&RowFilter::Failed));
     }
 
     /// A scored comparison offers both halves of "what moved?" whatever moved:

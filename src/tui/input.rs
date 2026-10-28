@@ -1169,8 +1169,14 @@ impl TuiApp {
         // Reuse the same column-width computation as the renderer so the click
         // lands on the right column.
         let x_off = (col as usize).saturating_sub(area.x as usize);
-        let widths =
-            result_column_widths(result, &header, &visible, self.reports[idx].shown_sort());
+        let columns = result.resolved_columns(&header);
+        let widths = result_column_widths(
+            result,
+            &header,
+            &visible,
+            self.reports[idx].shown_sort(),
+            &self.reports[idx].baseline_summary(&header, &columns),
+        );
         let n_cols = widths.len();
         if n_cols == 0 {
             return false;

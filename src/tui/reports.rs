@@ -364,6 +364,15 @@ pub(crate) struct ReportTab {
     /// The finished result's rows those map to, once it has landed — started
     /// by [`TuiApp::start_ready_reruns`] from the main loop.
     pub(crate) reruns_ready: Option<Vec<usize>>,
+    /// Rows marked with `Space` in the results grid, to act on together. A
+    /// network blip can fail dozens of rows at once; re-running them one
+    /// right-click at a time is the thing this spares.
+    ///
+    /// Held as plain row indices (not [`RowRef`](crate::report::rerun::RowRef)
+    /// identities) because a splice replaces rows *in place*: a re-run leaves
+    /// them pointing at the same rows. The marks are dropped wherever the grid
+    /// is replaced wholesale instead.
+    pub(crate) marked_rows: std::collections::BTreeSet<usize>,
     /// While a run streams: the rows that have come back, as the finished
     /// report will see them, and how many rows that was — so the pinned
     /// metrics fill in as the run goes (see [`ReportTab::refresh_live_summary`]).
@@ -557,6 +566,7 @@ impl ReportTab {
             result_run_params: Default::default(),
             queued_reruns: Vec::new(),
             reruns_ready: None,
+            marked_rows: Default::default(),
             live_summary: None,
             held_live: Vec::new(),
             results_col_offset: 0,
@@ -724,6 +734,24 @@ impl ReportTab {
         let root = crate::report::context::run_root(flow, self.report.path.as_deref());
         let projected = crate::report::run::project_live(result, flow, &params, root.as_deref());
         self.live_summary = Some((done, projected));
+    }
+
+    /// The baseline side's statistics for the grid on screen, ready to be
+    /// appended to its own summary footer.
+    ///
+    /// Empty unless a run is streaming or frozen: only then is the grid the
+    /// uncollapsed projection that lacks the `baseline.*` columns a finished
+    /// report carries (see [`ReportResult::baseline_summary_rows`]).
+    pub(crate) fn baseline_summary(
+        &self,
+        header: &crate::report::flow::Header,
+        live_columns: &[crate::report::model::OutputColumn],
+    ) -> Vec<crate::report::model::SummaryRow> {
+        let Some((_, projected)) = &self.live_summary else {
+            return Vec::new();
+        };
+        let projected_columns = projected.resolved_columns(header);
+        projected.baseline_summary_rows(&projected_columns, live_columns)
     }
 
     /// The metrics the pinned summary shows: the live projection's while a
@@ -1566,6 +1594,7 @@ impl TuiApp {
             self.reports[idx].result_params.iter().cloned().collect();
         self.reports[idx].queued_reruns.clear();
         self.reports[idx].reruns_ready = None;
+        self.reports[idx].marked_rows.clear();
         // Row re-runs the last run left out belong to it, not to this one:
         // landing in the new grid they would splice the old run's answers in.
         self.reports[idx].held_live.clear();
@@ -1912,10 +1941,14 @@ impl TuiApp {
         self.poll_live_reruns();
     }
 
-    /// Re-run row `data_row` of report `idx`'s run in flight straight away,
-    /// beside the run. Both sides of a comparison row go again, so the case's
-    /// rows that have come back are drawn running until the answer lands.
-    fn start_live_rerun<R, F>(&mut self, idx: usize, data_row: usize, make_runner: F)
+    /// Re-run `rows` of report `idx`'s run in flight straight away, beside the
+    /// run. Both sides of a comparison row go again, so the case's rows that
+    /// have come back are drawn running until the answer lands.
+    ///
+    /// Rows that haven't come back yet are dropped from the batch rather than
+    /// refusing it: mid-run, a selection made over a streaming grid will
+    /// reasonably include rows that are still out.
+    fn start_live_rerun<R, F>(&mut self, idx: usize, rows: &[usize], make_runner: F)
     where
         R: EntryRunner + Send + Sync + 'static,
         F: FnOnce(Option<PathBuf>) -> R + Send + 'static,
@@ -1929,30 +1962,46 @@ impl TuiApp {
         ) else {
             return;
         };
-        let Some(row) = result.rows.get(data_row) else {
-            return;
-        };
-        if progress.states.get(data_row) != Some(&RowState::Finished) {
+        let targets: Vec<usize> = rows
+            .iter()
+            .copied()
+            .filter(|&r| {
+                r < result.rows.len() && progress.states.get(r) == Some(&RowState::Finished)
+            })
+            .collect();
+        if targets.is_empty() {
             self.status = Some(Status::ReportRowRerunBlocked(
                 s.report_rerun_not_back_yet.to_string(),
             ));
             return;
         }
+        // Every row that goes again, plus the other side of each comparison
+        // row — all of them are drawn running until the answers land.
         let marked: Vec<usize> = result
             .rows
             .iter()
             .enumerate()
             .filter(|(i, other)| {
-                *i == data_row
-                    || (row.comparison.is_some()
-                        && other.comparison == row.comparison
-                        && other.key == row.key)
+                targets.contains(i)
+                    || targets.iter().any(|&t| {
+                        let row = &result.rows[t];
+                        row.comparison.is_some()
+                            && other.comparison == row.comparison
+                            && other.key == row.key
+                    })
             })
             .filter(|(i, _)| progress.states.get(*i) == Some(&RowState::Finished))
             .map(|(i, _)| i)
             .collect();
-        let refs = vec![crate::report::rerun::RowRef::of(row)];
-        let paths = vec![row.path.clone()];
+        let refs: Vec<_> = targets
+            .iter()
+            .map(|&r| crate::report::rerun::RowRef::of(&result.rows[r]))
+            .collect();
+        let paths: Vec<_> = targets
+            .iter()
+            .map(|&r| result.rows[r].path.clone())
+            .collect();
+        let started = targets.len();
         let report_id = rt.report.id;
         let params = rt.result_run_params.clone();
         let mut inputs = match crate::report::context::report_run_inputs(
@@ -2020,7 +2069,7 @@ impl TuiApp {
             refs,
             marked,
         });
-        self.status = Some(Status::ReportRowRerunning);
+        self.status = Some(Status::rerunning(started));
     }
 
     /// Fold in any live re-runs that have answered.
@@ -2357,9 +2406,12 @@ impl TuiApp {
                 rt.results_exported = false;
                 rt.last_export = None;
                 // The finalized grid may have different columns/rows than the
-                // streamed skeleton — reset cursor so it starts fresh.
+                // streamed skeleton — reset cursor so it starts fresh. The
+                // marks go with it: a comparison folds each baseline away, so
+                // the same index is now some other row.
                 rt.cell_cursor = None;
                 rt.results_col_offset = 0;
+                rt.marked_rows.clear();
                 // A filter picked while the run went on carries over, as long
                 // as the finished report still has rows for it.
                 if rt.visible_result_rows().is_empty() {
@@ -3143,6 +3195,37 @@ impl TuiApp {
         self.rerun_report_row_with(|file_root| crate::report::run::LiveRunner { file_root });
     }
 
+    /// Mark (or unmark) the row under the results cursor, so `x` can send it
+    /// round again together with the others marked.
+    pub(crate) fn toggle_report_row_mark(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let rt = &mut self.reports[idx];
+        if rt.view != ReportView::Results || rt.result.is_none() {
+            return;
+        }
+        let Some(data_row) = rt
+            .cell_cursor
+            .and_then(|(r, _)| rt.visible_result_rows().get(r).copied())
+        else {
+            return;
+        };
+        if !rt.marked_rows.remove(&data_row) {
+            rt.marked_rows.insert(data_row);
+        }
+        self.status = Some(Status::ReportRowsSelected {
+            rows: self.reports[idx].marked_rows.len(),
+        });
+    }
+
+    /// Re-run every failed row the results grid is showing.
+    pub(crate) fn rerun_failed_report_rows(&mut self) {
+        self.rerun_failed_report_rows_with(|file_root| crate::report::run::LiveRunner {
+            file_root,
+        });
+    }
+
     /// [`Self::rerun_report_row`] with the runner injected — the test seam,
     /// mirroring [`Self::start_report_run_faked`].
     pub(crate) fn rerun_report_row_with<R, F>(&mut self, make_runner: F)
@@ -3157,62 +3240,147 @@ impl TuiApp {
             return;
         }
         let rt = &self.reports[idx];
-        let Some(data_row) = rt
-            .cell_cursor
-            .and_then(|(r, _)| rt.visible_result_rows().get(r).copied())
-        else {
+        // Marked rows are what `x` acts on when there are any; otherwise the
+        // row under the cursor, as it has always been.
+        let rows: Vec<usize> = if rt.marked_rows.is_empty() {
+            let Some(data_row) = rt
+                .cell_cursor
+                .and_then(|(r, _)| rt.visible_result_rows().get(r).copied())
+            else {
+                return;
+            };
+            vec![data_row]
+        } else {
+            rt.marked_rows.iter().copied().collect()
+        };
+        self.rerun_report_rows_with(idx, rows, true, make_runner);
+    }
+
+    /// Re-run every failed row the results grid is currently showing — the
+    /// answer to a network blip that took out dozens of them at once.
+    /// Deliberately the rows *shown*: a filter or a search is how the reader
+    /// narrowed down to the failures worth retrying.
+    pub(crate) fn rerun_failed_report_rows_with<R, F>(&mut self, make_runner: F)
+    where
+        R: EntryRunner + Send + Sync + 'static,
+        F: FnOnce(Option<PathBuf>) -> R + Send + 'static,
+    {
+        let Some(idx) = self.active_report_index() else {
             return;
         };
+        if self.reports[idx].view != ReportView::Results {
+            return;
+        }
+        let rt = &self.reports[idx];
+        let Some(result) = rt.result.as_ref() else {
+            return;
+        };
+        let rows: Vec<usize> = rt
+            .visible_result_rows()
+            .into_iter()
+            .filter(|&r| crate::report::filter::row_failed(result, r))
+            .collect();
+        if rows.is_empty() {
+            let s = Strings::for_language(&self.language);
+            self.status = Some(Status::ReportRowRerunBlocked(
+                s.report_rerun_no_failed.to_string(),
+            ));
+            return;
+        }
+        self.rerun_report_rows_with(idx, rows, false, make_runner);
+    }
+
+    /// Send `rows` of report `idx` round again by whichever route the report's
+    /// current state allows. `from_marks` says the rows came from the marks,
+    /// which are then spent: leaving them lit over rows already on their way
+    /// is an invitation to send them twice.
+    fn rerun_report_rows_with<R, F>(
+        &mut self,
+        idx: usize,
+        rows: Vec<usize>,
+        from_marks: bool,
+        make_runner: F,
+    ) where
+        R: EntryRunner + Send + Sync + 'static,
+        F: FnOnce(Option<PathBuf>) -> R + Send + 'static,
+    {
+        if rows.is_empty() {
+            return;
+        }
+        if from_marks {
+            self.reports[idx].marked_rows.clear();
+        }
+        let rt = &self.reports[idx];
         let id = rt.report.id;
         let running = self.running_reports.contains_key(&id);
         let side = self.live_reruns.iter().any(|l| l.report_id == id);
         match &rt.run_progress {
-            // Mid-run, the row goes again straight away, beside the run:
-            // whoever noticed it is keen for its answer.
-            Some(p) if running && !p.rerun => self.start_live_rerun(idx, data_row, make_runner),
-            // While a re-run is going, the row is queued to go next.
-            Some(p) if p.rerun && (running || side) => self.toggle_queued_rerun(idx, data_row),
-            _ => self.start_report_rerun(idx, vec![data_row], make_runner),
+            // Mid-run, the rows go again straight away, beside the run:
+            // whoever noticed them is keen for their answers.
+            Some(p) if running && !p.rerun => self.start_live_rerun(idx, &rows, make_runner),
+            // While a re-run is going, they are queued to go next.
+            Some(p) if p.rerun && (running || side) => self.queue_reruns(idx, &rows),
+            _ => self.start_report_rerun(idx, rows, make_runner),
         }
     }
 
-    /// Queue row `data_row` to re-run once what is in flight — a run, or
-    /// another re-run — has finished, or take it off the queue. Only a row
-    /// that has come back has an answer to doubt.
-    fn toggle_queued_rerun(&mut self, idx: usize, data_row: usize) {
+    /// Queue `rows` to re-run once what is in flight — a run, or another
+    /// re-run — has finished. Only a row that has come back has an answer to
+    /// doubt.
+    ///
+    /// A single row toggles, so `x` on a queued row takes it off again. A
+    /// batch only ever queues: one that silently unqueued half of what it was
+    /// given would be unusable.
+    fn queue_reruns(&mut self, idx: usize, rows: &[usize]) {
         let s = Strings::for_language(&self.language);
+        let toggle = rows.len() == 1;
         let rt = &mut self.reports[idx];
         let (Some(result), Some(prog)) = (rt.result.as_ref(), rt.run_progress.as_mut()) else {
             return;
         };
-        let Some(row) = result.rows.get(data_row) else {
-            return;
-        };
-        // What the row goes back to when it comes off the queue: a finished
-        // row of a run in flight, or a settled row of a finished result.
+        // What a row goes back to when it comes off the queue: a finished row
+        // of a run in flight, or a settled row of a finished result.
         let settled = if prog.rerun {
             RowState::Idle
         } else {
             RowState::Finished
         };
-        match prog.states.get(data_row) {
-            Some(RowState::Finished | RowState::Idle) => {
-                rt.queued_reruns.push(crate::report::rerun::RowRef::of(row));
-                prog.states[data_row] = RowState::Queued;
+        // Why the rows that could not be queued could not be. Reported only if
+        // *none* of them could: a batch that queued most of itself has done
+        // what was asked, and the count says how much.
+        let mut refused: Option<&'static str> = None;
+        let mut queued_any = false;
+        for &data_row in rows {
+            let Some(row) = result.rows.get(data_row) else {
+                continue;
+            };
+            match prog.states.get(data_row) {
+                Some(RowState::Finished | RowState::Idle) => {
+                    rt.queued_reruns.push(crate::report::rerun::RowRef::of(row));
+                    prog.states[data_row] = RowState::Queued;
+                    queued_any = true;
+                }
+                Some(RowState::Queued) if toggle => {
+                    rt.queued_reruns.retain(|q| !q.is(row));
+                    prog.states[data_row] = settled;
+                    queued_any = true;
+                }
+                // Already queued, in a batch: leave it where it is.
+                Some(RowState::Queued) => queued_any = true,
+                _ => {
+                    refused = Some(if prog.rerun {
+                        s.report_rerun_already_running
+                    } else {
+                        s.report_rerun_not_back_yet
+                    });
+                }
             }
-            Some(RowState::Queued) => {
-                rt.queued_reruns.retain(|q| !q.is(row));
-                prog.states[data_row] = settled;
-            }
-            _ => {
-                let why = if prog.rerun {
-                    s.report_rerun_already_running
-                } else {
-                    s.report_rerun_not_back_yet
-                };
+        }
+        if !queued_any {
+            if let Some(why) = refused {
                 self.status = Some(Status::ReportRowRerunBlocked(why.to_string()));
-                return;
             }
+            return;
         }
         self.status = Some(Status::ReportRowRerunQueued {
             rows: rt.queued_reruns.len(),
@@ -3302,8 +3470,9 @@ impl TuiApp {
             done: 0,
             rerun: true,
         });
+        let started = rows.len();
         self.spawn_report_rerun(report_id, inputs, paths, rows, make_runner);
-        self.status = Some(Status::ReportRowRerunning);
+        self.status = Some(Status::rerunning(started));
     }
 
     /// Spawn the worker for a row re-run: no skeleton and no streaming, just
@@ -4025,8 +4194,16 @@ impl TuiApp {
             // descending, then back to the order the run produced.
             KeyCode::Char('o') if !ctrl => self.cycle_report_sort(),
             // `x` re-executes the cursor's row — for the row a transient
-            // failure spoiled, without re-rolling every other row's dice.
+            // failure spoiled, without re-rolling every other row's dice — or
+            // every marked row, when any are marked.
             KeyCode::Char('x') if !ctrl => self.rerun_report_row(),
+            // Space marks the cursor's row, so a handful of rows spotted while
+            // reading can go round again together.
+            KeyCode::Char(' ') => self.toggle_report_row_mark(),
+            // `X` re-runs every failed row on show at once: the answer to the
+            // network blip that took out dozens of them. Shift because a bare
+            // `x` already means "this row".
+            KeyCode::Char('X') => self.rerun_failed_report_rows(),
             // Global menus, unchanged from the collection view.
             // Ctrl+O opens what Ctrl+E wrote, so an exported HTML report is one
             // keystroke from the browser it was written for.
@@ -4060,6 +4237,11 @@ impl TuiApp {
                     } else if self.reports[idx].view == ReportView::Nodes {
                         self.reports[idx].view = ReportView::Source;
                         self.reports[idx].editor_view = ReportView::Source;
+                    } else if !self.reports[idx].marked_rows.is_empty() {
+                        // Marked rows are a selection like any other, so Esc
+                        // drops them before it means anything bigger.
+                        self.reports[idx].marked_rows.clear();
+                        self.status = Some(Status::ReportRowsSelected { rows: 0 });
                     } else if self.has_any_selection() {
                         self.clear_selections();
                     } else {
@@ -4737,6 +4919,8 @@ impl DryRunReport {
                 col_offset,
                 &visible,
                 None,
+                &Default::default(),
+                &[],
             ));
         }
 
@@ -5225,8 +5409,14 @@ fn draw_report_results(
     if let Some(result) = &app.reports[idx].result {
         let rt = &app.reports[idx];
         let header = rt.report.flow().map(|flow| flow.header).unwrap_or_default();
-        let widths =
-            result_column_widths(result, &header, &rt.visible_result_rows(), rt.shown_sort());
+        let columns = result.resolved_columns(&header);
+        let widths = result_column_widths(
+            result,
+            &header,
+            &rt.visible_result_rows(),
+            rt.shown_sort(),
+            &rt.baseline_summary(&header, &columns),
+        );
         // The status column is always there for a run's grid — blank once
         // the run is over — so the cells never shift sideways as runs start,
         // end or re-run a row.
@@ -5265,6 +5455,7 @@ fn draw_report_results(
                         idle.as_slice()
                     }
                 };
+                let columns = result.resolved_columns(&header);
                 let lines = report_grid_lines(
                     result,
                     &header,
@@ -5274,6 +5465,8 @@ fn draw_report_results(
                     rt.results_col_offset,
                     &visible,
                     rt.shown_sort(),
+                    &rt.marked_rows,
+                    &rt.baseline_summary(&header, &columns),
                 );
                 let count = if result.errors.is_empty() {
                     format!("{}", result.rows.len())
@@ -5597,6 +5790,7 @@ fn filter_label(s: &Strings, f: &crate::report::filter::RowFilter) -> String {
     use crate::report::filter::RowFilter;
     match f {
         RowFilter::All => s.report_filter_all.to_string(),
+        RowFilter::Failed => s.report_filter_failed.to_string(),
         RowFilter::Differ => s.report_filter_differences.to_string(),
         RowFilter::Correct => s.report_filter_correct.to_string(),
         RowFilter::Incorrect => s.report_filter_incorrect.to_string(),
@@ -5647,6 +5841,8 @@ fn report_grid_lines(
     col_offset: usize,
     visible: &[usize],
     sort: Option<&(String, bool)>,
+    marked: &std::collections::BTreeSet<usize>,
+    extra_summary: &[crate::report::model::SummaryRow],
 ) -> Vec<Line<'static>> {
     let columns = result.resolved_columns(header);
     if columns.is_empty() {
@@ -5676,7 +5872,7 @@ fn report_grid_lines(
         .collect();
     // STATISTICS(…) summary rows are appended after the data rows; they share
     // the same columns and are measured into the widths so they line up.
-    let summary_body = summary_grid_body(result, &columns);
+    let summary_body = summary_grid_body(result, &columns, extra_summary);
 
     // Column widths are factored out so the mouse hit-test shares the same
     // computation (see `result_column_widths` / `grid_col_at_x`).
@@ -5720,10 +5916,15 @@ fn report_grid_lines(
         if show_icons {
             // Mirror the collection view's Run-All markers (…/✓) for a
             // consistent visual language; a dim dot marks a queued row.
+            // A mark is drawn over everything except a row already queued or
+            // on its way: those states say what is *happening* to the row,
+            // which beats what the reader meant to do with it.
+            let is_marked = visible.get(i).is_some_and(|r| marked.contains(r));
             let (glyph, color) = match state {
                 Some(RowState::Running) => (ROW_RUNNING_ICON, th.pending),
-                Some(RowState::Finished) => (ROW_FINISHED_ICON, th.ok),
                 Some(RowState::Queued) => (ROW_QUEUED_ICON, th.accent),
+                _ if is_marked => (ROW_MARKED_ICON, th.accent),
+                Some(RowState::Finished) => (ROW_FINISHED_ICON, th.ok),
                 Some(RowState::Idle) => (" ", th.dim),
                 _ => (ROW_SCHEDULED_ICON, th.dim),
             };
@@ -5776,9 +5977,10 @@ fn report_grid_lines(
 fn summary_grid_body(
     result: &ReportResult,
     columns: &[crate::report::model::OutputColumn],
+    extra: &[crate::report::model::SummaryRow],
 ) -> Vec<Vec<String>> {
     result
-        .summary_rows(columns)
+        .summary_with_baseline(columns, extra)
         .iter()
         .map(|sr| {
             (0..columns.len())
@@ -5791,6 +5993,8 @@ const ROW_SCHEDULED_ICON: &str = "\u{00B7}"; // ·
 const ROW_RUNNING_ICON: &str = "\u{2026}"; // …
 const ROW_FINISHED_ICON: &str = "\u{2713}"; // ✓
 const ROW_QUEUED_ICON: &str = "\u{21BB}"; // ↻
+/// A row the reader marked (Space) to act on with the others marked.
+const ROW_MARKED_ICON: &str = "\u{25CF}"; // ●
 
 /// Per-column display width cap: a response body can easily be thousands of
 /// characters, so each column is capped so one wide cell can't push everything
@@ -5828,6 +6032,7 @@ pub(crate) fn result_column_widths(
     header: &crate::report::flow::Header,
     visible: &[usize],
     sort: Option<&(String, bool)>,
+    extra_summary: &[crate::report::model::SummaryRow],
 ) -> Vec<usize> {
     let columns = result.resolved_columns(header);
     let headers = grid_headers(&columns, sort);
@@ -5844,7 +6049,7 @@ pub(crate) fn result_column_widths(
                 .collect()
         })
         .collect();
-    let summary_body = summary_grid_body(result, &columns);
+    let summary_body = summary_grid_body(result, &columns, extra_summary);
     grid_column_widths(&headers, &body, &summary_body)
 }
 

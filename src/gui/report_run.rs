@@ -149,6 +149,11 @@ pub struct ParkedRun {
     pub result_run_params: crate::report::params::ParamValues,
     /// Rows picked to re-run once the run in flight has finished.
     pub queued_reruns: Vec<crate::report::rerun::RowRef>,
+    /// The rows picked out of the grid to act on together. They travel for
+    /// the same reason the answers above do: picking fourteen rows out of a
+    /// long table and losing them to a glance at another report would be a
+    /// poor reward for the picking.
+    pub selected_rows: std::collections::BTreeSet<usize>,
     /// Which tab was open when the editor was put away, and whether it already
     /// had results to show at the time.
     ///

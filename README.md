@@ -318,7 +318,8 @@ Press `?` or `F1` for the full, current key list. The essentials:
 | `[` / `]`, `PageUp`/`PageDown` | Previous / next tab |
 | `Ctrl+Shift+←`/`→` | Reorder the active tab |
 | `x` / `u` | Delete / undo — requests, tabs and environments each keep their own undo stack |
-| `o` / `x` (report results) | Sort by the cursor's column / re-run the cursor's row — see [Reading a report's results](#reading-a-reports-results) |
+| `o` / `x` (report results) | Sort by the cursor's column / re-run the cursor's row (or every marked row) — see [Reading a report's results](#reading-a-reports-results) |
+| `Space` / `Shift+X` (report results) | Mark the cursor's row to re-run with the others / re-run every failed row on show |
 | `/` | Find a request anywhere in the collection (whole tree on a Workspace tab) |
 | `Alt+↑`/`↓` | Reorder requests — the order `Alt+F5` and the CLI follow |
 | `m` / `c` | Move / copy a request to another collection in the workspace |
@@ -493,6 +494,43 @@ matrix. Both front-ends behave the same way:
   so editing the script afterwards doesn't strand the result. During a run, a
   row that has already come back re-runs straight away beside the run; while a
   re-run is going, further rows are queued (↻) and go as the next batch.
+- **Many rows can go at once.** A network blip tends to spoil dozens of rows,
+  not one. Pick them out — **ctrl-click** (command on macOS) a row in the GUI,
+  **shift-click** to take everything between it and the last one picked, or
+  press **`Space`** on a row in the terminal UI (`Esc` drops the lot) — then
+  re-run them together: **Re-run the N selected rows** in the right-click menu,
+  or `x` in the terminal UI, which takes the picked rows when there are any and
+  the cursor's row otherwise. They go as one batch, so a report's `PARALLEL`
+  setting applies to them as it does to a run.
+- **Or just re-run what failed.** A report with a failed row offers a **Failed**
+  filter (first on the bar, `/` in the terminal UI) and a **Re-run the failed
+  rows** action in the right-click menu — `Shift+X` in the terminal UI. It takes
+  the failed rows the grid is *showing*, so a filter or a sort narrows what goes
+  again. A row counts as failed when its request errored, or when the baseline
+  side of a comparison did.
+- **A comparison states both sides' statistics for the whole run.** A finished
+  comparison carries each `SHOW`n field twice — the candidate's value and, in a
+  `baseline.…` column, the baseline's — so `STATISTICS(…)` describes each side
+  separately. That pairing only exists once the report collapses, so a run in
+  flight used to show the candidate's mean alone and a long comparison had to
+  finish before it could be judged. The live footer now carries the baseline's
+  figures as well, as extra `Mean (baseline)` rows beneath the candidate's and
+  under the same column, alongside a `Mean (comparison)` row naming the
+  candidate's half, so neither reads as the run's overall figure (a report with
+  one side only keeps the plain `Mean`). They are there from the first row and
+  they stay on a
+  run that was stopped part-way, so a long comparison can be stopped and read.
+  When a field was renamed, the two halves still meet: a comparison names its
+  copied column after the *query* it read (`baseline.dfa.TimeWait`) while the
+  statistics may be declared on the alias (`"Response Time": TimeWait
+  STATISTICS(MEAN)`), and the footer puts the baseline's figures under the
+  column that states the candidate's rather than several columns away.
+- **A statistics panel, beside the matrices.** The GUI restates the same
+  figures next to the confusion matrix — one line per statistic, the two sides
+  of a comparison side by side, plus the **total request time** each side has
+  spent so far. The footer keeps its rows; this is a second reading of the same
+  numbers for the reader who wants the comparison rather than the column, and
+  it fills space a matrix would otherwise leave empty.
 - **Stopping a run keeps everything that came back** — rows, summary, matrix,
   filters and sorting — and the run can be **resumed**: the **Resume** button
   beside Run in the GUI, or `r` on the stopped run in the terminal UI (`y`

@@ -566,6 +566,7 @@ pub fn run_flow_raw_selected(
         warnings: ex.warnings,
         timing_columns: ex.timing_columns.into_iter().collect(),
         duration_columns: ex.duration_columns.into_iter().collect(),
+        column_sources: ex.column_sources.into_iter().collect(),
         column_stats: flow.column_stats(),
         column_images: flow.column_images(),
         column_truths: flow.column_truths(),
@@ -1014,6 +1015,10 @@ struct Exec<'a> {
     /// a writer that reports "how long did this row take" has to add up the
     /// totals only, or it counts the same milliseconds several times over.
     duration_columns: Vec<String>,
+    /// `(produced column key, the field query it was renamed from)` for every
+    /// `[Reports]`/`WITH` field written under a name of its own — see
+    /// [`ReportResult::column_sources`].
+    column_sources: Vec<(String, String)>,
     /// Non-fatal problems (unresolved request, transport failure, …). Every
     /// issue still leaves a row.
     errors: Vec<String>,
@@ -1106,6 +1111,7 @@ struct IterOut {
     columns: Vec<String>,
     timing_columns: Vec<String>,
     duration_columns: Vec<String>,
+    column_sources: Vec<(String, String)>,
     errors: Vec<String>,
     skipped: Vec<String>,
     warnings: Vec<String>,
@@ -1135,6 +1141,7 @@ struct StepOut {
     columns: Vec<String>,
     timing_columns: Vec<String>,
     duration_columns: Vec<String>,
+    column_sources: Vec<(String, String)>,
     errors: Vec<String>,
     warnings: Vec<String>,
 }
@@ -1548,6 +1555,7 @@ fn skip_out(
         columns: Vec::new(),
         timing_columns: Vec::new(),
         duration_columns: Vec::new(),
+        column_sources: Vec::new(),
         errors: Vec::new(),
         warnings: Vec::new(),
     };
@@ -1612,6 +1620,7 @@ fn run_step(
         columns: ex.column_order,
         timing_columns: ex.timing_columns,
         duration_columns: ex.duration_columns,
+        column_sources: ex.column_sources,
         errors: ex.errors,
         warnings: ex.warnings,
     }
@@ -1640,6 +1649,7 @@ impl<'a> Exec<'a> {
             column_order: Vec::new(),
             timing_columns: Vec::new(),
             duration_columns: Vec::new(),
+            column_sources: Vec::new(),
             errors: Vec::new(),
             skipped: Vec::new(),
             warnings: Vec::new(),
@@ -1736,6 +1746,7 @@ impl<'a> Exec<'a> {
             column_order: Vec::new(),
             timing_columns: Vec::new(),
             duration_columns: Vec::new(),
+            column_sources: Vec::new(),
             errors: Vec::new(),
             skipped: Vec::new(),
             warnings: Vec::new(),
@@ -1987,6 +1998,17 @@ impl<'a> Exec<'a> {
     fn note_duration_column(&mut self, key: &str) {
         if !self.duration_columns.iter().any(|c| c == key) {
             self.duration_columns.push(key.to_string());
+        }
+    }
+
+    /// Record that the column `key` is a field written under a name of its own,
+    /// renamed from the query `query`, so the comparison's copied baseline
+    /// column — which is named after the query — can be paired back up with it.
+    /// See [`ReportResult::column_sources`].
+    fn note_column_source(&mut self, key: &str, query: &str) {
+        if !self.column_sources.iter().any(|(c, _)| c == key) {
+            self.column_sources
+                .push((key.to_string(), query.to_string()));
         }
     }
 
@@ -2885,6 +2907,13 @@ impl<'a> Exec<'a> {
                     self.note_duration_column(&key);
                 }
             }
+            // A field written under a name of its own is the only trace left
+            // that this column and the comparison's `baseline.<alias>.<query>`
+            // copy measure the same thing — see
+            // [`ReportResult::column_sources`].
+            if fname != query {
+                self.note_column_source(&key, query);
+            }
             cells.push((key, value));
         }
 
@@ -2998,6 +3027,7 @@ impl<'a> Exec<'a> {
                 columns: sub.column_order,
                 timing_columns: sub.timing_columns,
                 duration_columns: sub.duration_columns,
+                column_sources: sub.column_sources,
                 errors: sub.errors,
                 skipped: sub.skipped,
                 warnings: sub.warnings,
@@ -3068,6 +3098,9 @@ impl<'a> Exec<'a> {
             }
             for c in &out.duration_columns {
                 self.note_duration_column(c);
+            }
+            for (k, q) in &out.column_sources {
+                self.note_column_source(k, q);
             }
             self.errors.extend(out.errors.iter().cloned());
             self.warnings.extend(out.warnings.iter().cloned());
@@ -3222,6 +3255,7 @@ impl<'a> Exec<'a> {
                 columns: sub.column_order,
                 timing_columns: sub.timing_columns,
                 duration_columns: sub.duration_columns,
+                column_sources: sub.column_sources,
                 errors: sub.errors,
                 skipped: sub.skipped,
                 warnings: sub.warnings,
@@ -3353,6 +3387,9 @@ impl<'a> Exec<'a> {
             }
             for c in &out.duration_columns {
                 self.note_duration_column(c);
+            }
+            for (k, q) in &out.column_sources {
+                self.note_column_source(k, q);
             }
             self.errors.extend(out.errors);
             self.skipped.extend(out.skipped);
@@ -8810,6 +8847,58 @@ mod tests {
         );
     }
 
+    /// The other half of the same footer: a finished comparison carries the
+    /// baseline's values in a `baseline.proc.n` column and states their
+    /// statistics under it, but the live grid is uncollapsed and has no such
+    /// column — so without re-keying them the reader sees only the candidate's
+    /// mean until the very last row lands.
+    #[test]
+    fn the_baseline_half_of_the_statistics_is_readable_mid_run() {
+        let entries = [graph_entry("r", &[], &[])];
+        let fake = Fake::new(&[]);
+        let flow = parse_flow(
+            "FOR X IN [1, 2]\n\
+             \x20 FOR T IN ENVS BASELINE(\"prod\") SHOW(n STATISTICS(MEAN)), COMPARISON(\"staging\")\n\
+             \x20   REPORT \"{{n}}{{X}}\" AS \"proc.n\" STATISTICS(MEAN)\n\
+             \x20 END\n\
+             END\n",
+        )
+        .unwrap();
+        let ctx = ctx_over(
+            &entries,
+            &[("prod", &[("n", "1")][..]), ("staging", &[("n", "3")][..])],
+            &fake,
+        );
+        let live = run_flow_raw(&flow, &ctx);
+        assert!(live.errors.is_empty(), "{:?}", live.errors);
+
+        let live_columns = live.resolved_columns(&flow.header);
+        let ci = live_columns
+            .iter()
+            .position(|c| c.header == "proc.n")
+            .unwrap();
+        // The live grid's own footer: the candidates' 31 and 32.
+        assert_eq!(
+            live.summary_rows(&live_columns)
+                .iter()
+                .map(|r| (r.label.clone(), r.text_cell(ci)))
+                .collect::<Vec<_>>(),
+            vec![("Mean".to_string(), "31.5".to_string())]
+        );
+
+        let projected = project_live(&live, &flow, &Default::default(), None);
+        let projected_columns = projected.resolved_columns(&flow.header);
+        let extra = projected.baseline_summary_rows(&projected_columns, &live_columns);
+        // Prod's 11 and 12, under the column they are being compared against.
+        assert_eq!(
+            extra
+                .iter()
+                .map(|r| (r.label.clone(), r.text_cell(ci)))
+                .collect::<Vec<_>>(),
+            vec![("Mean (baseline)".to_string(), "11.5".to_string())]
+        );
+    }
+
     /// A `RunContext` over `fake` with the given named environments — for the
     /// tests that need two runs of one flow against different runners.
     fn ctx_over<'a>(
@@ -10715,6 +10804,37 @@ mod timing_column_tests {
             result.timing_columns.is_empty(),
             "{:?}",
             result.timing_columns
+        );
+    }
+
+    /// A field written under a name of its own records what it was renamed
+    /// from. Without that, a comparison's copied baseline column — which is
+    /// named after the *query* — has nothing to pair it back up with, and the
+    /// two halves of one measurement are stated columns apart.
+    #[test]
+    fn a_renamed_field_records_the_query_it_came_from() {
+        let result = run(concat!(
+            "# collection: ./api.hurl\n\n",
+            "REPORT REQUEST face AS f WITH\n",
+            "    \"Response Time\": TimeWait STATISTICS(MEAN)\n",
+            "    Status: HttpStatus\n",
+            "    Verdict: jsonpath \"$.verdict\"\n",
+            "END\n",
+        ));
+        assert_eq!(
+            result.column_sources.get("f.Response Time"),
+            Some(&"TimeWait".to_string())
+        );
+        // Not only timings: any field renamed from its query is recorded, so a
+        // `SHOW(HttpStatus)` copy pairs with a renamed status just as well.
+        assert_eq!(
+            result.column_sources.get("f.Status"),
+            Some(&"HttpStatus".to_string())
+        );
+        // And a query that is not an intrinsic at all is still a rename.
+        assert_eq!(
+            result.column_sources.get("f.Verdict"),
+            Some(&"jsonpath \"$.verdict\"".to_string())
         );
     }
 }
