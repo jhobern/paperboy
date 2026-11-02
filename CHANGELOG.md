@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.7.4] - 2026-11-03
+
+### Fixed
+
+- **Exporting a report's results ignored the report.** The GUI's Export
+  dialog offered `results.csv` in whatever folder PaperBoy was started from,
+  whatever the report's `# output:` said and wherever it was saved; it now
+  offers the declared format, named for the report and beside it.
+- **Browse… in the Export dialog no longer writes the file on the spot.** The
+  location picked in the file chooser goes back into the Export dialog, so the
+  format can still be changed before pressing Export.
+
+
 ## [0.7.3] - 2026-10-28
 
 ### Added

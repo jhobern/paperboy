@@ -2809,7 +2809,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     )),
                 );
                 if export.clicked() {
-                    open_export_dialog(app);
+                    open_export_dialog(app, &ed);
                 }
                 // Appears only once there is a file to open, and disappears
                 // again when a rerun makes that file describe a different run:
@@ -6740,53 +6740,47 @@ fn truncate_cell(value: &str) -> String {
     crate::shared_utils::truncate_to_width(value, 48)
 }
 
-/// Open the native save picker for exporting the active report's results,
-/// defaulting to a `.csv` beside the report (or in the current dir for a scratch
-/// report).
-fn open_export_dialog(app: &mut GuiApp) {
+/// Open PaperBoy's Export dialog for `e`'s results, seeded with the format
+/// its `# output:` directive declares (else `.csv`), beside the report (or in
+/// its base directory for a scratch report).
+///
+/// Takes the editor explicitly rather than reading `app.report_editor`: the
+/// toolbar that calls this runs with the editor taken *out* of the app, so
+/// looking it up there found nothing and every export was offered as
+/// `results.csv` in whatever directory PaperBoy was started from.
+fn open_export_dialog(app: &mut GuiApp, e: &ReportEditor) {
     // Seeded with the name the report's own `# output:` directive asks for, so
     // the common case is press-Export-and-done.
-    let path = app
-        .report_editor
-        .as_ref()
-        .map(|e| {
-            let p = crate::report::writer::export_path(
-                &e.report,
-                &crate::report::writer::report_output_extension(&e.report),
-            );
-            // A saved report exports beside itself, so `export_path` already
-            // gives an absolute name. A scratch report gives a bare filename,
-            // which would land wherever PaperBoy happens to have been started
-            // from -- anchor it to the report's own base directory, the folder
-            // the terminal UI's picker opens in. A report with no folder of its
-            // own (no file, no `# root:`) has only the process's working
-            // directory for that, which nobody chose; the folder the user last
-            // browsed to is a far better guess.
-            if p.is_absolute() {
-                p
-            } else {
-                let (base, anchored) = crate::report::context::report_base_dir(
-                    &e.flow.clone().unwrap_or_default(),
-                    e.report.path.as_deref(),
-                );
-                let base = if anchored {
-                    base
-                } else {
-                    app.session
-                        .picker_dir(crate::session::PickerKind::Other)
-                        .map(std::path::Path::to_path_buf)
-                        .unwrap_or(base)
-                };
-                base.join(p)
-            }
-        })
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_default()
-                .join("results.csv")
-        })
-        .to_string_lossy()
-        .into_owned();
+    let p = crate::report::writer::export_path(
+        &e.report,
+        &crate::report::writer::report_output_extension(&e.report),
+    );
+    // A saved report exports beside itself, so `export_path` already gives an
+    // absolute name. A scratch report gives a bare filename, which would land
+    // wherever PaperBoy happens to have been started from -- anchor it to the
+    // report's own base directory, the folder the terminal UI's picker opens
+    // in. A report with no folder of its own (no file, no `# root:`) has only
+    // the process's working directory for that, which nobody chose; the folder
+    // the user last browsed to is a far better guess.
+    let path = if p.is_absolute() {
+        p
+    } else {
+        let (base, anchored) = crate::report::context::report_base_dir(
+            &e.flow.clone().unwrap_or_default(),
+            e.report.path.as_deref(),
+        );
+        let base = if anchored {
+            base
+        } else {
+            app.session
+                .picker_dir(crate::session::PickerKind::Other)
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or(base)
+        };
+        base.join(p)
+    }
+    .to_string_lossy()
+    .into_owned();
     app.dialog = Some(super::app::Dialog::ExportResults {
         path,
         replace: false,
@@ -16279,7 +16273,8 @@ mod toolbar_commit_tests {
             ed.report.path = Some(trail.clone());
             ed.flow = ed.report.flow().ok();
         }
-        super::open_export_dialog(&mut app);
+        let ed = app.report_editor.take().expect("editor");
+        super::open_export_dialog(&mut app, &ed);
         let path = match app.dialog {
             Some(super::super::app::Dialog::ExportResults { path, .. }) => path,
             _ => panic!("Export opens PaperBoy's own dialog"),
@@ -16299,7 +16294,8 @@ mod toolbar_commit_tests {
     fn the_export_dialog_offers_a_full_path() {
         // No file, no `# root:`: the case that used to offer a bare name.
         let mut app = app_with_report("# collection: api\n");
-        super::open_export_dialog(&mut app);
+        let ed = app.report_editor.take().expect("editor");
+        super::open_export_dialog(&mut app, &ed);
         let path = match app.dialog {
             Some(super::super::app::Dialog::ExportResults { path, .. }) => path,
             _ => panic!("Export opens PaperBoy's own dialog"),
@@ -16318,7 +16314,8 @@ mod toolbar_commit_tests {
         if let Some(ed) = app.report_editor.as_mut() {
             ed.flow = ed.report.flow().ok();
         }
-        super::open_export_dialog(&mut app);
+        let ed = app.report_editor.take().expect("editor");
+        super::open_export_dialog(&mut app, &ed);
         let path = match app.dialog {
             Some(super::super::app::Dialog::ExportResults { path, .. }) => path,
             _ => panic!("Export opens PaperBoy's own dialog"),
