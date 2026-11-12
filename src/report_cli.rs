@@ -73,7 +73,46 @@ fn random_seed() -> u64 {
 /// flight finish, runs `CLEANUP`, writes the outputs it was asked for marked
 /// as partial, and exits [`EXIT_INTERRUPTED`]; `grace_secs` bounds how long it
 /// will wait for that (see [`Control`]).
-pub fn run(
+pub fn run_with_state(
+    collection_path: Option<String>,
+    env_paths: Vec<String>,
+    report_path: String,
+    outputs: Vec<String>,
+    dry_run: bool,
+    targets: Vec<String>,
+    shuffle: Option<Option<u64>>,
+    params: ParamValues,
+    gates: Gates,
+    progress_json: bool,
+    grace_secs: Option<u64>,
+    stop_on_stdin: bool,
+    saved: crate::report::saved::Options,
+) -> i32 {
+    let control = Control::new(grace_secs);
+    control.listen(stop_on_stdin);
+    let mut progress = Progress::new(progress_json);
+    if saved.run_state.is_some() {
+        progress.schema = 2;
+    }
+    run_with_options(
+        collection_path,
+        env_paths,
+        report_path,
+        outputs,
+        dry_run,
+        targets,
+        shuffle,
+        params,
+        gates,
+        progress,
+        control,
+        saved,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn run(
     collection_path: Option<String>,
     env_paths: Vec<String>,
     report_path: String,
@@ -87,9 +126,7 @@ pub fn run(
     grace_secs: Option<u64>,
     stop_on_stdin: bool,
 ) -> i32 {
-    let control = Control::new(grace_secs);
-    control.listen(stop_on_stdin);
-    run_with_progress(
+    run_with_state(
         collection_path,
         env_paths,
         report_path,
@@ -99,12 +136,14 @@ pub fn run(
         shuffle,
         params,
         gates,
-        Progress::new(progress_json),
-        control,
+        progress_json,
+        grace_secs,
+        stop_on_stdin,
+        Default::default(),
     )
 }
 
-/// The body of [`run`], with the event stream's destination passed in.
+/// The body of [`run_with_state`], with the event stream's destination passed in.
 ///
 /// Split out so the stream itself can be tested: the events are a published
 /// contract that other programs parse, and asserting on it by spawning the
@@ -112,6 +151,7 @@ pub fn run(
 /// contract. A test hands in a capturing [`Progress`] and reads the events the
 /// run actually produced, output files and all.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn run_with_progress(
     collection_path: Option<String>,
     env_paths: Vec<String>,
@@ -125,6 +165,422 @@ fn run_with_progress(
     progress: Progress,
     control: Control,
 ) -> i32 {
+    run_with_options(
+        collection_path,
+        env_paths,
+        report_path,
+        outputs,
+        dry_run,
+        targets,
+        shuffle,
+        params,
+        gates,
+        progress,
+        control,
+        Default::default(),
+    )
+}
+
+/// Inspect/render never load a collection, resolve a provider, or send HTTP.
+pub fn read_saved(options: &crate::report::saved::Options, outputs: &[String], json: bool) -> i32 {
+    use crate::report::saved::{Action, Store};
+    let mut progress = Progress::new(json);
+    progress.schema = 2;
+    let outcome = (|| -> Result<i32, String> {
+        if options.expected_revision.is_some()
+            || !options.select.is_empty()
+            || options.whole_comparison
+            || options.bindings.is_some()
+            || options.case_key.is_some()
+            || !options.execution_binding.is_empty()
+        {
+            return Err("inspect/render do not accept execution or mutation options".into());
+        }
+        let state = Store::load(options.run_state.as_deref().unwrap())?;
+        progress.identify(&state.run_id, state.revision);
+        progress.emit(
+            "saved_run",
+            serde_json::json!({"run_id":state.run_id,"revision":state.revision}),
+        );
+        if options.state_action == Action::Inspect {
+            if !outputs.is_empty() {
+                return Err("inspect writes JSON to stdout; -o is for render".into());
+            }
+            let rows:Vec<_> = state.rows.iter().map(|r| {
+                let mut value=serde_json::json!({"execution_id":r.execution_id,"case_id":r.case_id,
+                    "target":r.target,"role":r.role,"comparison":r.comparison,"attempt":r.attempt,
+                    "result_attempt":r.result_attempt,"binding_revision":r.binding_revision,
+                    "status":r.status,"error_count":r.errors.len(),"skipped_count":r.skipped.len()});
+                if options.inspect_details {
+                    value["key"]=serde_json::json!(r.key);
+                    value["cells"]=serde_json::json!(r.cells);
+                    value["details"]=serde_json::json!(r.details);
+                    value["errors"]=serde_json::json!(r.errors);
+                    value["warnings"]=serde_json::json!(r.warnings);
+                    value["skipped"]=serde_json::json!(r.skipped);
+                    value["image_errors"]=serde_json::json!(r.image_errors);
+                }
+                value
+            }).collect();
+            let mut inspection = serde_json::json!({"schema":1,"run_id":state.run_id,"revision":state.revision,
+                "phase":state.phase,"shuffle":state.shuffle,"executions":rows,"history":state.history,
+                "errors_count":state.errors.len()+state.rows.iter().map(|r|r.image_errors.len()).sum::<usize>(),
+                "warnings_count":state.warnings.len(),"skipped_count":state.skipped.len()});
+            if options.inspect_details {
+                inspection["errors"] = serde_json::json!(state.errors);
+                inspection["warnings"] = serde_json::json!(state.warnings);
+                inspection["skipped"] = serde_json::json!(state.skipped);
+            }
+            println!("{inspection}");
+            progress.emit("run_finished",serde_json::json!({"exit_code":0,"operation":"inspect","run_id":state.run_id,"revision":state.revision}));
+            return Ok(0);
+        }
+        if options.inspect_details {
+            return Err("--inspect-details requires inspect".into());
+        }
+        if outputs.is_empty() {
+            return Err("render requires at least one -o output".into());
+        }
+        crate::report::saved::check_outputs(options.run_state.as_deref().unwrap(), outputs)?;
+        let result = state.rendered()?;
+        let flow = state.flow()?;
+        check_outputs(outputs, &flow.header)?;
+        let report = Report::from_text("saved-report", &state.header);
+        for output in outputs {
+            write_output(&result, &flow.header, Some(output), &report)?;
+            progress.output_written(output, &output_extension_of(output), None);
+        }
+        // Rendering is not a new quality judgment.
+        progress.emit("run_finished",serde_json::json!({"exit_code":0,"operation":"render","run_id":state.run_id,"revision":state.revision}));
+        Ok(0)
+    })();
+    outcome.unwrap_or_else(|e| progress.setup_failed(vec![e]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_saved(
+    options: &crate::report::saved::Options,
+    flow: &crate::report::flow::ReportFlow,
+    ctx: &RunContext,
+    shape: &ReportResult,
+    report: &Report,
+    outputs: &[String],
+    gates: Gates,
+    progress: &Progress,
+    control: &Control,
+) -> i32 {
+    use crate::report::saved::{Action, Attempt, State, Status, Store, load_bindings};
+    let outcome = (|| -> Result<i32, String> {
+        let creating = options.state_action == Action::Run;
+        if options.inspect_details
+            || (!creating && (options.case_key.is_some() || !options.execution_binding.is_empty()))
+        {
+            return Err("case/binding declarations are only accepted when creating state; inspection flags require inspect".into());
+        }
+        if creating
+            && (options.expected_revision.is_some()
+                || !options.select.is_empty()
+                || options.bindings.is_some()
+                || options.whole_comparison)
+        {
+            return Err("new saved runs do not accept revision/select/repair options".into());
+        }
+        let path = options.run_state.as_deref().unwrap();
+        crate::report::saved::check_outputs(path, outputs)?;
+        // Validate creation before leaving even an empty directory behind.
+        let initial = if creating {
+            Some(State::create(flow, ctx, shape, options)?)
+        } else {
+            None
+        };
+        let store = Store::acquire(path, creating)?;
+        let mut state = match initial {
+            Some(s) => s,
+            None => Store::load(path)?,
+        };
+        progress.identify(&state.run_id, state.revision);
+        let selected = if creating {
+            (0..state.rows.len()).collect::<Vec<_>>()
+        } else {
+            if options.expected_revision != Some(state.revision) {
+                return Err(format!(
+                    "stale/missing --expected-revision; current revision is {}",
+                    state.revision
+                ));
+            }
+            state.validate_plan(flow, ctx, shape)?;
+            state.selected(
+                options.state_action,
+                &options.select,
+                options.whole_comparison,
+            )?
+        };
+        let bindings = load_bindings(options.bindings.as_deref(), &state, &selected)?;
+        if options.state_action == Action::Resume && selected.is_empty() && state.phase == "active"
+        {
+            return Err("all rows are durable, but setup/cleanup completion is uncertain after a crash; render the partial state or explicitly rerun selected rows to replay their scopes".into());
+        }
+        if options.state_action == Action::Resume {
+            for &i in &selected {
+                let row = &state.rows[i];
+                if state
+                    .history
+                    .iter()
+                    .rev()
+                    .find(|h| h.execution_id == row.execution_id)
+                    .is_some_and(|h| !h.binding_names.is_empty())
+                    && !bindings.contains_key(&row.path)
+                {
+                    return Err(format!(
+                        "unfinished {} used replacement bindings; supply them again (values are never saved)",
+                        row.execution_id
+                    ));
+                }
+            }
+        }
+        let selection = state.selection(&selected, bindings.clone());
+        let names = state.names()?;
+        state.revision += 1;
+        state.phase = "active".into();
+        for &i in &selected {
+            let row = &mut state.rows[i];
+            let mut binding_names: Vec<_> = bindings
+                .get(&row.path)
+                .into_iter()
+                .flat_map(|m| m.keys().cloned())
+                .collect();
+            binding_names.sort();
+            if !binding_names.is_empty() {
+                row.binding_revision = state.revision;
+            }
+            state.history.push(Attempt {
+                execution_id: row.execution_id.clone(),
+                attempt: row.attempt + 1,
+                revision: state.revision,
+                previous_status: row.status,
+                binding_names,
+            });
+            row.attempt += 1;
+            row.status = Status::Pending;
+        }
+        store.save(&state)?;
+        progress.identify(&state.run_id, state.revision);
+        progress.emit(
+            "saved_run",
+            serde_json::json!({"run_id":state.run_id,"revision":state.revision,
+            "selected":selected.iter().map(|&i|&state.rows[i].execution_id).collect::<Vec<_>>()}),
+        );
+        progress.plan(&report.name, selected.len(), &[], &[], false);
+        let held = Mutex::new(state);
+        let failure = Mutex::new(None::<String>);
+        let sink = |event: RowEvent| {
+            let mut state = held.lock().unwrap_or_else(|e| e.into_inner());
+            let path = match &event {
+                RowEvent::Started(p) => *p,
+                RowEvent::Completed { row, .. } => row.path.as_slice(),
+            };
+            let Some(i) = state.rows.iter().position(|r| r.path == path) else {
+                *failure.lock().unwrap() = Some("live row not present in saved plan".into());
+                control.cancel.stop();
+                return;
+            };
+            match event {
+                RowEvent::Started(_) => state.rows[i].status = Status::InFlight,
+                RowEvent::Completed { row, .. } => {
+                    if row.target != state.rows[i].target
+                        || row.role != state.rows[i].role
+                        || crate::report::saved::case(row, &state.case_key, ctx.root.as_deref())
+                            .ok()
+                            != state.rows[i].key.first().cloned()
+                    {
+                        *failure.lock().unwrap() =
+                            Some("live identity diverged from offline saved plan".into());
+                        control.cancel.stop();
+                        return;
+                    }
+                    let fresh = ReportResult {
+                        rows: vec![row.clone()],
+                        ..Default::default()
+                    };
+                    if let Err(e) = state.merge(&fresh, &names) {
+                        *failure.lock().unwrap() = Some(e);
+                        control.cancel.stop();
+                        return;
+                    }
+                    // Bundle image bytes now, before acknowledging durable
+                    // completion. No old root or image server is needed later.
+                    let mut image_row = ReportResult {
+                        rows: vec![state.rows[i].raw_for_images()],
+                        column_order: state.column_order.clone(),
+                        column_images: state.column_images.clone(),
+                        no_match_marker: state.no_match_marker.clone(),
+                        ..Default::default()
+                    };
+                    // Before collapse a baseline-only output source has no
+                    // `baseline.` prefix yet. Bundle its own underlying image
+                    // now; render later chooses the authoritative baseline side.
+                    for column in image_row.resolved_columns(&flow.header) {
+                        for source in column.sources {
+                            if let Some(original) = source.strip_prefix("baseline.")
+                                && let Some(value) = image_row.rows[0].cells.get(original).cloned()
+                            {
+                                image_row.rows[0].cells.insert(source, value);
+                            }
+                        }
+                    }
+                    crate::report::run::resolve_images(&mut image_row, flow, ctx);
+                    state.rows[i].images = image_row
+                        .images
+                        .into_iter()
+                        .map(|((_, c), image)| (c, image))
+                        .collect();
+                    state.rows[i].image_errors = image_row.errors;
+                }
+            }
+            if let Err(e) = store.append(&state, &state.rows[i]) {
+                *failure.lock().unwrap() = Some(e);
+                control.cancel.stop();
+            }
+            let name = if matches!(event, RowEvent::Started(_)) {
+                "row_started"
+            } else {
+                "row_completed"
+            };
+            progress.emit(
+                name,
+                serde_json::json!({"run_id":state.run_id,"revision":state.revision,
+                "execution_id":state.rows[i].execution_id,"row_index":i,"path":state.rows[i].path,
+                "status":state.rows[i].status,"attempt":state.rows[i].attempt}),
+            );
+        };
+        let run_ctx = RunContext {
+            sink: Some(&sink),
+            entries: ctx.entries,
+            helpers: ctx.helpers,
+            base_vars: ctx.base_vars.clone(),
+            named_envs: ctx.named_envs.clone(),
+            root: ctx.root.clone(),
+            runner: ctx.runner,
+            strings: ctx.strings,
+            params: ctx.params.clone(),
+            shuffle: ctx.shuffle,
+            cancel: ctx.cancel,
+        };
+        let fresh = if selected.is_empty() {
+            ReportResult::default()
+        } else {
+            std::thread::scope(|scope| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let selection = &selection;
+                let run_ctx = &run_ctx;
+                scope.spawn(move || {
+                    let r =
+                        crate::report::run::run_flow_raw_selected(flow, run_ctx, Some(selection));
+                    let _ = tx.send(r);
+                });
+                let mut deadline = None;
+                loop {
+                    match rx.recv_timeout(STOP_POLL) {
+                        Ok(r) => break r,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            panic!("saved-run worker failed")
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    if control.cancel.stopped() && deadline.is_none() {
+                        deadline = Some(std::time::Instant::now() + control.grace);
+                        progress.run_stopping(control.source(), control.grace);
+                    }
+                    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        // The journal is already durable; don't block on a
+                        // worker holding the checkpoint mutex during an image
+                        // fetch. A fresh process replays uncertain work.
+                        progress.emit(
+                            "run_finished",
+                            serde_json::json!({"exit_code":EXIT_INTERRUPTED,"partial":true}),
+                        );
+                        (control.abandon)(EXIT_INTERRUPTED);
+                    }
+                }
+            })
+        };
+        if let Some(e) = failure.into_inner().unwrap() {
+            return Err(format!(
+                "checkpoint failed: {e}; prior snapshot/journal retained"
+            ));
+        }
+        let mut state = held.into_inner().unwrap();
+        state.merge(&fresh, &names)?;
+        state.phase = if control.cancel.stopped()
+            || state
+                .rows
+                .iter()
+                .any(|r| matches!(r.status, Status::Pending | Status::InFlight))
+        {
+            "interrupted"
+        } else {
+            "complete"
+        }
+        .into();
+        state.revision += 1;
+        store.save(&state)?;
+        progress.identify(&state.run_id, state.revision);
+        progress.emit("saved_run",serde_json::json!({"run_id":state.run_id,"revision":state.revision,"phase":state.phase}));
+        let result = state.rendered()?;
+        let header = state.flow()?.header;
+        // Avoid printing private row errors/cells as human prose.
+        let mut decor = Decor::new(outputs.iter().any(|o| o == "-"), true);
+        Ok(deliver(
+            &result,
+            &header,
+            report,
+            outputs,
+            &mut decor,
+            progress,
+            &[],
+            gates,
+        ))
+    })();
+    outcome.unwrap_or_else(|e| progress.setup_failed(vec![e]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_options(
+    collection_path: Option<String>,
+    env_paths: Vec<String>,
+    report_path: String,
+    outputs: Vec<String>,
+    dry_run: bool,
+    targets: Vec<String>,
+    shuffle: Option<Option<u64>>,
+    params: ParamValues,
+    gates: Gates,
+    progress: Progress,
+    control: Control,
+    saved: crate::report::saved::Options,
+) -> i32 {
+    if let Some(path) = saved.run_state.as_deref()
+        && saved.state_action != crate::report::saved::Action::Run
+    {
+        // Reject stale selectors before even resolving provider-backed envs.
+        let preflight = (|| -> Result<(), String> {
+            let state = crate::report::saved::Store::load(path)?;
+            progress.identify(&state.run_id, state.revision);
+            if saved.expected_revision != Some(state.revision) {
+                return Err(format!(
+                    "stale/missing --expected-revision; current revision is {}",
+                    state.revision
+                ));
+            }
+            let selected =
+                state.selected(saved.state_action, &saved.select, saved.whole_comparison)?;
+            crate::report::saved::load_bindings(saved.bindings.as_deref(), &state, &selected)?;
+            Ok(())
+        })();
+        if let Err(e) = preflight {
+            return progress.setup_failed(vec![e]);
+        }
+    }
     let progress_json = progress.on();
     // stdout stays clean for a piped CSV (`-o -`); everything human goes to the
     // "decorative" stream, which is stderr in that case and stdout otherwise.
@@ -438,7 +894,7 @@ fn run_with_progress(
     let dry = DryRunner;
 
     // --- header block ----------------------------------------------------
-    let mut decor = Decor::new(to_stdout, progress_json);
+    let mut decor = Decor::new(to_stdout, progress_json || saved.run_state.is_some());
     decor.line(&format!("PaperBoy — report \"{}\"", report.name));
     decor.line(&format!("  Collection : {collection_path}"));
     if let [one] = env_names_loaded.as_slice() {
@@ -575,6 +1031,7 @@ fn run_with_progress(
                     .to_string(),
             ]);
         }
+
         if crate::report::compare::comparison_roles(&flow).is_none()
             && flow.header.baseline().is_none()
         {
@@ -585,6 +1042,36 @@ fn run_with_progress(
                     .to_string(),
             ]);
         }
+    }
+
+    if saved.run_state.is_some() {
+        if dry_run {
+            return progress.setup_failed(vec!["native state cannot save a dry run".into()]);
+        }
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &helpers,
+            base_vars,
+            named_envs,
+            root,
+            runner: &live,
+            strings: &cli_strings,
+            params,
+            sink: None,
+            shuffle,
+            cancel: Some(control.cancel.as_ref()),
+        };
+        return run_saved(
+            &saved,
+            &flow,
+            &ctx,
+            shape.as_ref().unwrap(),
+            &report,
+            &outputs,
+            gates,
+            &progress,
+            &control,
+        );
     }
 
     let done = std::sync::atomic::AtomicUsize::new(0);
@@ -1679,6 +2166,8 @@ const PROGRESS_MAX_CELL: usize = 4096;
 /// where that row lands in the written report — so a consumer can hold a cheap
 /// live grid and fill in the full values from the file once the run is done.
 struct Progress {
+    schema: u32,
+    saved_identity: Mutex<Option<(String, u64)>>,
     /// Where a formatted event line goes, or `None` when `--progress-json` was
     /// not asked for.
     ///
@@ -1704,6 +2193,8 @@ struct Progress {
 impl Progress {
     fn new(on: bool) -> Self {
         Progress {
+            schema: PROGRESS_SCHEMA,
+            saved_identity: Mutex::new(None),
             finished: std::sync::atomic::AtomicBool::new(false),
             out: on.then(|| {
                 Box::new(|line: &str| {
@@ -1718,6 +2209,13 @@ impl Progress {
     /// Whether `--progress-json` was asked for.
     fn on(&self) -> bool {
         self.out.is_some()
+    }
+
+    fn identify(&self, run_id: &str, revision: u64) {
+        *self
+            .saved_identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((run_id.into(), revision));
     }
 
     /// A fatal setup failure — an unreadable collection, a `--param` the report
@@ -1800,10 +2298,34 @@ impl Progress {
         }
         let mut obj = serde_json::Map::new();
         obj.insert("event".into(), serde_json::Value::String(event.into()));
-        obj.insert("schema".into(), serde_json::json!(PROGRESS_SCHEMA));
+        obj.insert("schema".into(), serde_json::json!(self.schema));
+        if let Some((run_id, revision)) = &*self
+            .saved_identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            obj.insert("run_id".into(), serde_json::json!(run_id));
+            obj.insert("revision".into(), serde_json::json!(revision));
+        }
         if let serde_json::Value::Object(map) = fields {
             for (k, v) in map {
                 obj.insert(k, v);
+            }
+            if self.schema == 2
+                && event == "run_finished"
+                && obj
+                    .get("rows")
+                    .and_then(|v| v.as_u64())
+                    .is_some_and(|n| n > 0)
+            {
+                for key in ["errors", "warnings", "skipped"] {
+                    if let Some(values) = obj.remove(key) {
+                        obj.insert(
+                            format!("{key}_count"),
+                            serde_json::json!(values.as_array().map_or(0, Vec::len)),
+                        );
+                    }
+                }
             }
         }
         out(&format!("{}\n", serde_json::Value::Object(obj)));
@@ -2932,6 +3454,8 @@ mod tests {
         let sink = std::sync::Arc::clone(&log);
         (
             Progress {
+                schema: PROGRESS_SCHEMA,
+                saved_identity: Mutex::new(None),
                 finished: std::sync::atomic::AtomicBool::new(false),
                 out: Some(Box::new(move |line: &str| {
                     sink.lock().unwrap().push(line.to_string())

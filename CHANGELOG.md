@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.9.0] - 2026-11-12
+
+### Added
+
+- **Durable headless report bundles.** `--run-state` saves authoritative raw
+  target executions with stable case/execution IDs, private inspection,
+  bundled images, revision checks, atomic snapshots and active completion
+  journals. Separate processes can inspect, render, resume pending work, or
+  rerun selected executions with validated request-only replacement bindings.
+- **Exact-side repair.** Candidate-only reruns retain successful baselines;
+  baseline-only reruns refresh every dependent comparison without executing
+  candidates. `--whole-comparison` explicitly selects all sides. Existing GUI
+  pair-wide behavior is unchanged.
+- Saved-mode progress schema 2 carries run/revision/execution identity without
+  streaming private response data. Existing report progress remains schema 1.
+  Safe-state restrictions and possible replay after interruption are documented.
+
+
 ## [0.7.4] - 2026-11-03
 
 ### Fixed

@@ -26,7 +26,7 @@ pub const TARGET_COLUMN: &str = "TARGET";
 /// role sets of an unrelated comparison elsewhere in the flow, dragged into
 /// that collapse, and written out with a confident verdict about a comparison
 /// it was never part of.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RowRole {
     /// No role was recorded: a row from a stored snapshot, or one built outside
     /// a run. The collapse may fall back to matching its target by name.
@@ -434,7 +434,7 @@ impl Verdict {
 /// them. Kept as encoded bytes (rather than decoded pixels) because both
 /// writers embed the original file — xlsx stores it in `xl/media/`, HTML
 /// base64-encodes it into a `data:` URI — so decoding would only lose fidelity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ImageData {
     pub bytes: Vec<u8>,
     /// The MIME type sniffed from the leading magic bytes (`image/jpeg`, …).
@@ -908,7 +908,7 @@ impl ReportResult {
 /// column. Rendered as extra summary rows appended after the data (see
 /// [`ReportResult::summary_rows`]); the xlsx writer turns the numeric ones into
 /// live spreadsheet formulas.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StatKind {
     Mean,
     Median,

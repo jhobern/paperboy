@@ -273,28 +273,37 @@ fn reconcile_errors(result: &mut ReportResult, r: usize, old: &[String], new: &[
             continue;
         }
         seen.push(e);
-        let flat = count(&result.errors, e);
         let others: usize = (0..result.rows.len())
             .filter(|&o| o != r)
             .map(|o| count(&claims(result, o), e))
             .sum();
-        let (was, now) = (count(old, e), count(new, e));
-        if flat < others + was {
-            if now > 0 && flat == 0 {
-                result.errors.push(e.clone());
-            } else if now == 0 && others == 0 {
-                result.errors.retain(|x| x != e);
-            }
-        } else {
-            for _ in 0..was {
-                if let Some(at) = result.errors.iter().position(|x| x == e) {
-                    result.errors.remove(at);
-                }
-            }
-            for _ in 0..now {
-                result.errors.push(e.clone());
+        reconcile_message(&mut result.errors, e, others, count(old, e), count(new, e));
+    }
+}
+
+/// Shared by in-memory splicing and durable per-row journaling. A checkpoint
+/// must reconcile ownership without copying every response/image buffer.
+pub(super) fn reconcile_message(
+    flat: &mut Vec<String>,
+    message: &str,
+    others: usize,
+    was: usize,
+    now: usize,
+) {
+    let count = flat.iter().filter(|e| e.as_str() == message).count();
+    if count < others + was {
+        if now > 0 && count == 0 {
+            flat.push(message.into());
+        } else if now == 0 && others == 0 {
+            flat.retain(|e| e != message);
+        }
+    } else {
+        for _ in 0..was {
+            if let Some(at) = flat.iter().position(|e| e == message) {
+                flat.remove(at);
             }
         }
+        flat.extend(std::iter::repeat_n(message.to_owned(), now));
     }
 }
 

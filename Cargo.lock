@@ -3369,7 +3369,7 @@ dependencies = [
 
 [[package]]
 name = "paperboy"
-version = "0.7.4"
+version = "0.9.0"
 dependencies = [
  "base64",
  "chrono",

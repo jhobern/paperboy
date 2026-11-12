@@ -78,6 +78,12 @@ pub trait EntryRunner: Sync {
     fn offline(&self) -> bool {
         false
     }
+
+    /// File references are fingerprinted by the durable headless planner using
+    /// the same root that will be used when the request is actually sent.
+    fn input_root(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 /// Production [`EntryRunner`]: routes each send through
@@ -89,6 +95,9 @@ pub struct LiveRunner {
 }
 
 impl EntryRunner for LiveRunner {
+    fn input_root(&self) -> Option<&std::path::Path> {
+        self.file_root.as_deref()
+    }
     fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
         crate::request::run_resolved_entry(base, vars, self.file_root.as_deref(), &[])
     }
@@ -173,6 +182,9 @@ pub enum RowEvent<'r> {
 /// a `Mutex`), and events may arrive out of iteration order under `PARALLEL`
 /// (the `path` still identifies the target row).
 pub type RowSink<'a> = dyn Fn(RowEvent) + Sync + 'a;
+
+/// The lexical execution scope responsible for an inherited diagnostic.
+pub type ScopedError = (Vec<(usize, usize)>, String);
 
 /// A cooperative stop switch for a run in progress: flip it and the flow stops
 /// *starting* work, without abandoning what is already under way.
@@ -449,6 +461,9 @@ fn template_refs(template: &str) -> Vec<String> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RowSelection {
     patterns: Vec<Vec<(usize, Option<usize>)>>,
+    /// Execution-only replacements, applied after tuple bindings and captures.
+    bindings: HashMap<Vec<(usize, usize)>, HashMap<String, String>>,
+    inspect: bool,
 }
 
 impl RowSelection {
@@ -461,6 +476,7 @@ impl RowSelection {
                 .iter()
                 .map(|p| p.iter().map(|&(n, i)| (n, Some(i))).collect())
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -494,7 +510,23 @@ impl RowSelection {
                     .collect()
             })
             .collect();
-        RowSelection { patterns }
+        RowSelection {
+            patterns,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_bindings(
+        mut self,
+        bindings: HashMap<Vec<(usize, usize)>, HashMap<String, String>>,
+    ) -> Self {
+        self.bindings = bindings;
+        self
+    }
+
+    pub fn with_inspection(mut self) -> Self {
+        self.inspect = true;
+        self
     }
 }
 
@@ -595,6 +627,12 @@ pub fn run_flow_raw_selected(
 /// snapshot (a no-op otherwise). Done off the row model so the CSV writer and
 /// the TUI grid both pick it up unchanged. Applied once, after the emit phase.
 pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
+    finalize_data(result, flow, ctx);
+    resolve_images(result, flow, ctx);
+}
+
+/// Finalize authoritative saved rows without re-fetching images or HTTP.
+pub fn finalize_data(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
     // What kind of result this is, decided before anything reads it: an
     // offline runner sent nothing, so every response-shaped cell below is
     // blank by construction, and the collapse and the scoring must say
@@ -634,7 +672,6 @@ pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) 
         }
     }
     resolve_truths(result, flow);
-    resolve_images(result, flow, ctx);
     result.finalized = true;
 }
 
@@ -915,7 +952,7 @@ fn resolve_truths(result: &mut ReportResult, flow: &ReportFlow) {
 /// an API run must not fail because an illustration beside it was unreachable.
 /// The cell simply stays as its text, which is what CSV and JSON would have
 /// written anyway.
-fn resolve_images(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
+pub fn resolve_images(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
     let columns = result.resolved_columns(&flow.header);
     let image_columns: Vec<&super::model::OutputColumn> =
         columns.iter().filter(|c| c.image.is_some()).collect();
@@ -1065,6 +1102,7 @@ struct Exec<'a> {
     /// request that failed was written outside its loop. Never re-raised:
     /// the run's own flat error list keeps each error exactly once.
     inherited_errors: Vec<String>,
+    inherited_error_origins: Vec<ScopedError>,
     /// The spans of [`errors`](Self::errors) that were merged *up* from a
     /// finished loop's iterations rather than raised in this scope. They belong
     /// to the rows that loop produced and are already attributed there, so they
@@ -1098,6 +1136,7 @@ struct ExecState {
     broadcast: HashMap<String, String>,
     baseline_show: Vec<String>,
     inherited_errors: Vec<String>,
+    inherited_error_origins: Vec<ScopedError>,
 }
 
 /// The per-iteration output collected from a forked [`Exec`], reassembled in
@@ -1656,6 +1695,7 @@ impl<'a> Exec<'a> {
             role_targets: HashMap::new(),
             baseline_show: Vec::new(),
             inherited_errors: Vec::new(),
+            inherited_error_origins: Vec::new(),
             borrowed_errors: Vec::new(),
         }
     }
@@ -1703,6 +1743,15 @@ impl<'a> Exec<'a> {
                 .chain(self.scope_errors())
                 .cloned()
                 .collect(),
+            inherited_error_origins: if self.selection.as_ref().is_some_and(|s| s.inspect) {
+                self.inherited_error_origins
+                    .iter()
+                    .cloned()
+                    .chain(self.scope_errors().map(|e| (self.path.clone(), e.clone())))
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -1742,6 +1791,7 @@ impl<'a> Exec<'a> {
             target_env: state.target_env,
             broadcast: state.broadcast,
             inherited_errors: state.inherited_errors,
+            inherited_error_origins: state.inherited_error_origins,
             borrowed_errors: Vec::new(),
             column_order: Vec::new(),
             timing_columns: Vec::new(),
@@ -1830,6 +1880,31 @@ impl<'a> Exec<'a> {
             m.insert(k.clone(), v.clone());
         }
         m
+    }
+
+    fn request_vars(&self, qualified: bool) -> HashMap<String, String> {
+        let mut vars = if qualified {
+            self.vars_for_source()
+        } else {
+            self.vars_for()
+        };
+        if let Some(bindings) = self
+            .selection
+            .as_ref()
+            .and_then(|s| s.bindings.get(&self.path))
+        {
+            if qualified {
+                for (key, value) in &mut vars {
+                    if let Some((_, name)) = key.rsplit_once('.')
+                        && let Some(replacement) = bindings.get(name)
+                    {
+                        *value = replacement.clone();
+                    }
+                }
+            }
+            vars.extend(bindings.clone());
+        }
+        vars
     }
 
     /// [`Exec::vars_for`] plus the `step.var` names.
@@ -2528,6 +2603,20 @@ impl<'a> Exec<'a> {
         for (k, v) in &self.broadcast {
             cells.entry(k.clone()).or_insert_with(|| v.clone());
         }
+        if self.selection.as_ref().is_some_and(|s| s.inspect) {
+            cells.insert(
+                "\0skipped".into(),
+                serde_json::to_string(&self.skipped).unwrap(),
+            );
+            cells.insert(
+                "\0warnings".into(),
+                serde_json::to_string(&self.warnings).unwrap(),
+            );
+            cells.insert(
+                "\0shared_errors".into(),
+                serde_json::to_string(&self.inherited_error_origins).unwrap(),
+            );
+        }
         // `run_cleanups` *drains* the errors a teardown raised (they become
         // warnings), so the list can be shorter than the mark taken when the
         // block started — clamp rather than slice past the end.
@@ -2577,7 +2666,7 @@ impl<'a> Exec<'a> {
                 return None;
             }
         };
-        let base = match self.apply_using(name, base, using, &self.vars_for_source()) {
+        let base = match self.apply_using(name, base, using, &self.request_vars(true)) {
             Ok(base) => base,
             Err(e) => {
                 self.errors.push(e);
@@ -2585,7 +2674,7 @@ impl<'a> Exec<'a> {
                 return None;
             }
         };
-        let out = self.ctx.runner.run(&base, &self.vars_for());
+        let out = self.ctx.runner.run(&base, &self.request_vars(false));
         self.record_generated(&step, &out.generated);
         if let Some(err) = &out.error {
             self.errors.push(format!("{name}: {err}"));
@@ -2751,7 +2840,7 @@ impl<'a> Exec<'a> {
         // An unmet `USING` requirement means the request would send something
         // other than what the flow asked for, so it is not sent at all: the row
         // gets an `Error` cell instead of a plausible-looking success.
-        let base = match self.apply_using(name, base, using, &self.vars_for_source()) {
+        let base = match self.apply_using(name, base, using, &self.request_vars(true)) {
             Ok(base) => base,
             Err(e) => {
                 self.errors.push(e.clone());
@@ -2760,7 +2849,7 @@ impl<'a> Exec<'a> {
                 return cells;
             }
         };
-        let out = self.ctx.runner.run(&base, &self.vars_for());
+        let out = self.ctx.runner.run(&base, &self.request_vars(false));
         self.record_generated(&alias, &out.generated);
         // The run's verdict, decided over the *surviving* attempts only: with
         // `[Options] retry`, a poll that answered twice and then succeeded is
@@ -2917,6 +3006,15 @@ impl<'a> Exec<'a> {
             cells.push((key, value));
         }
 
+        // Private native-state inspection is explicit and does not widen the
+        // rendered table or record unreported authentication/setup responses.
+        let inspection = self.selection.as_ref().is_some_and(|s| s.inspect).then(|| {
+            cells
+                .iter()
+                .map(|(key, value)| (format!("\0inspect:{key}"), value.clone()))
+                .collect::<Vec<_>>()
+        });
+
         // Column selection is applied to the fully-built `cells` list.
         //
         // `has_declared`: true when this request has at least one declared field
@@ -2972,6 +3070,9 @@ impl<'a> Exec<'a> {
             });
         }
 
+        if let Some(inspection) = inspection {
+            cells.extend(inspection);
+        }
         cells
     }
 

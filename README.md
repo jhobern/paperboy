@@ -1180,6 +1180,31 @@ that already reads `--progress-json` from stderr gets a bidirectional protocol
 by adding one flag. It is opt-in precisely because EOF counts: most CI runners
 start processes with stdin already closed.
 
+#### Durable saved runs and exact-side repairs
+
+```sh
+paperboy -r compare.trail -e baseline.vars -e candidate.vars \
+  --run-state runs/nightly --case-key case_id \
+  --execution-binding session_id -o nightly.html
+paperboy --run-state runs/nightly --state-action inspect --inspect-details
+paperboy -r compare.trail -e baseline.vars -e candidate.vars \
+  --run-state runs/nightly --state-action rerun --expected-revision 2 \
+  --select x00000003 --bindings repairs.json -o nightly.html
+paperboy --run-state runs/nightly --state-action render -o copy.json
+```
+
+Native bundles retain every raw target side, images and durable per-row
+checkpoints. Reruns select an **exact side** unless `--whole-comparison` is
+explicit; `--state-action resume` executes pending work only, including after
+process death. Completed errors require an explicit rerun. Current credentials
+are re-resolved, not saved. Bundles can contain sensitive response/document
+data and must be protected.
+
+See [Durable headless runs](docs/saved-runs.md) for the binding
+schema, revision checks, relocation, progress schema 2, supported flow shapes,
+and setup/cleanup/replay limitations. Ordinary runs and GUI pair-wide reruns
+are unchanged.
+
 #### Dependency graphs
 
 Inside a `GRAPH … END` region the order statements are written in stops being

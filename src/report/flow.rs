@@ -644,7 +644,7 @@ pub enum ReportStmt {
 /// exports lossless, keeps baseline comparison textual, and lets a format with
 /// no picture support degrade to the text automatically rather than needing a
 /// fallback rule of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ImageSpec {
     /// Target height in pixels. With no `width`, the picture scales
     /// proportionally to this height.
