@@ -1025,6 +1025,12 @@ pub(crate) fn reported_requests(body: &[FlowNode]) -> Vec<String> {
                 FlowNode::ForEnvs { body, .. }
                 | FlowNode::ForEach { body, .. }
                 | FlowNode::Graph { body, .. } => walk(body, out),
+                FlowNode::Branch {
+                    body, alternative, ..
+                } => {
+                    walk(body, out);
+                    walk(alternative, out);
+                }
                 _ => {}
             }
         }
@@ -3374,6 +3380,22 @@ REQUEST A
         let again = report_assignment(&mut f, &[0]).expect("still reportable");
         assert_eq!(again, vec![1]);
         assert_eq!(f.nodes.len(), 2);
+    }
+
+    #[test]
+    fn reported_requests_include_both_conditional_arms() {
+        let f = flow(
+            "IF \"a\" == \"a\"\nREPORT REQUEST first\nELSE\nTRY\nREPORT REQUEST second\nRECOVER failure\nREPORT REQUEST third\nEND\nEND\n",
+        );
+        assert_eq!(
+            reported_requests(&f.nodes),
+            vec!["first", "second", "third"]
+        );
+        let roundtrip = flow(&f.to_text());
+        assert_eq!(
+            reported_requests(&roundtrip.nodes),
+            reported_requests(&f.nodes)
+        );
     }
 
     #[test]

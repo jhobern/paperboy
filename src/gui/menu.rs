@@ -2742,6 +2742,7 @@ fn prompt_dialog(app: &mut GuiApp, ctx: &egui::Context, kind: PromptKind, mut te
     let title = match &kind {
         PromptKind::BaseUrl => app.strings.gui_base_url_title,
         PromptKind::NewEnvName => app.strings.gui_new_env_name_title,
+        PromptKind::DuplicateEnv(_) => app.strings.gui_duplicate_env_title,
         PromptKind::NewCollectionName => app.strings.gui_new_collection_name_title,
         PromptKind::NewWorkspaceFolder { .. } => app.strings.gui_ws_new_folder_title,
     };
@@ -2783,6 +2784,9 @@ fn prompt_dialog(app: &mut GuiApp, ctx: &egui::Context, kind: PromptKind, mut te
                     text.clone()
                 };
                 app.session.add_environment(name);
+            }
+            PromptKind::DuplicateEnv(id) => {
+                super::environments::duplicate_environment(app, *id, text.trim());
             }
             PromptKind::NewCollectionName => {
                 let name = if text.trim().is_empty() {

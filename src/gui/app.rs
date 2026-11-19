@@ -217,6 +217,7 @@ pub enum RenameTarget {
 pub enum PromptKind {
     BaseUrl,
     NewEnvName,
+    DuplicateEnv(u64),
     NewCollectionName,
     /// Name for a new subfolder in a Workspace tab's tree, with the tab and the
     /// folder it goes inside. Asked for in-app rather than through the

@@ -129,6 +129,10 @@ pub struct State {
     pub baseline_show: Vec<String>,
     pub role_targets: HashMap<String, Vec<String>>,
     pub no_match_marker: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_max_edge: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_quality: Option<u8>,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
     pub skipped: Vec<String>,
@@ -216,13 +220,22 @@ impl SavedRow {
             .filter(|(k, _)| names.contains(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        self.replace_diagnostics(row);
+        self.result_attempt = Some(self.attempt);
+        self.status = if row.errors.is_empty() && self.skipped.is_empty() {
+            Status::Success
+        } else {
+            Status::Error
+        };
+    }
+
+    fn replace_diagnostics(&mut self, row: &ReportRow) {
         self.errors = row.errors.clone();
         self.shared_errors = row
             .cells
             .get("\0shared_errors")
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
-        self.result_attempt = Some(self.attempt);
         self.skipped = row
             .cells
             .get("\0skipped")
@@ -233,11 +246,6 @@ impl SavedRow {
             .get("\0warnings")
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
-        self.status = if row.errors.is_empty() && self.skipped.is_empty() {
-            Status::Success
-        } else {
-            Status::Error
-        };
     }
 }
 
@@ -335,6 +343,8 @@ impl State {
                 .map(|r| r.baseline_show)
                 .unwrap_or_default(),
             no_match_marker: shape.no_match_marker.clone(),
+            image_max_edge: shape.image_max_edge,
+            image_quality: shape.image_quality,
             errors: Vec::new(),
             warnings: Vec::new(),
             skipped: Vec::new(),
@@ -343,6 +353,13 @@ impl State {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self
+            .image_max_edge
+            .is_some_and(|v| v < super::image::MIN_EMBED_EDGE)
+            || self.image_quality.is_some_and(|v| !(1..=100).contains(&v))
+        {
+            return Err("invalid saved image settings".into());
+        }
         if self.schema != 1 {
             return Err(format!(
                 "unsupported run-state schema {}; expected 1",
@@ -416,6 +433,10 @@ impl State {
         shape: &ReportResult,
     ) -> Result<(), String> {
         validate_supported(flow, ctx, &self.case_key, &self.execution_bindings)?;
+        if shape.image_max_edge != self.image_max_edge || shape.image_quality != self.image_quality
+        {
+            return Err("image settings differ from the saved plan".into());
+        }
         if source_hash(flow, ctx) != self.source_hash
             || input_hashes(flow, ctx, shape)? != self.input_hashes
         {
@@ -521,6 +542,8 @@ impl State {
             column_truths: self.column_truths.clone(),
             column_details: self.column_details.clone(),
             no_match_marker: self.no_match_marker.clone(),
+            image_max_edge: self.image_max_edge,
+            image_quality: self.image_quality,
             errors: self
                 .errors
                 .iter()
@@ -626,7 +649,12 @@ impl State {
     }
 
     pub fn merge(&mut self, fresh: &ReportResult, names: &HashSet<String>) -> Result<(), String> {
-        for row in &fresh.rows {
+        for (row, finished) in fresh
+            .rows
+            .iter()
+            .map(|r| (r, true))
+            .chain(fresh.unfinished_rows.iter().map(|r| (r, false)))
+        {
             let i = self
                 .rows
                 .iter()
@@ -639,12 +667,23 @@ impl State {
                 return Err("live execution target diverged from saved plan".into());
             }
             let mut replacement = self.rows[i].clone();
-            replacement.replace(row, names);
+            if finished {
+                replacement.replace(row, names);
+            } else {
+                replacement.replace_diagnostics(row);
+                replacement.status = Status::InFlight;
+            }
             self.replace_row(i, replacement);
         }
         // Diagnostics not claimed by a returned row are setup/cleanup/global.
         for e in &fresh.errors {
-            if !fresh.rows.iter().any(|r| r.errors.contains(e)) && !self.errors.contains(e) {
+            if !fresh
+                .rows
+                .iter()
+                .chain(&fresh.unfinished_rows)
+                .any(|r| r.errors.contains(e))
+                && !self.errors.contains(e)
+            {
                 self.errors.push(e.clone());
             }
         }
@@ -835,6 +874,46 @@ fn source_hashes(flow: &ReportFlow, ctx: &RunContext) -> BTreeMap<String, String
     sources
 }
 
+fn dynamic_names(flow: &ReportFlow, ctx: &RunContext) -> HashSet<String> {
+    let mut captured: HashSet<String> = ctx
+        .entries
+        .iter()
+        .chain(ctx.helpers.iter().flat_map(|h| &h.entries))
+        .flat_map(|e| {
+            e.captures
+                .iter()
+                .chain(e.generators.iter())
+                .map(|(n, _)| n.clone())
+        })
+        .collect();
+    fn branch_assignments(nodes: &[FlowNode], inside: bool, out: &mut HashSet<String>) {
+        for node in nodes {
+            match node {
+                FlowNode::Assign { key, .. } if inside => {
+                    out.insert(key.clone());
+                }
+                FlowNode::Branch {
+                    body,
+                    alternative,
+                    kind,
+                } => {
+                    if let super::flow::BranchKind::Try { error_var } = kind {
+                        out.insert(error_var.clone());
+                    }
+                    branch_assignments(body, true, out);
+                    branch_assignments(alternative, true, out);
+                }
+                FlowNode::ForEach { body, .. }
+                | FlowNode::ForEnvs { body, .. }
+                | FlowNode::Graph { body, .. } => branch_assignments(body, inside, out),
+                _ => {}
+            }
+        }
+    }
+    branch_assignments(&flow.nodes, false, &mut captured);
+    captured
+}
+
 fn validate_supported(
     flow: &ReportFlow,
     ctx: &RunContext,
@@ -847,22 +926,26 @@ fn validate_supported(
                 .into(),
         );
     }
-    let captured: HashSet<String> = ctx
-        .entries
+    let captured = dynamic_names(flow, ctx);
+    if captured
         .iter()
-        .chain(ctx.helpers.iter().flat_map(|h| &h.entries))
-        .flat_map(|e| {
-            e.captures
-                .iter()
-                .chain(e.generators.iter())
-                .map(|(n, _)| n.clone())
-        })
-        .collect();
+        .any(|name| name.starts_with("PRELUDE_IMAGE_"))
+    {
+        return Err(
+            "native state requires image settings independent of captures and branches".into(),
+        );
+    }
+    if captured.contains(case_key) {
+        return Err("native state requires a case key independent of captures and branches".into());
+    }
     fn walk(nodes: &[FlowNode], captured: &HashSet<String>) -> Result<(), String> {
         fn graph_reports(nodes: &[FlowNode]) -> bool {
             nodes.iter().any(|n| match n {
                 FlowNode::Report(_) => true,
                 FlowNode::Graph { body, .. } => graph_reports(body),
+                FlowNode::Branch {
+                    body, alternative, ..
+                } => graph_reports(body) || graph_reports(alternative),
                 _ => false,
             })
         }
@@ -876,6 +959,18 @@ fn validate_supported(
             match n {
                 FlowNode::Report(_) if has_loop => return Err("native checkpointing requires REPORT statements in leaf blocks; outer broadcasts cannot be durably completed per row".into()),
                 FlowNode::ForEach{body,..}|FlowNode::ForEnvs{body,..}|FlowNode::Graph{body,..} => walk(body,captured)?,
+                // Keep saved row identity and source discovery independent of
+                // live conditions. Report the final result after the branch.
+                FlowNode::Branch { body, alternative, .. } => {
+                    if has_loop {
+                        return Err("native state requires IF/TRY in leaf blocks so interrupted diagnostics belong to an execution".into());
+                    }
+                    if graph_reports(body) || graph_reports(alternative) {
+                        return Err("native state requires REPORT outside IF/TRY; branch on requests, then report the final result".into());
+                    }
+                    walk(body, captured)?;
+                    walk(alternative, captured)?;
+                }
                 _=>{}
             }
         }
@@ -909,13 +1004,29 @@ fn validate_supported(
         Ok(())
     }
     walk(&flow.nodes, &captured)?;
-    if ctx
+    // Name the entries that could not be parsed. The condition is a property of
+    // the collection, not of anything the report says, so without the names the
+    // author is left bisecting a file they did not necessarily write — and the
+    // usual cause is a handful of unused requests in a large export.
+    let unreadable: Vec<&str> = ctx
         .entries
         .iter()
         .chain(ctx.helpers.iter().flat_map(|h| &h.entries))
-        .any(|e| e.unparsed.is_some())
-    {
-        return Err("native state requires fully parsed request sources".into());
+        .filter(|e| e.unparsed.is_some())
+        .map(|e| {
+            if e.title.is_empty() {
+                "<untitled>"
+            } else {
+                e.title.as_str()
+            }
+        })
+        .collect();
+    if !unreadable.is_empty() {
+        return Err(format!(
+            "native state requires fully parsed request sources; \
+             these could not be parsed: {}",
+            unreadable.join(", ")
+        ));
     }
     let names = render_names(
         &ReportResult {
@@ -927,6 +1038,9 @@ fn validate_supported(
     let mut unique = HashSet::new();
     fn env_binding(nodes: &[FlowNode], name: &str) -> bool {
         nodes.iter().any(|node| match node {
+            FlowNode::Branch {
+                body, alternative, ..
+            } => env_binding(body, name) || env_binding(alternative, name),
             FlowNode::ForEnvs { var, body, .. } => var == name || env_binding(body, name),
             FlowNode::ForEach { body, .. } | FlowNode::Graph { body, .. } => {
                 env_binding(body, name)
@@ -938,6 +1052,13 @@ fn validate_supported(
         use super::flow::{OverrideTarget, ReportStmt, UsingItem};
         for node in nodes {
             let call = match node {
+                FlowNode::Branch {
+                    body, alternative, ..
+                } => {
+                    validate_using(body, ctx, name)?;
+                    validate_using(alternative, ctx, name)?;
+                    None
+                }
                 FlowNode::Request { name, using, .. }
                 | FlowNode::Cleanup { name, using, .. }
                 | FlowNode::Report(ReportStmt::Request { name, using, .. }) => Some((name, using)),
@@ -1160,10 +1281,14 @@ fn input_hashes(
         error: std::sync::Mutex<Option<String>>,
         env_vars: Vec<String>,
         endpoints: std::sync::Mutex<BTreeMap<String, String>>,
+        unknown: HashSet<String>,
     }
     impl super::run::EntryRunner for Probe {
         fn offline(&self) -> bool {
             true
+        }
+        fn dependency_probe(&self) -> Option<&HashSet<String>> {
+            Some(&self.unknown)
         }
         fn run(
             &self,
@@ -1242,6 +1367,7 @@ fn input_hashes(
         error: Default::default(),
         env_vars: names,
         endpoints: Default::default(),
+        unknown: dynamic_names(flow, ctx),
     };
     let dry = RunContext {
         entries: ctx.entries,
@@ -1256,7 +1382,13 @@ fn input_hashes(
         shuffle: ctx.shuffle,
         cancel: None,
     };
-    super::run::run_flow_raw(flow, &dry);
+    let discovered = super::run::run_flow_raw(flow, &dry);
+    if !discovered.errors.is_empty() {
+        return Err(format!(
+            "cannot resolve saved request dependencies: {}",
+            discovered.errors.join("; ")
+        ));
+    }
     if let Some(error) = probe.error.into_inner().unwrap() {
         return Err(error);
     }
@@ -2083,5 +2215,269 @@ mod tests {
         )
         .unwrap();
         assert!(validate_supported(&dynamic, &ctx, "case_id", &[]).is_err());
+    }
+
+    /// Whether every entry parsed is a property of the *collection*, not of
+    /// anything the report says, so the author of the report has no way to find
+    /// the culprit unless the error names it — and the usual cause is a couple
+    /// of unused requests in a large Postman export.
+    #[test]
+    fn saved_image_settings_round_trip_and_default_for_older_bundles() {
+        let (_, flow, entries, _) = completed(false);
+        let ctx = context(&entries, &DryRunner);
+        let mut shape = run_flow_raw(&flow, &ctx);
+        shape.image_max_edge = Some(160);
+        shape.image_quality = Some(40);
+        let state = State::create(&flow, &ctx, &shape, &options()).unwrap();
+        let mut json = serde_json::to_value(&state).unwrap();
+        let restored: State = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(restored.raw().image_max_edge, Some(160));
+        assert_eq!(restored.raw().image_quality, Some(40));
+        json.as_object_mut().unwrap().remove("image_max_edge");
+        json.as_object_mut().unwrap().remove("image_quality");
+        let older: State = serde_json::from_value(json).unwrap();
+        assert_eq!(older.image_max_edge, None);
+        assert_eq!(older.image_quality, None);
+    }
+
+    #[test]
+    fn saved_branch_dependencies_include_files_and_origins_from_both_arms() {
+        let dir =
+            std::env::temp_dir().join(format!("paperboy-branch-inputs-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("document.bin"), b"original").unwrap();
+        fs::write(dir.join("other.bin"), b"other").unwrap();
+        let entries = crate::hurl::parse_hurl(
+            "# probe\nGET http://fixture.invalid/\nHTTP 200\n\n\
+             # upload\nPOST https://{{host}}/upload\n[Multipart]\nfile: file,{{input}};\nHTTP 200\n",
+        );
+        let runner = super::super::run::LiveRunner {
+            file_root: Some(dir.clone()),
+        };
+        let mut ctx = context(&entries, &runner);
+        ctx.base_vars.insert("host".into(), "first.invalid".into());
+        let opts = Options {
+            case_key: Some("case_id".into()),
+            ..Default::default()
+        };
+        for branch in [
+            "IF \"x\" == \"x\"\nREQUEST upload\nELSE\nREQUEST upload USING(multipart.file = \"other.bin\")\nEND",
+            "TRY\nREQUEST probe\nRECOVER failure\nIF \"x\" == \"x\"\nREQUEST upload\nELSE\nRETHROW\nEND\nEND",
+            "IF \"x\" == \"y\"\nCLEANUP upload\nEND",
+        ] {
+            let flow = super::super::parser::parse_flow(&format!(
+                "FOR (case_id,input) IN [(\"one\",\"document.bin\")]\n{branch}\nREPORT case_id\nEND\n"
+            )).unwrap();
+            let shape = run_flow_raw(&flow, &context(&entries, &DryRunner));
+            let state = State::create(&flow, &ctx, &shape, &opts).unwrap();
+            assert!(
+                state
+                    .input_hashes
+                    .keys()
+                    .any(|k| k.ends_with("document.bin"))
+            );
+            if branch.contains("other.bin") {
+                assert!(state.input_hashes.keys().any(|k| k.ends_with("other.bin")));
+            }
+            fs::write(dir.join("document.bin"), b"changed").unwrap();
+            assert!(state.validate_plan(&flow, &ctx, &shape).is_err());
+            fs::write(dir.join("document.bin"), b"original").unwrap();
+            ctx.base_vars.insert("host".into(), "second.invalid".into());
+            assert!(state.validate_plan(&flow, &ctx, &shape).is_err());
+            ctx.base_vars.insert("host".into(), "first.invalid".into());
+            fs::remove_file(dir.join("document.bin")).unwrap();
+            let error = State::create(&flow, &ctx, &shape, &opts).unwrap_err();
+            assert!(error.contains("cannot hash input"), "{error}");
+            fs::write(dir.join("document.bin"), b"original").unwrap();
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn saved_branch_dependencies_reject_dynamic_paths_even_with_old_values() {
+        let entries = crate::hurl::parse_hurl(
+            "# probe\nGET http://fixture.invalid/\nHTTP 200\n[Captures]\npath: body\n\n\
+             # upload\nPOST https://fixture.invalid/upload\n[Multipart]\nfile: file,{{path}};\nHTTP 200\n",
+        );
+        let mut ctx = context(&entries, &DryRunner);
+        ctx.base_vars
+            .insert("path".into(), "old-document.bin".into());
+        let opts = Options {
+            case_key: Some("case_id".into()),
+            ..Default::default()
+        };
+        for body in [
+            "TRY\nREQUEST probe\nRECOVER failure\nREQUEST upload\nEND",
+            "IF \"x\" == \"x\"\nREQUEST upload USING(multipart.file = \"{{path}}\")\nEND",
+            "IF \"x\" == \"x\"\nREQUEST probe USING(url = \"https://{{path}}/upload\")\nEND",
+        ] {
+            let flow = super::super::parser::parse_flow(&format!(
+                "FOR case_id IN [\"one\"]\n{body}\nREPORT case_id\nEND\n"
+            ))
+            .unwrap();
+            let shape = run_flow_raw(&flow, &ctx);
+            let error = State::create(&flow, &ctx, &shape, &opts).unwrap_err();
+            assert!(
+                error.contains("fingerprint") || error.contains("endpoint origins"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_interrupted_branches_remain_resumable() {
+        use super::super::run::{Cancel, RowEvent};
+        struct Stopping<'a> {
+            cancel: &'a Cancel,
+            stop_at: &'a str,
+            calls: Mutex<Vec<String>>,
+        }
+        impl EntryRunner for Stopping<'_> {
+            fn run(
+                &self,
+                entry: &crate::hurl::HurlEntry,
+                vars: &HashMap<String, String>,
+            ) -> crate::hurl::RunOutput {
+                self.calls.lock().unwrap().push(entry.title.clone());
+                let mut out = DryRunner.run(entry, vars);
+                if entry.title == "fail" {
+                    out.error = Some("missing".into());
+                    out.entries[0].ok = false;
+                    out.entries[0].error = out.error.clone();
+                }
+                if entry.title == self.stop_at {
+                    self.cancel.stop();
+                }
+                out
+            }
+        }
+        let entries = crate::hurl::parse_hurl(
+            "# first\nGET http://fixture.invalid/first\n\n# upload\nGET http://fixture.invalid/upload\n\n\
+             # fail\nGET http://fixture.invalid/fail\n\n# clean\nGET http://fixture.invalid/clean\n",
+        );
+        for branch in [
+            "TRY\nCLEANUP clean\nREQUEST first\nREQUEST upload\nRECOVER failure\nRETHROW\nEND",
+            "IF \"x\" == \"x\"\nCLEANUP clean\nREQUEST first\nREQUEST upload\nEND",
+            "TRY\nREQUEST fail\nRECOVER failure\nCLEANUP clean\nREQUEST first\nREQUEST upload\nEND",
+        ] {
+            let flow = super::super::parser::parse_flow(&format!(
+                "FOR case_id IN [\"one\"]\n{branch}\nREPORT \"done\" AS Status\nEND\n"
+            ))
+            .unwrap();
+            let dry = context(&entries, &DryRunner);
+            let shape = run_flow_raw(&flow, &dry);
+            let opts = Options {
+                case_key: Some("case_id".into()),
+                ..Default::default()
+            };
+            let state = Mutex::new(State::create(&flow, &dry, &shape, &opts).unwrap());
+            let names = state.lock().unwrap().names().unwrap();
+            let sink = |event: RowEvent| {
+                let mut state = state.lock().unwrap();
+                match event {
+                    RowEvent::Started(_) => state.rows[0].status = Status::InFlight,
+                    RowEvent::Completed { row, .. } => state.rows[0].replace(row, &names),
+                }
+            };
+            let cancel = Cancel::new();
+            let stopping = Stopping {
+                cancel: &cancel,
+                stop_at: "first",
+                calls: Mutex::new(Vec::new()),
+            };
+            let mut ctx = context(&entries, &stopping);
+            ctx.cancel = Some(&cancel);
+            ctx.sink = Some(&sink);
+            let interrupted = run_flow_raw(&flow, &ctx);
+            assert!(interrupted.rows.is_empty());
+            assert_eq!(interrupted.unfinished_rows.len(), 1);
+            state.lock().unwrap().merge(&interrupted, &names).unwrap();
+            if branch.contains("REQUEST fail") {
+                assert!(!state.lock().unwrap().errors.is_empty());
+            }
+            let calls = stopping.calls.lock().unwrap();
+            assert!(calls.iter().any(|n| n == "clean"));
+            assert!(!calls.iter().any(|n| n == "upload"));
+            drop(calls);
+            let mut restored: State =
+                serde_json::from_value(serde_json::to_value(&*state.lock().unwrap()).unwrap())
+                    .unwrap();
+            let selected = restored.selected(Action::Resume, &[], false).unwrap();
+            assert_eq!(selected, vec![0]);
+            let mut with_global: State =
+                serde_json::from_value(serde_json::to_value(&restored).unwrap()).unwrap();
+            with_global.errors.push("unrelated global failure".into());
+            let selection = restored.selection(&selected, HashMap::new());
+            let cancel = Cancel::new();
+            let finishing = Stopping {
+                cancel: &cancel,
+                stop_at: "",
+                calls: Mutex::new(Vec::new()),
+            };
+            let finished =
+                run_flow_raw_selected(&flow, &context(&entries, &finishing), Some(&selection));
+            restored.merge(&finished, &names).unwrap();
+            with_global.merge(&finished, &names).unwrap();
+            assert!(restored.errors.is_empty(), "{:?}", restored.errors);
+            assert_eq!(with_global.errors, vec!["unrelated global failure"]);
+            assert_eq!(restored.rows[0].status, Status::Success);
+            assert!(
+                finishing
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n == "upload")
+            );
+            assert!(
+                restored
+                    .selected(Action::Resume, &[], false)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn saved_conditionals_keep_identity_static_and_report_after_recovery() {
+        let entries = entries();
+        let ctx = context(&entries, &DryRunner);
+        let flow = super::super::parser::parse_flow(
+            "FOR (case_id, session_id) IN [(\"a\",\"old\")]\nTRY\nREQUEST setup\nRECOVER failure\nRETHROW\nEND\nREPORT REQUEST check\nEND\n",
+        ).unwrap();
+        let shape = run_flow_raw(&flow, &ctx);
+        State::create(&flow, &ctx, &shape, &options()).unwrap();
+        let outer = super::super::parser::parse_flow(
+            "TRY\nREQUEST setup\nRECOVER failure\nRETHROW\nEND\nFOR case_id IN [\"one\"]\nREPORT case_id\nEND\n",
+        ).unwrap();
+        assert!(
+            validate_supported(&outer, &ctx, "case_id", &[])
+                .unwrap_err()
+                .contains("leaf blocks")
+        );
+        for body in [
+            "IF \"a\" == \"a\"\ncase_id=changed\nEND",
+            "IF \"a\" == \"a\"\nREPORT case_id\nEND",
+        ] {
+            let bad = super::super::parser::parse_flow(&format!(
+                "FOR (case_id, session_id) IN [(\"a\",\"old\")]\n{body}\nREPORT REQUEST check\nEND\n",
+            )).unwrap();
+            assert!(validate_supported(&bad, &ctx, "case_id", &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn an_unparsed_entry_is_named_in_the_error() {
+        let (_, flow, entries, _) = completed(false);
+        let mut entries = entries.to_vec();
+        entries.push(crate::hurl::HurlEntry::unreadable(
+            "# upload_face\nPOST {{url}}/upload_face\n[Multipart]\nliveness_image_file: file,;\n",
+        ));
+        let ctx = context(&entries, &DryRunner);
+        let err = validate_supported(&flow, &ctx, "case_id", &[]).unwrap_err();
+        assert!(
+            err.contains("upload_face"),
+            "must name the entry that could not be parsed, got: {err}"
+        );
     }
 }

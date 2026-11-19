@@ -106,18 +106,12 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
             return 1;
         }
     }
-    let run_content = if looks_like_postman(&col_content) || has_base64 || skipped {
-        // These paths re-serialize from the entry model, so normalize each
-        // entry the same way the TUI runner does: a bodyless POST/PUT/PATCH/
-        // DELETE gets an explicit `Content-Length: 0` (Postman/browsers send
-        // it; libcurl omits it over HTTP/2 and some servers 400 without it).
-        for e in &mut entries {
-            e.ensure_run_content_length();
-        }
-        collection_to_hurl(&entries)
-    } else {
-        col_content
-    };
+    // Plain Hurl needs the same bodyless-request framing as imported
+    // collections and the other runners; libcurl may omit the header.
+    let mut reserialize = looks_like_postman(&col_content) || has_base64 || skipped;
+    for e in &mut entries {
+        reserialize |= e.ensure_run_content_length();
+    }
 
     // Substitution variables come from the environment file (if any); captures
     // are chained by the runner itself. `BASE_URL` must be provided by the env
@@ -148,16 +142,14 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
     // A request may declare parameters as `[Options] variable: NAME=value`.
     // PaperBoy reads those as *defaults*, so a name the environment file binds
     // must win — Hurl would let the request's own row overwrite it. Dropping
-    // just the bound rows leaves the rest for Hurl to apply as written. The
-    // re-serialize is conditional because a plain `.hurl` is otherwise run
-    // verbatim, and round-tripping a file nobody parameterised buys nothing.
-    let mut run_content = run_content;
-    if request::strip_bound_variable_options(&mut entries, &vars) {
-        for e in &mut entries {
-            e.ensure_run_content_length();
-        }
-        run_content = collection_to_hurl(&entries);
-    }
+    // just the bound rows leaves the rest for Hurl to apply as written.
+    // Keep plain Hurl verbatim unless preparation actually changed an entry.
+    reserialize |= request::strip_bound_variable_options(&mut entries, &vars);
+    let run_content = if reserialize {
+        collection_to_hurl(&entries)
+    } else {
+        col_content
+    };
 
     let color = color_enabled();
     println!();
@@ -559,6 +551,96 @@ fn paint(on: bool, hue: Hue, s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn collections_send_content_length_for_bodyless_requests_in_both_modes() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        for batch in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let cases = [
+                ("POST", "", "", Some("0"), ""),
+                ("PUT", "", "", Some("0"), ""),
+                ("PATCH", "", "", Some("0"), ""),
+                ("DELETE", "", "", Some("0"), ""),
+                ("GET", "", "", None, ""),
+                ("POST", "content-length: 0\n", "", Some("0"), ""),
+                ("POST", "", "`abc`\n", Some("3"), "abc"),
+                ("POST", "", "[Form]\nkey: value\n", Some("9"), "key=value"),
+            ];
+            let server = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut received = Vec::new();
+                while received.len() < cases.len() {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "collection did not finish");
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("accept request: {error}"),
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut headers = Vec::new();
+                    loop {
+                        let mut line = String::new();
+                        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        headers.push(line.trim_end().to_string());
+                    }
+                    let lengths: Vec<String> = headers
+                        .iter()
+                        .filter_map(|line| line.split_once(':'))
+                        .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim().to_string())
+                        .collect();
+                    let length = lengths.first().map_or(0, |value| value.parse().unwrap());
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    received.push((lengths, body));
+                }
+                received
+            });
+            let content: String = cases
+                .iter()
+                .map(|(method, headers, body, _, _)| {
+                    format!(
+                        "{method} http://{address}/\n{headers}[Options]\nproxy:\nmax-time: 5s\n{body}HTTP 200\n\n"
+                    )
+                })
+                .collect();
+            let path = std::env::temp_dir()
+                .join(format!("paperboy_cli_length_{}.hurl", uuid::Uuid::new_v4()));
+            std::fs::write(&path, &content).unwrap();
+            let code = super::run(path.to_string_lossy().into_owned(), None, batch);
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let received = server.join().unwrap();
+            assert_eq!(code, 0, "batch={batch}");
+            assert_eq!(on_disk, content, "run-only headers must not be persisted");
+            for ((method, _, _, length, body), (lengths, actual_body)) in cases.iter().zip(received)
+            {
+                let expected: Vec<_> = length.iter().map(|value| value.to_string()).collect();
+                assert_eq!(lengths, expected, "{method}, batch={batch}");
+                assert_eq!(actual_body, body.as_bytes(), "{method}, batch={batch}");
+            }
+        }
+    }
+
     /// Regression: nothing ran, so nothing passed. Exiting 0 here let a
     /// mistyped path, an empty file, or a collection whose every request was
     /// unreadable pass a CI pipeline green — the opposite of what `-c` is for.

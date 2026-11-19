@@ -32,7 +32,11 @@ fn selected_response(session: &Session, ci: usize) -> (Option<&ApiResponse>, boo
         .get(ci)
         .and_then(|col| col.entries.get(col.selected_entry));
     let loading = entry.is_some_and(|e| e.last_run == RunStatus::Running);
-    (entry.and_then(|e| e.last_response.as_ref()), loading)
+    // A previous failure is not the result of the attempt still on the wire.
+    let shown = entry
+        .filter(|_| !loading)
+        .and_then(|e| e.last_response.as_ref());
+    (shown, loading)
 }
 
 /// The colour a hovered subject is washed in, wherever it is drawn.
@@ -102,14 +106,16 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
 
     // See `selected_response`: the panel follows the selection, not the wire.
     let (shown, loading) = selected_response(&app.session, app.active_ci());
-    // Whether this request has a response *at all*, as opposed to a response
-    // that happens to be empty. Without the distinction each section falls back
-    // to its own "there is nothing here" note — "(empty body)", "(no headers)",
-    // "(no assertions)" — and every one of those is a claim about a reply that
-    // was never received. A request that has not been sent would report that the
-    // server returned no body, which is exactly backwards: the reader is being
-    // told the result of a request rather than that there isn't one yet.
-    let sent = shown.is_some();
+    // Hurl discards partial/redirect responses on a transfer failure, so status
+    // 0 means no response is available, not necessarily that no bytes arrived.
+    let received = shown.is_some_and(|r| r.status > 0);
+    let no_response = if loading {
+        lbl_sending
+    } else if shown.is_some() {
+        app.strings.gui_no_http_response
+    } else {
+        lbl_unsent
+    };
     let (status, status_text, body, error, headers, asserts, duration, captures) = match shown {
         Some(r) => (
             r.status,
@@ -162,11 +168,6 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         if loading {
             ui.spinner();
             ui.colored_label(theme.dim, lbl_sending);
-        } else if !error.is_empty() {
-            ui.colored_label(
-                theme.err,
-                format!("{} {}", super::icons::WARNING, lbl_error),
-            );
         } else if status > 0 {
             let col = status_color(&theme, status);
             let line = ui.label(
@@ -188,8 +189,14 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     ui.close();
                 }
             });
-        } else {
+        } else if error.is_empty() {
             ui.colored_label(theme.dim, lbl_no_response);
+        }
+        if !error.is_empty() {
+            ui.colored_label(
+                theme.err,
+                format!("{} {}", super::icons::WARNING, lbl_error),
+            );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(ms) = duration {
@@ -201,13 +208,13 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     ui.ctx().copy_text(body.to_string());
                 }
             }
-            // Gated on `sent`, not on a non-empty body: a 204 (or any reply with
+            // Gated on `received`, not on a non-empty body: a 204 (or any reply with
             // no body) still has a status and headers to assert on, and the
             // status is the one subject that sets the HTTP line. Right-clicking
             // a value is the quick way in, but it is also invisible: the button
             // is what tells anyone the feature is here at all, and it opens the
             // same builder on the full list.
-            if sent && ui.button(lbl_probe).on_hover_text(lbl_probe_hint).clicked() {
+            if received && ui.button(lbl_probe).on_hover_text(lbl_probe_hint).clicked() {
                 open_probe = Some(None);
             }
             // Compact toggle — only meaningful on the Body section, and only
@@ -248,7 +255,39 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
 
     if !error.is_empty() {
         ui.add_space(4.0);
-        ui.colored_label(theme.err, error);
+        ui.horizontal(|ui| {
+            if ui
+                .button(app.strings.gui_copy_error)
+                .on_hover_text(app.strings.gui_copy_error_hint)
+                .clicked()
+            {
+                ui.ctx().copy_text(error.clone());
+                copied = true;
+            }
+            if received {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(app.strings.gui_last_received_response).color(theme.dim),
+                    )
+                    .wrap(),
+                );
+            }
+        });
+        egui::ScrollArea::vertical()
+            .id_salt(body_id.with("error_scroll"))
+            .max_height((ui.available_height() * 0.35).clamp(40.0, 160.0))
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut error.as_str())
+                        .id(body_id.with("error"))
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(1)
+                        .font(egui::TextStyle::Body)
+                        .text_color(theme.err)
+                        .frame(egui::Frame::NONE),
+                );
+            });
     }
 
     ui.add_space(2.0);
@@ -282,8 +321,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         .auto_shrink([false, false])
         .show(ui, |ui| match app.response_section {
             ResponseSection::Body => {
-                if !sent {
-                    ui.colored_label(theme.dim, lbl_unsent);
+                if !received {
+                    ui.colored_label(theme.dim, no_response);
                 } else if body.is_empty() {
                     ui.colored_label(theme.dim, lbl_empty_body);
                 } else {
@@ -385,8 +424,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 }
             }
             ResponseSection::Headers => {
-                if !sent {
-                    ui.colored_label(theme.dim, lbl_unsent);
+                if !received {
+                    ui.colored_label(theme.dim, no_response);
                 } else if headers.is_empty() {
                     ui.colored_label(theme.dim, lbl_no_headers);
                 } else {
@@ -463,8 +502,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 }
             }
             ResponseSection::Asserts => {
-                if !sent {
-                    ui.colored_label(theme.dim, lbl_unsent);
+                if !received && asserts.is_empty() {
+                    ui.colored_label(theme.dim, no_response);
                 } else if asserts.is_empty() {
                     ui.colored_label(theme.dim, lbl_no_assertions);
                 } else {
@@ -493,8 +532,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             // is what makes the row admit it instead. The whole pool, and what
             // each name is worth *now*, is the Environments panel's job.
             ResponseSection::Captures => {
-                if !sent {
-                    ui.colored_label(theme.dim, lbl_unsent);
+                if !received && captures.is_empty() {
+                    ui.colored_label(theme.dim, no_response);
                 } else if captures.is_empty() {
                     ui.colored_label(theme.dim, lbl_no_captures);
                 } else {
@@ -1410,5 +1449,188 @@ mod unsent_tests {
             !painted.contains(&app.strings.no_response_yet.to_string()),
             "but it was sent, so the not-sent note would now be the lie: {painted:?}"
         );
+    }
+
+    #[test]
+    fn a_failed_attempt_is_not_an_empty_http_response_in_any_section() {
+        let mut app = app_with(Some(ApiResponse {
+            error: "HTTP connection: (7) Could not connect to server".into(),
+            ..Default::default()
+        }));
+        for section in [
+            ResponseSection::Body,
+            ResponseSection::Headers,
+            ResponseSection::Asserts,
+            ResponseSection::Captures,
+        ] {
+            let painted = draw(&mut app, section);
+            assert!(
+                painted.contains(&app.strings.gui_no_http_response.to_string()),
+                "{painted:?}"
+            );
+            assert!(!painted.contains(&app.strings.gui_empty_body.to_string()));
+            assert!(!painted.contains(&app.strings.no_response_yet.to_string()));
+            assert!(!painted.contains(&app.strings.gui_probe_button.to_string()));
+            assert!(
+                painted.iter().any(|s| s.contains("(7) Could not connect")),
+                "{painted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_runs_keep_the_received_http_status_body_and_headers() {
+        for (status, reason, error) in [
+            (
+                401,
+                "Unauthorized",
+                "Expected status 200 but got 401 Unauthorized",
+            ),
+            (200, "OK", "Assert failure"),
+            (
+                302,
+                "Found",
+                "HTTP connection: (7) Could not connect to server",
+            ),
+        ] {
+            let mut app = app_with(Some(ApiResponse {
+                status,
+                status_text: reason.into(),
+                error: error.into(),
+                body: std::sync::Arc::from("server reply"),
+                headers: vec![("X-Trace".into(), "trace-id".into())],
+                ..Default::default()
+            }));
+            let painted = draw(&mut app, ResponseSection::Body);
+            assert!(
+                painted.contains(&format!("{status} {reason}")),
+                "{painted:?}"
+            );
+            assert!(painted.contains(&"server reply".into()));
+            assert!(painted.contains(&app.strings.gui_last_received_response.to_string()));
+            assert!(painted.iter().any(|s| s.contains(error)));
+            assert!(painted.contains(&app.strings.gui_probe_button.to_string()));
+            let painted = draw(&mut app, ResponseSection::Headers);
+            assert!(painted.contains(&"trace-id".into()));
+        }
+    }
+
+    #[test]
+    fn rerunning_hides_the_previous_error_without_erasing_other_requests_results() {
+        let mut app = app_with(Some(ApiResponse {
+            error: "previous failure".into(),
+            ..Default::default()
+        }));
+        app.session.collections[0].entries.push(HurlEntry {
+            last_response: Some(ApiResponse {
+                status: 200,
+                body: std::sync::Arc::from("other reply"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        app.session.collections[0].entries[0].last_run = RunStatus::Running;
+        let painted = draw(&mut app, ResponseSection::Body);
+        assert!(painted.contains(&app.strings.sending.to_string()));
+        assert!(!painted.iter().any(|s| s.contains("previous failure")));
+        assert!(!painted.contains(&app.strings.gui_copy_error.to_string()));
+        app.session.collections[0].selected_entry = 1;
+        let painted = draw(&mut app, ResponseSection::Body);
+        assert!(painted.contains(&"other reply".into()));
+        assert!(!painted.contains(&app.strings.sending.to_string()));
+        app.session.collections[0].selected_entry = 0;
+        let entry = &mut app.session.collections[0].entries[0];
+        entry.last_run = RunStatus::Passed;
+        entry.last_response = Some(ApiResponse {
+            status: 204,
+            ..Default::default()
+        });
+        let painted = draw(&mut app, ResponseSection::Body);
+        assert!(painted.contains(&app.strings.gui_empty_body.to_string()));
+        assert!(!painted.iter().any(|s| s.contains("previous failure")));
+    }
+
+    #[test]
+    fn long_diagnostics_wrap_remain_selectable_and_copy_in_full() {
+        use crate::gui::probe_test_support as harness;
+        let mut app = app_with(Some(ApiResponse {
+            error: format!(
+                "HTTP connection: (28) {}\nend of diagnostic",
+                "timeout details ".repeat(150)
+            ),
+            ..Default::default()
+        }));
+        let expected = app.session.collections[0].entries[0]
+            .last_response
+            .as_ref()
+            .unwrap()
+            .error_detail(&app.strings);
+        let ctx = harness::themed_ctx();
+        let painted = harness::panel_frame(&mut app, &ctx, vec![]);
+        let (_, galley) = painted
+            .iter()
+            .find(|(_, g)| g.text() == expected)
+            .expect("full diagnostic");
+        assert!(galley.rows.len() > 2, "the diagnostic must wrap");
+        assert!(galley.size().x < 900.0);
+        let id = super::super::probe::body_field_id(&app).with("error");
+        assert!(
+            egui::TextEdit::load_state(&ctx, id).is_some(),
+            "a selectable text field"
+        );
+        let tabs = harness::rect_of(&painted, app.strings.gui_sec_headers);
+        assert!(
+            tabs.bottom() < 350.0,
+            "long diagnostics must not push response tabs offscreen: {tabs:?}"
+        );
+        let word = harness::pos_in_text(&painted, "HTTP connection");
+        let (down, up) = harness::click_events(word, egui::PointerButton::Primary);
+        harness::panel_frame(&mut app, &ctx, down);
+        harness::panel_frame(&mut app, &ctx, up);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(id));
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+        };
+        harness::panel_frame(&mut app, &ctx, vec![key(egui::Key::A)]);
+        let selection = egui::TextEdit::load_state(&ctx, id)
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap();
+        assert_eq!(
+            selection
+                .primary
+                .index
+                .0
+                .abs_diff(selection.secondary.index.0),
+            expected.chars().count(),
+            "the complete read-only diagnostic can be selected"
+        );
+        let copied = harness::panel_output(&mut app, &ctx, vec![egui::Event::Copy]);
+        assert!(copied.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == &expected)
+        }));
+        let at = harness::centre_of(&painted, app.strings.gui_copy_error);
+        let (down, up) = harness::click_events(at, egui::PointerButton::Primary);
+        harness::panel_frame(&mut app, &ctx, down);
+        let output = harness::panel_output(&mut app, &ctx, up);
+        assert!(
+            output.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == &expected)
+            }),
+            "copy must include even the scrolled-out portion"
+        );
+        assert!(matches!(
+            app.session.status,
+            Some(crate::i18n::Status::Copied)
+        ));
     }
 }

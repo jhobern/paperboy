@@ -130,6 +130,9 @@ pub struct Partial {
 #[derive(Debug, Clone, Default)]
 pub struct ReportResult {
     pub rows: Vec<ReportRow>,
+    /// Diagnostics from interrupted leaf executions, not completed table rows.
+    /// Saved state retains their ownership while leaving the executions resumable.
+    pub unfinished_rows: Vec<ReportRow>,
     /// Set when this result came out of a **dry run** — an expansion of the
     /// flow against an offline runner, where not one request was sent.
     ///
@@ -204,6 +207,15 @@ pub struct ReportResult {
     /// effective `PRELUDE_NO_MATCH_MARKER`, empty by default). Applied once, at
     /// render time, by [`OutputColumn::value`].
     pub no_match_marker: String,
+    /// The effective `PRELUDE_IMAGE_MAX_EDGE`/`PRELUDE_IMAGE_QUALITY`, when the
+    /// report set them. `None` means "whatever the resolver defaults to", which
+    /// is what every report that does not mention them gets.
+    ///
+    /// Carried on the result rather than re-read from the flow because images
+    /// are resolved after the walk, by which point the scope frames that held
+    /// the settings are gone — the same reason `no_match_marker` lives here.
+    pub image_max_edge: Option<u32>,
+    pub image_quality: Option<u8>,
     /// Non-fatal problems encountered during the run (a request that failed, a
     /// producer that matched nothing, …). Every issue still leaves a row.
     pub errors: Vec<String>,

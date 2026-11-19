@@ -102,6 +102,52 @@ pub(super) fn goto_active(app: &mut GuiApp, id: u64) {
     app.reveal_env = Some(id);
 }
 
+fn environment_copy(
+    source: &crate::environment::Environment,
+    name: String,
+) -> (crate::environment::Environment, Vec<PendingSecret>) {
+    let mut copy = source.clone();
+    copy.id = crate::environment::next_env_id();
+    copy.name = name;
+    copy.path = None;
+    copy.git_origin = None;
+    let mut pending = Vec::new();
+    for (i, var) in copy.vars.iter_mut().enumerate() {
+        // In-flight results target the original id, not this copy.
+        if var.loading {
+            var.loading = false;
+            if let Some(secret) = var.reload(i) {
+                pending.push(secret);
+            }
+        }
+    }
+    (copy, pending)
+}
+
+pub(super) fn duplicate_environment(app: &mut GuiApp, id: u64, name: &str) {
+    let Some(source) = app.session.global_envs.iter().find(|env| env.id == id) else {
+        app.session.status = Some(crate::i18n::Status::Error(
+            app.strings.gui_duplicate_env_missing.to_string(),
+        ));
+        return;
+    };
+    let base = if name.is_empty() { &source.name } else { name };
+    let mut name = base.to_string();
+    let mut suffix = 2;
+    while app.session.global_envs.iter().any(|env| env.name == name) {
+        name = format!("{base} ({suffix})");
+        suffix += 1;
+    }
+    let (copy, pending) = environment_copy(source, name);
+    let id = copy.id;
+    app.session.global_envs.push(copy);
+    if !pending.is_empty() {
+        app.session.pending_env.push(spawn_resolution(id, pending));
+    }
+    goto_active(app, id);
+    app.session.save();
+}
+
 pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     let theme = app.theme;
     let ci = app.active_ci();
@@ -254,6 +300,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     let mut activate: Option<u64> = None;
     let mut delete: Option<u64> = None;
     let mut save: Option<u64> = None;
+    let mut duplicate: Option<u64> = None;
     let mut resolve: Option<(u64, Vec<PendingSecret>)> = None;
     let mut open_file: Option<std::path::PathBuf> = None;
     let mut changed = false;
@@ -389,6 +436,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                             if ui.button(lbl_save).clicked() {
                                 save = Some(id);
                             }
+                            if ui.button(app.strings.gui_duplicate).clicked() {
+                                duplicate = Some(id);
+                            }
                             if ui
                                 .button(RichText::new(lbl_delete).color(theme.err))
                                 .clicked()
@@ -444,6 +494,10 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                         save = Some(id);
                         ui.close();
                     }
+                    if ui.button(app.strings.gui_duplicate).clicked() {
+                        duplicate = Some(id);
+                        ui.close();
+                    }
                     if ui
                         .button(RichText::new(lbl_delete).color(theme.err))
                         .clicked()
@@ -482,6 +536,18 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     }
     if let Some(id) = save {
         super::menu::save_via_picker(app, SaveKind::Environment(id));
+    }
+    if let Some(id) = duplicate {
+        let source = app
+            .session
+            .global_envs
+            .iter()
+            .find(|env| env.id == id)
+            .unwrap();
+        app.dialog = Some(Dialog::Prompt {
+            kind: PromptKind::DuplicateEnv(id),
+            text: source.name.clone(),
+        });
     }
     if let Some((id, pending)) = resolve {
         app.session.pending_env.push(spawn_resolution(id, pending));
@@ -875,6 +941,72 @@ fn var_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_environment_copy_is_independent_and_persists_only_secret_references() {
+        let (mut source, _) = crate::environment::parse_vars_pending(
+            "dev".into(),
+            "URL=https://old\nTOKEN={{ ssm:/test/token }}",
+        );
+        source.path = Some("dev.vars".into());
+        source.git_origin = Some(crate::git_remote::GitOrigin {
+            repo_url: "https://example.com/envs.git".into(),
+            path: "dev.vars".into(),
+            ref_kind: crate::git_remote::RefKind::Branch,
+            ref_name: "main".into(),
+        });
+        source.vars[0].set_user_value_secrecy("https://edited".into(), false, 0);
+        source.vars[1].value = "resolved-test-secret".into();
+        source.vars[1].resolved = true;
+        source.vars[1].loading = false;
+        let (mut copy, pending) = environment_copy(&source, "staging".into());
+        assert_ne!(source.id, copy.id);
+        assert!(copy.path.is_none());
+        assert!(copy.git_origin.is_none());
+        assert!(pending.is_empty());
+        assert_eq!(copy.vars[0].value, "https://edited");
+        assert_eq!(copy.vars[1].value, "resolved-test-secret");
+        let persisted = crate::persistence::PersistedEnv::from_environment(&copy);
+        let text = serde_json::to_string(&persisted).unwrap();
+        assert!(!text.contains("resolved-test-secret"));
+        let (restored, pending) = persisted.restore();
+        assert_eq!(restored.name, "staging");
+        assert_eq!(restored.vars[0].value, "https://edited");
+        assert_eq!(restored.vars[1].raw, "{{ ssm:/test/token }}");
+        assert_eq!(pending.len(), 1);
+        copy.vars[0].set_user_value_secrecy("https://copy".into(), false, 0);
+        assert_eq!(source.vars[0].value, "https://edited");
+    }
+
+    #[test]
+    fn copying_an_inflight_secret_schedules_resolution_for_the_copy() {
+        let (source, _) = crate::environment::parse_vars_pending(
+            "dev".into(),
+            "TOKEN={{ op://test/item/password }}",
+        );
+        let (copy, pending) = environment_copy(&source, "staging".into());
+        assert_ne!(copy.id, source.id);
+        assert!(copy.vars[0].loading);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].index, 0);
+    }
+
+    #[test]
+    fn duplicating_an_empty_environment_disambiguates_and_reveals_without_activating() {
+        let mut app = GuiApp::for_test(crate::session::Session::default());
+        let id = app.session.add_environment("dev");
+        app.session.collections[0].env_id = Some(id);
+        app.env_query = "does not match".into();
+        duplicate_environment(&mut app, id, "dev");
+        duplicate_environment(&mut app, id, "dev");
+        let copies = &app.session.global_envs;
+        assert_eq!(copies[1].name, "dev (2)");
+        assert_eq!(copies[2].name, "dev (3)");
+        assert!(copies[2].vars.is_empty());
+        assert_eq!(app.reveal_env, Some(copies[2].id));
+        assert!(app.env_query.is_empty());
+        assert_eq!(app.session.collections[0].env_id, Some(id));
+    }
 
     /// Every string the frame painted, so a row can be checked for by the name
     /// the user reads rather than by poking at internal state.

@@ -43,6 +43,7 @@ pub mod report;
 pub mod rerun;
 pub mod run;
 pub mod saved;
+pub mod stats;
 pub mod validate;
 pub mod writer;
 

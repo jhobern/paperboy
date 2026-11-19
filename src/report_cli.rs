@@ -414,6 +414,8 @@ fn run_saved(
                         column_order: state.column_order.clone(),
                         column_images: state.column_images.clone(),
                         no_match_marker: state.no_match_marker.clone(),
+                        image_max_edge: state.image_max_edge,
+                        image_quality: state.image_quality,
                         ..Default::default()
                     };
                     // Before collapse a baseline-only output source has no
@@ -4855,6 +4857,113 @@ mod tests {
     /// The whole promise of a stop: the rows that finished are written, the
     /// report says it is short and by how much, and the exit code says the run
     /// was told to stop rather than that the API is broken.
+    #[test]
+    fn saved_resume_clears_interrupted_recovery_errors_end_to_end() {
+        use crate::report::saved::{Action, Options, Status, Store};
+        use std::io::{Read, Write};
+        let dir = temp_dir("saved-recovery-stop");
+        let control = Control::for_test();
+        let cancel = control.switch();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut paths = Vec::new();
+            while paths.len() < 5 && std::time::Instant::now() < deadline {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                    .unwrap();
+                let mut buffer = [0; 4096];
+                let n = socket.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..n]);
+                let path = request.split_whitespace().nth(1).unwrap().to_owned();
+                let status = if path == "/fail" {
+                    "400 Bad Request"
+                } else {
+                    "200 OK"
+                };
+                paths.push(path);
+                if paths.len() == 2 {
+                    cancel.stop();
+                }
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+            paths
+        });
+        fs::write(dir.join("api.hurl"), format!(
+            "# fail\nGET http://{address}/fail\nHTTP 200\n\n# repair\nGET http://{address}/repair\nHTTP 200\n\n# upload\nGET http://{address}/upload\nHTTP 200\n"
+        )).unwrap();
+        let trail = dir.join("recovery.trail");
+        fs::write(&trail, "# collection: api.hurl\nFOR case_id IN [\"one\"]\nTRY\nREQUEST fail\nRECOVER failure\nREQUEST repair\nREQUEST upload\nEND\nREPORT \"done\" AS Status\nEND\n").unwrap();
+        let state_path = dir.join("state");
+        let output = dir.join("report.json").to_string_lossy().into_owned();
+        let (progress, _) = capturing();
+        let first = run_with_options(
+            None,
+            Vec::new(),
+            trail.to_string_lossy().into_owned(),
+            vec![output.clone()],
+            false,
+            Vec::new(),
+            None,
+            ParamValues::new(),
+            Gates::default(),
+            progress,
+            control,
+            Options {
+                run_state: Some(state_path.clone()),
+                case_key: Some("case_id".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(first, EXIT_INTERRUPTED);
+        let state = Store::load(&state_path).unwrap();
+        assert_eq!(state.rows[0].status, Status::InFlight);
+        assert!(!state.errors.is_empty());
+        let (progress, _) = capturing();
+        let resumed = run_with_options(
+            None,
+            Vec::new(),
+            trail.to_string_lossy().into_owned(),
+            vec![output],
+            false,
+            Vec::new(),
+            None,
+            ParamValues::new(),
+            Gates::default(),
+            progress,
+            Control::for_test(),
+            Options {
+                run_state: Some(state_path.clone()),
+                state_action: Action::Resume,
+                expected_revision: Some(state.revision),
+                ..Default::default()
+            },
+        );
+        assert_eq!(resumed, 0);
+        let state = Store::load(&state_path).unwrap();
+        assert!(state.errors.is_empty(), "{:?}", state.errors);
+        assert_eq!(state.rows[0].status, Status::Success);
+        assert_eq!(
+            server.join().unwrap(),
+            vec!["/fail", "/repair", "/fail", "/repair", "/upload"]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn a_stopped_run_writes_the_rows_that_finished_and_says_it_is_partial() {
         let dir = temp_dir("stop");

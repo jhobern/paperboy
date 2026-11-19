@@ -541,6 +541,13 @@ fn scope_captures(
                     continue;
                 }
                 FlowNode::Cleanup { name, .. } => cleanups.then_some(name.as_str()),
+                FlowNode::Branch {
+                    body, alternative, ..
+                } => {
+                    out.extend(scope_captures(body, entries, helpers, cleanups));
+                    out.extend(scope_captures(alternative, entries, helpers, cleanups));
+                    continue;
+                }
                 _ => step_name(n).map(|(_, r)| r),
             };
             // The self-read exclusion belongs to teardowns alone. A cleanup is
@@ -678,6 +685,9 @@ fn count_cleanups(nodes: &[FlowNode]) -> usize {
             FlowNode::ForEach { body, .. }
             | FlowNode::ForEnvs { body, .. }
             | FlowNode::Graph { body, .. } => count_cleanups(body),
+            FlowNode::Branch {
+                body, alternative, ..
+            } => count_cleanups(body) + count_cleanups(alternative),
             _ => 0,
         })
         .sum()
@@ -763,6 +773,30 @@ fn retain_cleanups(
             ord += 1;
         }
         match &mut rest[0] {
+            FlowNode::Branch {
+                body,
+                alternative,
+                kind,
+            } => {
+                let mut body_visible = visible.clone();
+                body_visible.extend(scope_captures(above, entries, helpers, false));
+                let body_dropped = here_dropped
+                    .visible_strictly_before(here_ord)
+                    .positionless();
+                retain_cleanups(body, &body_visible, entries, helpers, &body_dropped, keep);
+                if let super::flow::BranchKind::Try { error_var } = kind {
+                    body_visible.extend(scope_captures(body, entries, helpers, false));
+                    body_visible.insert(error_var.clone());
+                }
+                retain_cleanups(
+                    alternative,
+                    &body_visible,
+                    entries,
+                    helpers,
+                    &body_dropped,
+                    keep,
+                );
+            }
             FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
                 let mut body_visible = visible.clone();
                 body_visible.extend(scope_captures(above, entries, helpers, false));
@@ -971,6 +1005,12 @@ fn scan_strands(nodes: &[FlowNode], dropped_names: &DroppedNames, out: &mut Vec<
             FlowNode::ForEach { body, .. }
             | FlowNode::ForEnvs { body, .. }
             | FlowNode::Graph { body, .. } => scan_strands(body, dropped_names, out),
+            FlowNode::Branch {
+                body, alternative, ..
+            } => {
+                scan_strands(body, dropped_names, out);
+                scan_strands(alternative, dropped_names, out);
+            }
             _ => {}
         }
     }
@@ -2374,6 +2414,48 @@ END
         )
         .unwrap_err();
         assert!(errs.iter().any(|e| e.contains("create.sid")), "{errs:?}");
+    }
+
+    #[test]
+    fn conditional_bodies_cannot_keep_stranded_captures_or_cleanups() {
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("make", &["sid"], &[]),
+            entry("health", &[], &[]),
+            entry("teardown", &[], &["sid"]),
+        ];
+        let prefix = "GRAPH\nREQUEST create\nREQUEST health\nEND\n";
+        let errors = pruned(
+            &format!("{prefix}IF \"a\" == \"b\"\nREPORT \"ok\" AS Value\nELSE\nREPORT \"{{{{create.sid}}}}\" AS Value\nEND\n"),
+            &["health"],
+            &entries,
+        )
+        .unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("create.sid")),
+            "{errors:?}"
+        );
+        let text = pruned(
+            &format!("{prefix}IF \"a\" == \"a\"\nCLEANUP teardown\nELSE\nCLEANUP teardown\nEND\n"),
+            &["health"],
+            &entries,
+        )
+        .unwrap();
+        assert!(!text.contains("CLEANUP teardown"), "{text}");
+        let text = pruned(
+            &format!("{prefix}IF \"a\" == \"a\"\nsid=new\nEND\nCLEANUP teardown\n"),
+            &["health"],
+            &entries,
+        )
+        .unwrap();
+        assert!(text.contains("CLEANUP teardown"), "{text}");
+        let text = pruned(
+            &format!("{prefix}TRY\nREQUEST make\nRECOVER failure\nCLEANUP teardown\nEND\n"),
+            &["health"],
+            &entries,
+        )
+        .unwrap();
+        assert!(text.contains("CLEANUP teardown"), "{text}");
     }
 
     #[test]

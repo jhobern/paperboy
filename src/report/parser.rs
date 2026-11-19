@@ -11,9 +11,9 @@ use nom::{
 };
 
 use crate::report::flow::{
-    Binder, Element, EnvClause, FlowNode, Header, HeaderLine, ImageSpec, OverrideTarget,
-    ParallelSpec, ParamDecl, ParamKind, Pattern, Producer, ReportFlow, ReportStmt, ResponseFmt,
-    RoleBinding, RoleRef, ShowField, UsingItem, WithItem,
+    Binder, BranchKind, Condition, Element, EnvClause, FlowNode, Header, HeaderLine, ImageSpec,
+    OverrideTarget, ParallelSpec, ParamDecl, ParamKind, Pattern, Producer, ReportFlow, ReportStmt,
+    ResponseFmt, RoleBinding, RoleRef, ShowField, UsingItem, WithItem,
 };
 use crate::report::model::{ColumnClauses, StatKind};
 
@@ -320,8 +320,97 @@ fn header_line(i: &str) -> IResult<'_, HeaderLine> {
 
 fn node(i: &str) -> IResult<'_, FlowNode> {
     alt((
-        for_stmt, graph_stmt, list_decl, param_decl, cleanup, request, report, assign,
+        for_stmt,
+        graph_stmt,
+        list_decl,
+        param_decl,
+        cleanup,
+        request,
+        report,
+        assign,
+        branch_stmt,
+        value(FlowNode::Rethrow, kw("RETHROW")),
     ))(i)
+}
+
+fn condition_atom(i: &str) -> IResult<'_, Condition> {
+    alt((
+        delimited(sym('('), condition, sym(')')),
+        map(
+            tuple((
+                str_or_word,
+                preceded(
+                    multispace0,
+                    alt((
+                        value(false, nom::bytes::complete::tag("==")),
+                        value(true, nom::bytes::complete::tag("!=")),
+                    )),
+                ),
+                str_or_word,
+            )),
+            |(left, negate, right)| Condition::Equal {
+                left,
+                right,
+                negate,
+            },
+        ),
+    ))(i)
+}
+
+fn condition_and(i: &str) -> IResult<'_, Condition> {
+    let (i, first) = condition_atom(i)?;
+    let (i, rest) = many0(preceded(kw("AND"), condition_atom))(i)?;
+    Ok((
+        i,
+        rest.into_iter()
+            .fold(first, |a, b| Condition::And(Box::new(a), Box::new(b))),
+    ))
+}
+
+fn condition(i: &str) -> IResult<'_, Condition> {
+    let (i, first) = condition_and(i)?;
+    let (i, rest) = many0(preceded(kw("OR"), condition_and))(i)?;
+    Ok((
+        i,
+        rest.into_iter()
+            .fold(first, |a, b| Condition::Or(Box::new(a), Box::new(b))),
+    ))
+}
+
+fn branch_stmt(i: &str) -> IResult<'_, FlowNode> {
+    let (i, is_try) = alt((value(false, kw("IF")), value(true, kw("TRY"))))(i)?;
+    let (i, predicate) = if is_try {
+        (i, None)
+    } else {
+        let (i, c) = condition(i)?;
+        (i, Some(c))
+    };
+    let (i, body) = many0(preceded(multispace0, node_or_comment))(i)?;
+    let (i, kind, alternative) = if is_try {
+        let (i, _) = kw("RECOVER")(i)?;
+        let (i, error_var) = same_line_ident(i)?;
+        let (i, alternative) = many0(preceded(multispace0, node_or_comment))(i)?;
+        (i, BranchKind::Try { error_var }, alternative)
+    } else {
+        let (i, alternative) = opt(preceded(
+            kw("ELSE"),
+            many0(preceded(multispace0, node_or_comment)),
+        ))(i)?;
+        (
+            i,
+            BranchKind::If(predicate.unwrap()),
+            alternative.unwrap_or_default(),
+        )
+    };
+    let (i, _) = kw("END")(i)?;
+    Ok((
+        i,
+        FlowNode::Branch {
+            kind,
+            body,
+            alternative,
+        },
+    ))
 }
 
 /// `IDENT = <rest of line>` — value is untokenized (may contain `=`, `&`, …).
@@ -1368,6 +1457,8 @@ pub fn opens_block(line: &str) -> bool {
     map(for_head, |_| ())(line).is_ok()
         || map(graph_head, |_| ())(line).is_ok()
         || with_block_head(line).is_ok()
+        || kw("IF")(line).is_ok()
+        || kw("TRY")(line).is_ok()
 }
 
 /// The opener line of a `REPORT REQUEST … WITH … END` block: the statement head
@@ -1391,6 +1482,25 @@ fn with_block_head(i: &str) -> IResult<'_, ()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn conditional_recovery_round_trips_and_rejects_malformed_blocks() {
+        let src = "TRY\nIF \"{{status}}\" == \"400\" AND (\"{{message}}\" != \"\" OR \"x\" == \"y\")\nREQUEST fix\nELSE\nREQUEST warm\nEND\nRECOVER failure\n# preserve this\nRETHROW\nEND\n";
+        let flow = parse_flow(src).unwrap();
+        assert_eq!(
+            parse_flow(&flow.to_text()).unwrap().to_text(),
+            flow.to_text()
+        );
+        for bad in [
+            "IF \"a\" = \"b\"\nEND\n",
+            "TRY\nREQUEST x\nEND\n",
+            "RECOVER err\nEND\n",
+            "IF \"x\" == \"x\"\nELSE\nELSE\nEND\n",
+        ] {
+            assert!(parse_flow(bad).is_err(), "{bad}");
+        }
+        assert!(opens_block("IF \"x\" == \"y\""));
+        assert!(opens_block("TRY"));
+    }
     // --- USING(…) ----------------------------------------------------------
 
     /// The common form: one identifier stating which parameter the request must

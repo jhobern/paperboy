@@ -530,7 +530,17 @@ matrix. Both front-ends behave the same way:
   of a comparison side by side, plus the **total request time** each side has
   spent so far. The footer keeps its rows; this is a second reading of the same
   numbers for the reader who wants the comparison rather than the column, and
-  it fills space a matrix would otherwise leave empty.
+  it fills space a matrix would otherwise leave empty. The HTML export shows
+  the same panel in the same place, the xlsx export beside the matrices on its
+  Metrics sheet, the PDF after the table, and the JSON as a `statistics` key.
+- **What differed from the baseline, in the drill-down.** Clicking a row whose
+  comparison didn't match lists the fields that differed, the baseline's value
+  beside the comparison's (a nested JSON value broken down to the leaves that
+  changed). The HTML export's drill-down has the same section; the xlsx export
+  gathers every row's on a Differences sheet, and the JSON as `differences`.
+- **The HTML export is interactive like the app.** Click a column header to
+  sort (ascending, descending, back to run order), drag its edge to resize,
+  and click the Fixed/Regressed/Correct/Incorrect cards to filter.
 - **A run you walked away from is still announced, and clicking it takes you
   back.** The **Running report… 502/684** line on the menu row keeps counting
   while the report is off screen, and says so when it finishes. Clicking it
@@ -1204,6 +1214,89 @@ See [Durable headless runs](docs/saved-runs.md) for the binding
 schema, revision checks, relocation, progress schema 2, supported flow shapes,
 and setup/cleanup/replay limitations. Ordinary runs and GUI pair-wide reruns
 are unchanged.
+
+#### Conditional requests and recovery
+
+```text
+TRY
+    REQUEST cached_result AS probe
+RECOVER failure
+    IF "{{probe_status}}" == "503"
+        REQUEST fallback
+    ELSE
+        RETHROW
+    END
+END
+REPORT REQUEST final_result
+```
+
+The probe's Hurl captures supply `probe_status` (using the `status` query); only
+values actually captured are available. Hurl checks an implicit `HTTP 200`
+assertion **before** captures. For a recovery probe that needs the status even
+on an error response, use this response section instead:
+
+```hurl
+HTTP *
+[Captures]
+probe_status: status
+[Asserts]
+status == 200
+```
+
+Explicit asserts run after captures. A transport failure produces no response
+captures; a failed capture query can also leave captures unavailable. Do not
+unconditionally capture JSON fields that only exist on error responses.
+Undefined variables are errors, not
+empty strings. `IF` compares interpolated strings with `==` or `!=`;
+`AND` binds more tightly than `OR`, both short-circuit, and parentheses group
+conditions. `ELSE` is optional.
+
+`TRY` stops its body at the first failure and runs `RECOVER name`. The local
+`name` contains the error text. Successful recovery moves the caught error
+to warnings; failed recovery retains both errors. `RETHROW` preserves the
+original failure. Cancellation is not recovered. An interrupted branch leaves
+its row unfinished, not successful; saved `resume` replays that row, including
+any already-sent requests. Already-sent requests and
+captured values are not rolled back; report cells from a failed try body are
+discarded before recovery. Reached `CLEANUP` statements still run.
+
+These are **row-local blocks**: use them inside a loop, not around one.
+Their bodies accept requests, reports, assignments, cleanup and nested
+conditionals/recovery, but not loops, graphs, parameter or list declarations.
+Edit these blocks in the source editor; the node view treats each as an
+atomic block. A dry run does not choose branches from imaginary responses.
+For saved runs, keep the case key independent of branches and place the
+final `REPORT` **after** the branch, as above. HTTP assertions remain explicit:
+an expected 4xx is not automatically an error.
+Saved `IF`/`TRY` must be in leaf blocks (the block that produces one execution),
+not before or after a loop in its parent block. This gives interrupted
+diagnostics an execution owner so a successful resume can clear them.
+
+Column metadata is global: conditional statements writing the same column must
+use identical `TRUTH` templates (including whether a truth is declared).
+Conflicting declarations are rejected before requests are sent; use a common
+per-row template or move the report outside the branch.
+
+Saved input discovery inspects **both** arms without choosing a response-based
+branch. Files used only by recovery must therefore exist at plan time too.
+Capture-, generator-, or branch-dependent input paths and endpoint origins are
+rejected, even when an older environment value exists for that variable.
+Use explicit input bindings for those dependencies.
+
+#### Embedded image size
+
+```text
+PRELUDE_IMAGE_MAX_EDGE=160
+PRELUDE_IMAGE_QUALITY=40
+```
+
+These top-level settings control the embedded copy, not the display size
+specified by `IMAGE(HEIGHT ...)`. Defaults are 640 pixels and JPEG quality 82;
+valid values are a positive pixel count and quality 1–100. Invalid values warn
+and use the default, including values supplied through parameters or variables.
+Saved runs retain the settings. Quality applies when a JPEG is downscaled;
+small images and unsupported codecs retain their original bytes. Resizing is
+best-effort, **not redaction**: omit images from reports that must not contain PII.
 
 #### Dependency graphs
 

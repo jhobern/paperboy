@@ -617,7 +617,7 @@ pub struct BatchRunUpdate {
 /// `[Query]`/`[Captures]`/`[Asserts]`/`[Reports]`/expected-status metadata.
 /// Shared by [`run_content`] and the report interpreter so both assemble the
 /// run entry identically.
-fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
+pub(crate) fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
     let is_multipart = resolved
         .form_fields
         .iter()
@@ -741,7 +741,7 @@ pub fn effective_vars_with<'a>(
 ///
 /// Dropping them also closes the documented oddity that a `variable:` option
 /// leaks into *subsequent* entries of the same file, unlike every other option.
-fn strip_variable_options(entry: &mut HurlEntry) {
+pub(crate) fn strip_variable_options(entry: &mut HurlEntry) {
     entry
         .options
         .retain(|r| !(r.enabled && r.key.trim().eq_ignore_ascii_case("variable")));

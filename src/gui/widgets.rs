@@ -84,6 +84,160 @@ pub fn table_rows<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R
     .inner
 }
 
+pub const ROW_DRAG_WIDTH: f32 = 18.0;
+pub const ROW_DRAG_SPACE: f32 = ROW_DRAG_WIDTH + 8.0;
+
+#[derive(Clone)]
+struct RowIds<T> {
+    ids: Vec<u64>,
+    next: u64,
+    rows: Vec<T>,
+}
+
+#[derive(Clone)]
+struct TableRowDrag {
+    table: egui::Id,
+    row: u64,
+}
+
+/// Stable field identities and deferred moves shared by the request tables.
+/// Only the handle starts a drag; selecting text must never move a row.
+pub struct ReorderRows<T> {
+    id: egui::Id,
+    state: RowIds<T>,
+    movement: Option<(usize, usize)>,
+}
+
+impl<T: Clone + PartialEq + Send + Sync + 'static> ReorderRows<T> {
+    pub fn new(ui: &egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, rows: &[T]) -> Self {
+        let id = ui.id().with(id);
+        let mut state = ui.data(|d| d.get_temp::<RowIds<T>>(id)).unwrap_or(RowIds {
+            ids: Vec::new(),
+            next: 0,
+            rows: Vec::new(),
+        });
+        // Code-view edits and reloads can change the list outside this widget.
+        // Match surviving rows once, without lending a deleted row's undo
+        // history to its replacement. Ordinary cell edits are recorded below.
+        if state.rows != rows {
+            let mut used = vec![false; state.rows.len()];
+            state.ids = rows
+                .iter()
+                .map(|row| {
+                    if let Some(i) = state
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .position(|(i, old)| !used[i] && old == row)
+                    {
+                        used[i] = true;
+                        state.ids[i]
+                    } else {
+                        let id = state.next;
+                        state.next += 1;
+                        id
+                    }
+                })
+                .collect();
+        }
+        Self {
+            id,
+            state,
+            movement: None,
+        }
+    }
+
+    pub fn row_id(&self, i: usize) -> egui::Id {
+        self.id.with(self.state.ids[i])
+    }
+
+    pub fn row(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &GuiTheme,
+        s: &Strings,
+        i: usize,
+        content: impl FnOnce(&mut egui::Ui),
+    ) {
+        // `push_id` still mixes layout position into automatic widget ids.
+        // An explicit scope keeps text-field caret/undo state with the row.
+        let row = ui
+            .scope_builder(egui::UiBuilder::new().id(self.row_id(i)), |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.dnd_drag_source(
+                        ui.id().with("drag"),
+                        TableRowDrag {
+                            table: self.id,
+                            row: self.state.ids[i],
+                        },
+                        |ui| {
+                            ui.add_sized(
+                                [ROW_DRAG_WIDTH, ui.spacing().interact_size.y],
+                                egui::Label::new(
+                                    RichText::new(super::icons::DRAG).color(theme.dim),
+                                ),
+                            );
+                        },
+                    )
+                    .response
+                    .on_hover_text(s.gui_drag_reorder);
+                    content(ui);
+                })
+                .response
+            })
+            .inner;
+        let Some(drag) = egui::DragAndDrop::payload::<TableRowDrag>(ui.ctx()) else {
+            return;
+        };
+        if drag.table != self.id || !row.contains_pointer() {
+            return;
+        }
+        let Some(from) = self.state.ids.iter().position(|id| *id == drag.row) else {
+            return;
+        };
+        let Some(pos) = ui.ctx().pointer_interact_pos() else {
+            return;
+        };
+        let above = pos.y < row.rect.center().y;
+        let before = if above { i } else { i + 1 };
+        if before == from || before == from + 1 {
+            return;
+        }
+        let y = if above {
+            row.rect.top()
+        } else {
+            row.rect.bottom()
+        };
+        ui.painter()
+            .hline(row.rect.x_range(), y, egui::Stroke::new(2.0, theme.accent));
+        if ui.input(|input| input.pointer.any_released()) {
+            self.movement = Some((from, before));
+            egui::DragAndDrop::clear_payload(ui.ctx());
+        }
+    }
+
+    pub fn finish(mut self, ui: &egui::Ui, rows: &mut Vec<T>, remove: Option<usize>) -> bool {
+        let changed = if let Some(i) = remove {
+            rows.remove(i);
+            self.state.ids.remove(i);
+            true
+        } else if let Some((from, before)) = self.movement {
+            let to = if from < before { before - 1 } else { before };
+            let row = rows.remove(from);
+            rows.insert(to, row);
+            let id = self.state.ids.remove(from);
+            self.state.ids.insert(to, id);
+            true
+        } else {
+            false
+        };
+        self.state.rows.clone_from(rows);
+        ui.data_mut(|d| d.insert_temp(self.id, self.state));
+        changed
+    }
+}
+
 /// Draw a control at the height of the fields around it, by taking its own
 /// vertical padding away. A button is otherwise taller than the row it sits in.
 pub fn flat_buttons<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -248,8 +402,8 @@ pub fn wrapping_field_font(
 /// the one below slides into its id, inheriting its caret and its undo history
 /// (egui keys both by widget id). Rows the user can add, delete and reorder —
 /// the `[Gen]` block — pass a stable per-row, per-request id here so a cell's
-/// history follows the row, not the slot. Everything else passes `None` and
-/// keeps the positional id it always had.
+/// history follows the row, not the slot. Other callers derive an id from the
+/// outer layout slot, independent of whether the field needs a scroll area.
 pub fn wrapping_field_font_id(
     ui: &mut egui::Ui,
     width: f32,
@@ -277,17 +431,19 @@ pub fn wrapping_field_font_id(
         .ctx()
         .fonts_mut(|f| f.layout(text.clone(), font_id, color, text_w).size().y)
         + TEXT_EDIT_MARGIN;
+    // The scroll area adds a child UI, so its automatic field id differs from
+    // the short layout's. Choose the id before branching to keep focus and
+    // selection when replacing a long value or resizing the panel.
+    let id = id.unwrap_or_else(|| ui.next_auto_id().with("wrapping-field"));
     let field = |ui: &mut egui::Ui, text: &mut String| {
-        let mut edit = egui::TextEdit::multiline(text)
+        let edit = egui::TextEdit::multiline(text)
+            .id(id)
             .hint_text(hint)
             .text_color(color)
             .desired_width(text_w)
             .desired_rows(1)
             .return_key(None)
             .font(font.clone());
-        if let Some(id) = id {
-            edit = edit.id(id);
-        }
         ui.add(edit)
     };
     flat_fields(ui, |ui| {
@@ -796,7 +952,7 @@ fn kv_widths(ui: &egui::Ui) -> (f32, f32, f32, f32) {
     let check = ui.spacing().interact_size.y + 4.0;
     // The tick, the remove ✕ and the four gaps between the five columns are
     // fixed furniture; only what's left is shared out.
-    let fixed = check + remove_width(ui) + 4.0 * 8.0;
+    let fixed = ROW_DRAG_SPACE + check + remove_width(ui) + 4.0 * 8.0;
     let free = (ui.available_width() - fixed).max(240.0);
     let key = free * 0.28;
     let val = free * 0.38;
@@ -836,11 +992,13 @@ pub fn kv_editor(
     let (check_w, key_w, val_w, desc_w) = kv_widths(ui);
     let row_h = ui.spacing().interact_size.y;
     ui.push_id(id, |ui| {
+        let mut reorder = ReorderRows::new(ui, "rows", rows);
         table_rows(ui, |ui| {
             // Column titles, as in the terminal UI: without them a bare table of
             // text boxes gives no clue that the tick is "send this row" rather
             // than "select".
             table_row(ui, |ui| {
+                ui.allocate_space(egui::vec2(ROW_DRAG_WIDTH, 1.0));
                 // The Phosphor tick, not a bare `\u{2713}`: egui's bundled fonts
                 // have no glyph for it, so the literal rendered as a tofu box.
                 sized_header(ui, theme, super::icons::PASS, check_w);
@@ -851,7 +1009,13 @@ pub fn kv_editor(
                 ui.allocate_space(egui::vec2(remove_width(ui), 1.0));
             });
             for i in 0..rows.len() {
-                table_row(ui, |ui| {
+                let bad_key = crate::hurl::key_problem(&rows[i].key).is_some()
+                    && !rows[i].key.trim().is_empty();
+                let value_warning = crate::hurl::value_problem(&rows[i].value).map(|c| {
+                    s.gui_bad_value_warning
+                        .replace("{char}", &c.escape_debug().to_string())
+                });
+                reorder.row(ui, theme, s, i, |ui| {
                     if ui
                         .add_sized(
                             [check_w, row_h],
@@ -869,28 +1033,29 @@ pub fn kv_editor(
                     // `value_problem`), so it is flagged in the error colour
                     // where it is typed rather than silently dropping off the
                     // wire later.
-                    let bad_key = crate::hurl::key_problem(&rows[i].key).is_some()
-                        && !rows[i].key.trim().is_empty();
-                    let bad_value = crate::hurl::value_problem(&rows[i].value).is_some();
-                    let row_color = if bad_key || bad_value {
-                        theme.err
-                    } else if rows[i].enabled {
+                    let row_color = if rows[i].enabled {
                         theme.text
                     } else {
                         theme.dim
+                    };
+                    let key_color = if bad_key { theme.err } else { row_color };
+                    let value_color = if value_warning.is_some() {
+                        theme.err
+                    } else {
+                        row_color
                     };
                     // Sections with a well-known vocabulary (header and cookie
                     // names) get the caret; a query parameter's name is the
                     // API's business and there is nothing to suggest.
                     let k = if key_options.is_empty() {
-                        sized_key(ui, key_w, &mut rows[i].key, key_hint, row_color)
+                        sized_key(ui, key_w, &mut rows[i].key, key_hint, key_color)
                     } else {
                         suggesting_key(
                             ui,
                             key_w,
                             &mut rows[i].key,
                             key_hint,
-                            row_color,
+                            key_color,
                             key_options,
                             s.gui_suggest_no_matches,
                         )
@@ -903,12 +1068,12 @@ pub fn kv_editor(
                     }
                     // The value is the one cell whose content is the request
                     // itself, so it is the one that wraps rather than truncates.
-                    let v = wrapping_field(ui, val_w, &mut rows[i].value, val_hint, row_color);
+                    let v = wrapping_field(ui, val_w, &mut rows[i].value, val_hint, value_color);
                     if v.changed() {
                         changed = true;
                     }
-                    if bad_value {
-                        v.clone().on_hover_text(s.gui_bad_value_warning);
+                    if let Some(warning) = &value_warning {
+                        v.clone().on_hover_text(warning);
                     }
                     if !rows[i].value.trim().is_empty() {
                         v.context_menu(|ui| {
@@ -950,39 +1115,24 @@ pub fn kv_editor(
                         remove = Some(i);
                     }
                 });
+                if bad_key {
+                    ui.add(
+                        egui::Label::new(RichText::new(s.gui_bad_key_warning).color(theme.err))
+                            .wrap(),
+                    );
+                }
+                if let Some(warning) = value_warning {
+                    ui.add(egui::Label::new(RichText::new(warning).color(theme.err)).wrap());
+                }
             }
         });
+        changed |= reorder.finish(ui, rows, remove);
     });
-    if let Some(i) = remove {
-        rows.remove(i);
-        changed = true;
-    }
     if ui.button(s.gui_add).clicked() {
         rows.push(KvRow::toggled(String::new(), String::new(), true));
         changed = true;
     }
     changed
-}
-
-/// An editable table of `(name, value)` pairs without an enabled flag
-/// (captures, reports). Returns true if anything changed.
-/// A per-row anchor for a `[Gen]` cell's widget id, taken from its *neighbour*
-/// cell's text (the name cell anchors on the expression and vice versa) so that
-/// typing in a cell never changes that cell's own id. Whitespace-only text
-/// doesn't count as content — an empty neighbour falls back to the row index so
-/// two blank rows don't hash to the same id and clash.
-///
-/// `dup` is how many rows above this one have the same neighbour text, and
-/// disambiguates the case the text alone can't: two rows computing `uuid` under
-/// different names have the same expression, so their *name* cells would
-/// otherwise share an id — egui would paint a duplicate-id warning over the
-/// table and the two cells would share one caret and one undo history.
-fn neighbour_key(neighbour: &str, i: usize, dup: usize) -> egui::Id {
-    if neighbour.trim().is_empty() {
-        egui::Id::new(("row", i))
-    } else {
-        egui::Id::new(("neighbour", neighbour, dup))
-    }
 }
 
 /// The `# [Gen]` table: `Name | Expression`, with a function menu on each row
@@ -1012,39 +1162,22 @@ pub fn computed_editor(
 ) -> bool {
     let mut changed = false;
     let mut remove: Option<usize> = None;
-    let key_w = split_key_width(ui, 42.0);
+    let key_w = split_key_width(ui, 42.0 + ROW_DRAG_SPACE);
     let x_w = remove_width(ui);
     let row_h = ui.spacing().interact_size.y;
     ui.push_id(req.with("computed"), |ui| {
+        let mut reorder = ReorderRows::new(ui, "rows", rows);
         table_rows(ui, |ui| {
             table_row(ui, |ui| {
+                ui.allocate_space(egui::vec2(ROW_DRAG_WIDTH, 1.0));
                 sized_header(ui, theme, s.generated_name, key_w);
                 column_header(ui, theme, s.generated_expr);
             });
             for i in 0..rows.len() {
-                table_row(ui, |ui| {
-                    // Per-row, per-request cell ids that follow the *row*, not
-                    // its position, so a row keeps its caret and undo history
-                    // when one above it is deleted and it slides up a slot.
-                    // Each cell is keyed by the *other* cell's text — the name
-                    // cell by the expression, the expression cell by the name —
-                    // so typing in one never moves the id of the cell being
-                    // typed in (which would drop focus every keystroke), while
-                    // still giving the row a content identity that survives a
-                    // deletion. An empty neighbour falls back to the row index
-                    // so two blank rows don't collide.
-                    let name_dup = rows[..i]
-                        .iter()
-                        .filter(|(_, e)| e.trim() == rows[i].1.trim())
-                        .count();
-                    let expr_dup = rows[..i]
-                        .iter()
-                        .filter(|(n, _)| n.trim() == rows[i].0.trim())
-                        .count();
-                    let name_anchor = neighbour_key(&rows[i].1, i, name_dup);
-                    let expr_anchor = neighbour_key(&rows[i].0, i, expr_dup);
-                    let name_id = req.with(("computed-name", name_anchor));
-                    let expr_id = req.with(("computed-expr", expr_anchor));
+                let row_id = reorder.row_id(i);
+                reorder.row(ui, theme, s, i, |ui| {
+                    let name_id = row_id.with("name");
+                    let expr_id = row_id.with("expression");
                     // A name that isn't a variable Hurl will resolve, or a name
                     // left blank beside a filled-in expression, is a row that
                     // vanishes on save (the block only keeps readable rows), so
@@ -1134,11 +1267,8 @@ pub fn computed_editor(
                 });
             }
         });
+        changed |= reorder.finish(ui, rows, remove);
     });
-    if let Some(i) = remove {
-        rows.remove(i);
-        changed = true;
-    }
     if ui.button(s.gui_add).clicked() {
         rows.push((String::new(), String::new()));
         changed = true;
@@ -1721,6 +1851,7 @@ fn arg_names(signature: &str) -> Vec<&str> {
         .collect()
 }
 
+/// An editable table of `(name, value)` pairs without an enabled flag.
 pub fn pair_editor(
     ui: &mut egui::Ui,
     theme: &GuiTheme,
@@ -1737,19 +1868,21 @@ pub fn pair_editor(
     // See `kv_editor`: the value fills only as the last column, so the remove ✕
     // shares the value cell (right-aligned) rather than being its own column,
     // and the key takes ~40% of the free width so it grows too.
-    let key_w = split_key_width(ui, 42.0);
+    let key_w = split_key_width(ui, 42.0 + ROW_DRAG_SPACE);
     let x_w = remove_width(ui);
     let row_h = ui.spacing().interact_size.y;
     ui.push_id(id, |ui| {
+        let mut reorder = ReorderRows::new(ui, "rows", rows);
         table_rows(ui, |ui| {
             // See `kv_editor`: titled columns, minus the enabled tick this
             // table doesn't have, and top-aligned rows so they don't sag.
             table_row(ui, |ui| {
+                ui.allocate_space(egui::vec2(ROW_DRAG_WIDTH, 1.0));
                 sized_header(ui, theme, key_label, key_w);
                 column_header(ui, theme, val_label);
             });
             for i in 0..rows.len() {
-                table_row(ui, |ui| {
+                reorder.row(ui, theme, s, i, |ui| {
                     let k = sized_key(ui, key_w, &mut rows[i].0, key_hint, theme.text);
                     if k.changed() {
                         changed = true;
@@ -1771,11 +1904,8 @@ pub fn pair_editor(
                 });
             }
         });
+        changed |= reorder.finish(ui, rows, remove);
     });
-    if let Some(i) = remove {
-        rows.remove(i);
-        changed = true;
-    }
     if ui.button(s.gui_add).clicked() {
         rows.push((String::new(), String::new()));
         changed = true;
@@ -2008,6 +2138,166 @@ mod tests {
             });
         }
         assert_eq!(value, "text/plain", "Enter must not insert a newline");
+    }
+
+    #[test]
+    fn replacing_a_long_value_keeps_focus_when_the_field_shrinks_and_grows() {
+        for explicit_id in [false, true] {
+            let ctx = egui::Context::default();
+            let long = "Bearer abcdefghijklmnopqrstuvwxyz0123456789".repeat(40);
+            let mut value = long.clone();
+            let mut neighbour = "other field".to_string();
+            let mut draw = |events: Vec<egui::Event>, value: &mut String| {
+                let mut out = None;
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..a_frame()
+                    },
+                    |ui| {
+                        let field = wrapping_field_font_id(
+                            ui,
+                            200.0,
+                            value,
+                            "",
+                            Color32::WHITE,
+                            egui::TextStyle::Body,
+                            explicit_id.then(|| egui::Id::new("explicit-value")),
+                        );
+                        out = Some((
+                            field.id,
+                            field.rect.intersect(ui.clip_rect()),
+                            field.has_focus(),
+                        ));
+                        wrapping_field(ui, 200.0, &mut neighbour, "", Color32::WHITE);
+                    },
+                );
+                out.unwrap()
+            };
+            for _ in 0..3 {
+                draw(vec![], &mut value);
+            }
+            let (id, rect, _) = draw(vec![], &mut value);
+            let mut click = a_frame();
+            click_at(&mut click, rect.min + egui::vec2(12.0, 8.0));
+            assert!(draw(click.events, &mut value).2);
+            let select_all = || egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    command: true,
+                    ..Default::default()
+                },
+            };
+            draw(
+                vec![select_all(), egui::Event::Text("x".into())],
+                &mut value,
+            );
+            assert_eq!(value, "x");
+            let (short_id, short_rect, focused) = draw(vec![], &mut value);
+            assert_eq!(short_id, id, "shrinking must keep the same text field");
+            assert!(focused, "shrinking must not drop focus");
+            assert!(short_rect.height() < rect.height());
+            draw(vec![egui::Event::Text("y".into())], &mut value);
+            assert_eq!(value, "xy", "typing must continue after shrinking");
+            draw(
+                vec![select_all(), egui::Event::Paste(long.clone())],
+                &mut value,
+            );
+            let (long_id, _, focused) = draw(vec![], &mut value);
+            assert_eq!(long_id, id, "growing must keep the same text field");
+            assert!(focused);
+            draw(vec![egui::Event::Text("z".into())], &mut value);
+            assert_eq!(value, format!("{long}z"));
+            assert_eq!(neighbour, "other field");
+        }
+    }
+
+    #[test]
+    fn invalid_header_values_explain_the_character_without_marking_the_key_invalid() {
+        fn texts(shape: &egui::Shape, out: &mut Vec<(String, Color32)>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    if let Some(section) = t.galley.job.sections.first() {
+                        out.push((t.galley.text().to_string(), section.format.color));
+                    }
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        let theme = GuiTheme::from_spec(&crate::theme::default_preset());
+        let s = Strings::for_language(&crate::i18n::Language::English);
+        let ctx = egui::Context::default();
+        theme.apply(&ctx);
+        let long = format!("Bearer {}", "abcdefgh0123456789".repeat(150));
+        let mut rows = vec![KvRow::new("Authorization", &long)];
+        let draw = |rows: &mut Vec<KvRow>| {
+            let mut painted = Vec::new();
+            for _ in 0..3 {
+                let out = ctx.run_ui(a_frame(), |ui| {
+                    kv_editor(
+                        ui,
+                        &theme,
+                        &s,
+                        "headers",
+                        rows,
+                        "",
+                        "",
+                        s.hdr_key,
+                        s.hdr_value,
+                        "",
+                        &mut None,
+                        crate::http::COMMON_HEADERS,
+                    );
+                });
+                painted.clear();
+                for shape in out.shapes {
+                    texts(&shape.shape, &mut painted);
+                }
+            }
+            painted
+        };
+        let valid = draw(&mut rows);
+        assert!(valid.contains(&(long.clone(), theme.text)));
+        assert!(valid.contains(&("Authorization".into(), theme.text)));
+        assert!(
+            !valid
+                .iter()
+                .any(|(text, _)| text.starts_with("Value contains"))
+        );
+        for ch in ['\n', '\r', '\t', '\\'] {
+            rows[0].value = format!("{long}{ch}");
+            let painted = draw(&mut rows);
+            assert!(painted.contains(&("Authorization".into(), theme.text)));
+            assert!(
+                painted
+                    .iter()
+                    .any(|(text, color)| text.starts_with("Bearer ") && *color == theme.err)
+            );
+            let warning = s
+                .gui_bad_value_warning
+                .replace("{char}", &ch.escape_debug().to_string());
+            assert!(
+                painted.contains(&(warning, theme.err)),
+                "the reason must be visible without hovering"
+            );
+        }
+        rows[0].value = "fixed".into();
+        rows[0].key = "Bad:Name".into();
+        let painted = draw(&mut rows);
+        assert!(painted.contains(&("Bad:Name".into(), theme.err)));
+        assert!(painted.contains(&("fixed".into(), theme.text)));
+        assert!(painted.contains(&(s.gui_bad_key_warning.into(), theme.err)));
+        rows[0].key = "Authorization".into();
+        let painted = draw(&mut rows);
+        assert!(painted.contains(&("fixed".into(), theme.text)));
+        assert!(!painted.iter().any(
+            |(text, _)| text.contains("unsupported character") || text == s.gui_bad_key_warning
+        ));
     }
 
     /// A dialog covers the app with a sheet that eats clicks: the menu bar and

@@ -2006,6 +2006,7 @@ fn build_node_chips(
     s: &crate::i18n::Strings,
 ) -> Vec<Chip> {
     match node {
+        FlowNode::Branch { .. } | FlowNode::Rethrow => vec![Chip::base(node.label(), th.accent)],
         // One chip holding the comment verbatim. It has no detachable parts —
         // a comment is text, not a statement with clauses — but it is a block
         // like any other, so it can be dragged, moved and deleted.
@@ -4865,6 +4866,48 @@ fn detail_section(
                     .desired_width(f32::INFINITY),
             );
         }
+        DetailSection::Comparison {
+            baseline,
+            comparison,
+            fields,
+        } => {
+            ui.label(
+                RichText::new(app.strings.report_detail_comparison)
+                    .strong()
+                    .color(th.accent),
+            );
+            egui::Grid::new("pb_detail_comparison")
+                .striped(true)
+                .num_columns(3)
+                .show(ui, |ui| {
+                    // Each side's column names the environment it ran
+                    // against, because "Baseline" alone doesn't tell the
+                    // reader which server gave which answer.
+                    let head = |label: &str, env: &str| {
+                        if env.is_empty() {
+                            label.to_string()
+                        } else {
+                            format!("{label} ({env})")
+                        }
+                    };
+                    ui.label(RichText::new(app.strings.report_detail_field).color(th.dim));
+                    ui.label(
+                        RichText::new(head(app.strings.report_stats_baseline, &baseline))
+                            .color(th.dim),
+                    );
+                    ui.label(
+                        RichText::new(head(app.strings.report_stats_comparison, &comparison))
+                            .color(th.dim),
+                    );
+                    ui.end_row();
+                    for f in &fields {
+                        ui.label(&f.path);
+                        ui.colored_label(th.err, f.baseline.as_deref().unwrap_or("\u{2014}"));
+                        ui.colored_label(th.err, f.candidate.as_deref().unwrap_or("\u{2014}"));
+                        ui.end_row();
+                    }
+                });
+        }
         DetailSection::Diff { header, fields } => {
             ui.label(
                 RichText::new(app.strings.report_detail_changed.replace("{c}", header))
@@ -5189,73 +5232,13 @@ fn statistics_panel(
     columns: &[crate::report::model::OutputColumn],
     extra: &[crate::report::model::SummaryRow],
 ) {
-    use crate::report::model::StatKind;
-
-    // Read from the same result the grid's own footer is built from, so the
-    // panel can never state a different number for the same statistic.
-    let rows = result.summary_rows(columns);
-    let paired: std::collections::HashMap<usize, usize> =
-        result.baseline_column_pairs(columns).into_iter().collect();
-
-    // One block per column that asked for statistics, each line a statistic
-    // with the two sides beside it.
-    let mut blocks: Vec<(String, Vec<(String, String, Option<String>)>)> = Vec::new();
-    for (ci, col) in columns.iter().enumerate() {
-        if col.stats.is_empty() || col.header.starts_with("baseline.") {
-            continue;
-        }
-        let mut lines = Vec::new();
-        for r in &rows {
-            let Some(cell) = r.cells.get(ci).and_then(Option::as_ref) else {
-                continue;
-            };
-            // A distribution row is one line per distinct value, already named
-            // by its own label — a tally, not a pair of measurements.
-            if cell.stat == Some(StatKind::Distribution) {
-                continue;
-            }
-            // A collapsed table pairs through its own `baseline.*` column; a
-            // live one has none, so the re-keyed rows carry the other half.
-            let other = paired
-                .get(&ci)
-                .and_then(|bi| r.cells.get(*bi))
-                .and_then(Option::as_ref)
-                .map(|v| v.text.clone())
-                .or_else(|| {
-                    extra
-                        .iter()
-                        .find(|e| e.label == format!("{} (baseline)", r.label))
-                        .and_then(|e| e.cells.get(ci).and_then(Option::as_ref))
-                        .map(|v| v.text.clone())
-                });
-            lines.push((r.label.clone(), cell.text.clone(), other));
-        }
-        if !lines.is_empty() {
-            blocks.push((col.header.clone(), lines));
-        }
-    }
-
-    // Measured on the grid's own rows rather than the projection's: the
-    // collapse folds the baseline rows away, and they are what the baseline's
-    // total is made of.
-    let (cand_ms, base_ms) = result.side_durations_ms();
-    let totals = (cand_ms > 0.0).then(|| {
-        let unit = duration_unit(cand_ms.max(base_ms.unwrap_or(0.0)));
-        (
-            unit.render(cand_ms),
-            base_ms.map(|ms| unit.render(ms)),
-            unit.suffix,
-        )
-    });
-    if blocks.is_empty() && totals.is_none() {
+    // Built by the same call the HTML export makes, so the two panels pair
+    // the same figures the same way.
+    let stats = crate::report::stats::paired_stats(result, columns, extra);
+    if stats.is_empty() {
         return;
     }
-    // Only a comparison has a second side to state; an ordinary report gets
-    // one column of figures and no heading telling it which side it is.
-    let two_sided = totals.as_ref().is_some_and(|(_, b, _)| b.is_some())
-        || blocks
-            .iter()
-            .any(|(_, l)| l.iter().any(|(_, _, b)| b.is_some()));
+    let two_sided = stats.two_sided();
 
     let base = ui.text_style_height(&egui::TextStyle::Body);
     egui::CollapsingHeader::new(
@@ -5275,73 +5258,34 @@ fn statistics_panel(
                     ui.label(RichText::new(s.report_stats_baseline).color(th.dim));
                     ui.end_row();
                 }
-                for (header, lines) in &blocks {
-                    ui.label(RichText::new(header).color(th.dim).italics());
+                for block in &stats.blocks {
+                    ui.label(RichText::new(&block.header).color(th.dim).italics());
                     ui.end_row();
-                    for (label, cand, other) in lines {
-                        ui.label(RichText::new(format!("   {label}")));
-                        ui.label(RichText::new(cand).strong());
+                    for line in &block.lines {
+                        ui.label(RichText::new(format!("   {}", line.label)));
+                        ui.label(RichText::new(&line.comparison).strong());
                         if two_sided {
-                            ui.label(RichText::new(other.as_deref().unwrap_or("")));
+                            ui.label(RichText::new(line.baseline.as_deref().unwrap_or("")));
                         }
                         ui.end_row();
                     }
                 }
-                if let Some((cand, other, suffix)) = &totals {
+                if let Some(total) = &stats.total {
                     ui.label(
                         RichText::new(s.report_stats_total_time)
                             .color(th.dim)
                             .italics(),
                     );
                     ui.end_row();
-                    ui.label(RichText::new(format!("   {suffix}")));
-                    ui.label(RichText::new(cand).strong());
+                    ui.label(RichText::new(format!("   {}", total.unit)));
+                    ui.label(RichText::new(&total.comparison).strong());
                     if two_sided {
-                        ui.label(RichText::new(other.as_deref().unwrap_or("")));
+                        ui.label(RichText::new(total.baseline.as_deref().unwrap_or("")));
                     }
                     ui.end_row();
                 }
             });
     });
-}
-
-/// The unit a pair of durations is stated in.
-///
-/// Chosen once, from the larger of the two, and then applied to both: the
-/// panel exists to be compared down the row, and two totals in different units
-/// are exactly the comparison the reader has to stop and do by hand.
-struct DurationUnit {
-    per_ms: f64,
-    decimals: usize,
-    suffix: &'static str,
-}
-
-impl DurationUnit {
-    fn render(&self, ms: f64) -> String {
-        format!("{:.*}", self.decimals, ms / self.per_ms)
-    }
-}
-
-fn duration_unit(largest_ms: f64) -> DurationUnit {
-    if largest_ms >= 60_000.0 {
-        DurationUnit {
-            per_ms: 60_000.0,
-            decimals: 1,
-            suffix: "min",
-        }
-    } else if largest_ms >= 1_000.0 {
-        DurationUnit {
-            per_ms: 1_000.0,
-            decimals: 2,
-            suffix: "s",
-        }
-    } else {
-        DurationUnit {
-            per_ms: 1.0,
-            decimals: 0,
-            suffix: "ms",
-        }
-    }
 }
 
 fn confusion_matrix(

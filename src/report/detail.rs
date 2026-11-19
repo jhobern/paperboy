@@ -1,15 +1,16 @@
 //! What a row's drill-down holds: the things too big for a grid cell.
 //!
 //! The grid answers "what happened across the run"; the drill-down answers
-//! "what happened in *this* row" — its pictures at full size, its `DETAIL`
-//! columns in full, and, when the run compared against a baseline, a
-//! field-by-field diff of whichever of them are JSON on both sides.
+//! "what happened in *this* row": which compared fields differed from the
+//! baseline, its pictures at full size, its `DETAIL` columns in full, and,
+//! when the run kept the baseline row, a field-by-field diff of whichever of
+//! those columns are JSON on both sides.
 //!
 //! Deciding *what* goes in the panel lives here rather than in a renderer,
 //! because more than one renderer shows it: the interactive HTML export and the
 //! in-app results views. The selection rules are fiddly (a `DETAIL` column with
 //! an empty value is not worth a heading; a diff of identical JSON is not worth
-//! a table; a row with none of the three should not offer an expander at all)
+//! a table; a row with none of them should not offer an expander at all)
 //! and two copies of them would drift.
 
 use super::jsondiff::FieldDiff;
@@ -64,6 +65,22 @@ pub enum DetailSection<'a> {
         header: &'a str,
         fields: Vec<FieldDiff>,
     },
+    /// Every compared field that differed between the baseline and the
+    /// comparison, read from the row's `Result` cell.
+    ///
+    /// The `Result` cell is one line of JSON that answers "what changed?" but
+    /// is too long to read in a grid cell. This section shows the same answer
+    /// as a table. A field whose value is JSON on both sides is broken down to
+    /// the leaves that moved (`body.checks.face`), so a changed 4 KB response
+    /// shows the one number that differs rather than two copies of the body.
+    /// Only differing entries are listed, because that is all the `Result`
+    /// cell records.
+    Comparison {
+        /// The environment names the two sides ran against.
+        baseline: String,
+        comparison: String,
+        fields: Vec<FieldDiff>,
+    },
 }
 
 /// Everything row `r` has to show in its drill-down, or an empty vector when it
@@ -84,6 +101,11 @@ pub fn sections<'a>(
         return Vec::new();
     };
     let mut out = Vec::new();
+    // First, because it says why the row is a difference, which is usually the
+    // reason a comparison row gets opened.
+    if let Some(cmp) = comparison_section(row) {
+        out.push(cmp);
+    }
     for c in all_columns {
         if let Some(image) = result.images.get(&(r, c.header.clone())) {
             out.push(DetailSection::Image {
@@ -119,6 +141,79 @@ pub fn sections<'a>(
         }
     }
     out
+}
+
+/// The [`DetailSection::Comparison`] for `row`, or `None` when its `Result`
+/// is not a difference (a match, `no baseline`, a dry run, or no comparison
+/// at all).
+///
+/// [`super::compare::compute_result`] writes a difference as
+/// `{"<env> (baseline)": {field: value…}, "<env>": {field: value…}}`. This
+/// parses it back into that shape instead of keeping the baseline row around.
+/// That works for every comparison, including one against a saved snapshot,
+/// and costs a finished result nothing extra to hold.
+pub fn comparison_section(row: &super::model::ReportRow) -> Option<DetailSection<'static>> {
+    use serde_json::Value;
+    let cell = row.cells.get(super::compare::RESULT_COLUMN)?;
+    let Value::Object(sides) = serde_json::from_str::<Value>(cell.trim()).ok()? else {
+        return None;
+    };
+    let (base_key, base) = sides
+        .iter()
+        .find(|(k, _)| k.ends_with(" (baseline)"))
+        .and_then(|(k, v)| Some((k, v.as_object()?)))?;
+    let (cand_key, cand) = sides
+        .iter()
+        .find(|(k, _)| *k != base_key)
+        .and_then(|(k, v)| Some((k, v.as_object()?)))?;
+    let text = |v: &Value| match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut fields = Vec::new();
+    for name in base.keys().chain(cand.keys()) {
+        if !seen.insert(name) {
+            continue;
+        }
+        let (b, c) = (base.get(name), cand.get(name));
+        // A structured value on both sides is broken down to the leaves that
+        // moved; a scalar, or a value that changed shape, is one line.
+        let structured = |v: Option<&Value>| v.is_some_and(|v| v.is_object() || v.is_array());
+        if structured(b) && structured(c) {
+            let leaves: Vec<FieldDiff> = super::jsondiff::diff(b.unwrap(), c.unwrap())
+                .into_iter()
+                .filter(FieldDiff::differs)
+                .map(|f| FieldDiff {
+                    path: if f.path.is_empty() {
+                        name.clone()
+                    } else if f.path.starts_with('[') {
+                        format!("{name}{}", f.path)
+                    } else {
+                        format!("{name}.{}", f.path)
+                    },
+                    ..f
+                })
+                .collect();
+            if !leaves.is_empty() {
+                fields.extend(leaves);
+                continue;
+            }
+        }
+        fields.push(FieldDiff {
+            path: name.clone(),
+            baseline: b.map(text),
+            candidate: c.map(text),
+        });
+    }
+    if fields.is_empty() {
+        return None;
+    }
+    Some(DetailSection::Comparison {
+        baseline: base_key.trim_end_matches(" (baseline)").to_string(),
+        comparison: cand_key.clone(),
+        fields,
+    })
 }
 
 /// How a ground-truthed cell scored and what it was scored against, or `None`
@@ -201,6 +296,59 @@ mod tests {
             r.cells.insert(k.to_string(), v.to_string());
         }
         r
+    }
+
+    /// A row whose comparison differed opens on what differed: each changed
+    /// field once, with a nested value broken down to the leaves that moved.
+    #[test]
+    fn a_differing_comparison_lists_the_fields_that_moved() {
+        let cell = r#"{"prod (baseline)":{"status":"ok","body":{"a":1,"b":[1,2]}},"staging":{"status":"err","body":{"a":1,"b":[1,3]}}}"#;
+        let result = ReportResult {
+            column_order: vec!["Name".into()],
+            rows: vec![row(&[
+                ("Name", "x"),
+                (crate::report::compare::RESULT_COLUMN, cell),
+            ])],
+            ..Default::default()
+        };
+        let cols = [col("Name")];
+        let got = sections(&result, 0, &cols, &[]);
+        let Some(DetailSection::Comparison {
+            baseline,
+            comparison,
+            fields,
+        }) = got.first()
+        else {
+            panic!("the comparison leads the panel: {got:?}");
+        };
+        assert_eq!(
+            (baseline.as_str(), comparison.as_str()),
+            ("prod", "staging")
+        );
+        let paths: Vec<&str> = fields.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"status"), "{paths:?}");
+        assert!(
+            paths.contains(&"body.b[1]"),
+            "only the moved leaf: {paths:?}"
+        );
+        assert!(!paths.iter().any(|p| p.starts_with("body.a")), "{paths:?}");
+    }
+
+    /// A row that matched its baseline has nothing to compare.
+    #[test]
+    fn a_matching_comparison_adds_no_section() {
+        let result = ReportResult {
+            column_order: vec!["Name".into()],
+            rows: vec![row(&[
+                ("Name", "x"),
+                (
+                    crate::report::compare::RESULT_COLUMN,
+                    crate::report::compare::MATCH,
+                ),
+            ])],
+            ..Default::default()
+        };
+        assert!(sections(&result, 0, &[col("Name")], &[]).is_empty());
     }
 
     /// A row with nothing worth drilling into gets no sections, so no renderer

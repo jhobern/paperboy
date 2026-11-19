@@ -1148,7 +1148,7 @@ strings! {
     gui_hint_value => "value", "valeur", "værdi";
     gui_hint_header => "Header", "En-tête", "Header";
     gui_bad_key_warning => "Hurl can't carry this character in a name — the whole collection would fail to load. This row won't be sent until it's renamed.", "Hurl ne peut pas porter ce caractère dans un nom — toute la collection ne se chargerait plus. Cette ligne ne sera pas envoyée tant qu'elle n'est pas renommée.", "Hurl kan ikke bære dette tegn i et navn — hele samlingen ville ikke kunne indlæses. Denne række sendes ikke, før den omdøbes.";
-    gui_bad_value_warning => "Hurl can't carry a newline, tab or backslash in a value. This row won't be sent until it's edited.", "Hurl ne peut pas porter de saut de ligne, de tabulation ni de barre oblique inverse dans une valeur. Cette ligne ne sera pas envoyée tant qu'elle n'est pas modifiée.", "Hurl kan ikke bære linjeskift, tabulator eller omvendt skråstreg i en værdi. Denne række sendes ikke, før den redigeres.";
+    gui_bad_value_warning => "Value contains unsupported character '{char}' (line break, tab or backslash). This row won't be sent until it's removed.", "La valeur contient le caractère non pris en charge « {char} » (saut de ligne, tabulation ou barre oblique inverse). Cette ligne ne sera pas envoyée tant qu'il n'est pas supprimé.", "Værdien indeholder det ikke-understøttede tegn '{char}' (linjeskift, tabulator eller omvendt skråstreg). Denne række sendes ikke, før tegnet fjernes.";
     gui_hint_name => "name", "nom", "navn";
     gui_hint_query => "query", "requête", "forespørgsel";
     gui_hint_description => "note", "note", "note";
@@ -1165,7 +1165,21 @@ strings! {
     // Response viewer.
     gui_error => "Error", "Erreur", "Fejl";
     gui_no_response_yet => "No response yet", "Aucune réponse", "Intet svar endnu";
+    gui_no_http_response => "No HTTP response available.", "Aucune réponse HTTP disponible.", "Intet HTTP-svar tilgængeligt.";
+    gui_last_received_response => "Showing the last HTTP response received.", "Affichage de la dernière réponse HTTP reçue.", "Viser det senest modtagne HTTP-svar.";
+    gui_copy_error => "Copy error", "Copier l'erreur", "Kopiér fejl";
+    gui_copy_error_hint => "Copy the full diagnostic. It may contain sensitive information; review before sharing.", "Copier le diagnostic complet. Il peut contenir des informations sensibles ; vérifiez avant de le partager.", "Kopiér hele fejlbeskrivelsen. Den kan indeholde følsomme oplysninger; gennemgå den før deling.";
     gui_copy => "Copy", "Copier", "Kopiér";
+    gui_copy_as_curl => "Copy as cURL", "Copier en cURL", "Kopiér som cURL";
+    gui_copy_as_curl_hint => "Copy a POSIX-shell command without sending. Includes resolved credentials; computed values are generated now. Hurl assertions and captures are not included.", "Copier une commande pour un shell POSIX sans envoyer la requête. Inclut les identifiants résolus ; les valeurs calculées sont générées maintenant. Les assertions et captures Hurl ne sont pas incluses.", "Kopiér en POSIX-shellkommando uden at sende. Indeholder indlæste legitimationsoplysninger; beregnede værdier genereres nu. Hurl-kontroller og optagelser medtages ikke.";
+    gui_curl_unsupported => "Cannot copy as cURL: '{}' is not supported by the exporter.", "Impossible de copier en cURL : « {} » n'est pas pris en charge par l'exportateur.", "Kan ikke kopiere som cURL: '{}' understøttes ikke af eksportøren.";
+    gui_curl_invalid_request => "Cannot copy as cURL: fix the invalid request fields or conflicting body and form fields first.", "Impossible de copier en cURL : corrigez les champs invalides ou le conflit entre corps et formulaire.", "Kan ikke kopiere som cURL: ret først ugyldige felter eller konflikten mellem brødtekst og formularfelter.";
+    gui_curl_unresolved => "Cannot copy as cURL: unresolved variables: {}.", "Impossible de copier en cURL : variables non résolues : {}.", "Kan ikke kopiere som cURL: uafklarede variabler: {}.";
+    gui_curl_expression => "Hurl expression", "expression Hurl", "Hurl-udtryk";
+    gui_curl_path => "non-UTF-8 file path", "chemin de fichier non UTF-8", "filsti uden UTF-8";
+    gui_curl_head_body => "HEAD with a body", "HEAD avec un corps", "HEAD med brødtekst";
+    gui_curl_form_name => "multipart field name containing =, ; or double quotes", "nom de champ multipart contenant =, ; ou des guillemets doubles", "multipart-feltnavn med =, ; eller dobbelte anførselstegn";
+    gui_curl_nul => "NUL in text body", "caractère NUL dans le corps texte", "NUL i brødtekst";
     gui_copy_body => "Copy body", "Copier le corps", "Kopiér brødtekst";
     gui_compact => "Compact", "Compact", "Kompakt";
     gui_reveal => "Reveal", "Révéler", "Vis";
@@ -1214,6 +1228,8 @@ strings! {
     gui_save_ellipsis => "Save…", "Enregistrer…", "Gem…";
     gui_env_menu_activate => "Activate", "Activer", "Aktivér";
     gui_env_menu_deactivate => "Deactivate", "Désactiver", "Deaktivér";
+    gui_duplicate_env_title => "Duplicate environment: name", "Dupliquer l'environnement : nom", "Dublér miljø: navn";
+    gui_duplicate_env_missing => "The environment to duplicate is no longer loaded.", "L'environnement à dupliquer n'est plus chargé.", "Miljøet, der skal kopieres, er ikke længere indlæst.";
     gui_add_variable => "+ Add variable", "+ Ajouter une variable", "+ Tilføj variabel";
     gui_resolving => "resolving…", "résolution…", "løser…";
     gui_unresolved => "unresolved", "non résolu", "uløst";
@@ -1232,6 +1248,7 @@ strings! {
     // Shared widgets.
     gui_add => "+ Add", "+ Ajouter", "+ Tilføj";
     gui_remove => "Remove", "Supprimer", "Fjern";
+    gui_drag_reorder => "Drag to reorder", "Glisser pour réorganiser", "Træk for at ændre rækkefølgen";
     // Menu bar.
     gui_menu_file => "File", "Fichier", "Fil";
     gui_menu_edit => "Edit", "Édition", "Rediger";
@@ -1551,6 +1568,8 @@ strings! {
     report_detail_title => "Row {n} details", "Détails de la ligne {n}", "Detaljer for række {n}";
     report_detail_close => "Close this row's details", "Fermer les détails de cette ligne", "Luk denne rækkes detaljer";
     report_detail_changed => "{c} — changed fields", "{c} — champs modifiés", "{c} — ændrede felter";
+    report_detail_comparison => "What differed from the baseline", "Différences avec la référence", "Forskelle fra basislinjen";
+    report_detail_field => "Field", "Champ", "Felt";
     report_matrix_caption => "Rows: ground truth. Columns: reported value. {n} scored row(s).", "Lignes\u{a0}: vérité terrain. Colonnes\u{a0}: valeur rapportée. {n} ligne(s) évaluée(s).", "Rækker: sandhed. Kolonner: rapporteret værdi. {n} bedømt(e) række(r).";
     report_matrix_all_matched => "Every scored row matched its ground truth.", "Chaque ligne évaluée correspond à sa vérité terrain.", "Alle bedømte rækker matchede deres sandhed.";
     help_report_matrix_cell => "Show the rows this count is made of", "Afficher les lignes qui composent ce total", "Vis de rækker, dette tal består af";
@@ -1725,6 +1744,7 @@ strings! {
     diag_duplicate_column => "Two columns are both headed '{}' — give each one a distinct name with AS.", "Deux colonnes portent le même titre '{}' — donnez à chacune un nom distinct avec AS.", "To kolonner har begge overskriften '{}' — giv hver af dem et særskilt navn med AS.";
     diag_labels_malformed => "The label setting '{}' declares nothing — write it as 'Name = synonym, synonym'.", "Le réglage d'étiquettes '{}' ne déclare rien — écrivez-le sous la forme 'Nom = synonyme, synonyme'.", "Etiketindstillingen '{}' erklærer ingenting — skriv den som 'Navn = synonym, synonym'.";
     diag_labels_conflict => "'{}' is claimed by both '{}' and '{}' — it counts as '{}'.", "'{}' est revendiqué à la fois par '{}' et '{}' — il compte comme '{}'.", "'{}' hævdes af både '{}' og '{}' — den tælles som '{}'.";
+    diag_branch_truth_conflict => "Column '{}' has conflicting conditional TRUTH declarations. Use the same truth template everywhere, or report outside IF/TRY.", "La colonne '{}' a des déclarations TRUTH conditionnelles incompatibles. Utilisez le même modèle partout ou placez REPORT hors de IF/TRY.", "Kolonnen '{}' har modstridende betingede TRUTH-deklarationer. Brug samme skabelon overalt, eller placer REPORT uden for IF/TRY.";
     diag_truth_empty => "Column '{}' has an empty ground truth, so it will never be scored.", "La colonne '{}' a une vérité terrain vide, elle ne sera donc jamais évaluée.", "Kolonnen '{}' har en tom grundsandhed, så den bliver aldrig vurderet.";
     diag_truth_on_image => "Column '{}' is shown as a picture, so its ground truth compares the address of the picture rather than what it shows.", "La colonne '{}' est affichée comme une image, sa vérité terrain compare donc l'adresse de l'image plutôt que son contenu.", "Kolonnen '{}' vises som et billede, så dens grundsandhed sammenligner billedets adresse frem for det, det viser.";
     diag_environment_unset => "The environment setting is empty — either name an environment or remove the setting.", "Le réglage d'environnement est vide — nommez un environnement ou supprimez le réglage.", "Miljøindstillingen er tom — navngiv et miljø, eller fjern indstillingen.";
@@ -1734,6 +1754,12 @@ strings! {
     diag_no_columns => "This report emits no columns, so it will produce an empty table — attach REPORT to a request to make it one.", "Ce rapport ne produit aucune colonne, il donnera donc un tableau vide — attachez REPORT à une requête pour en créer une.", "Denne rapport udsender ingen kolonner, så den giver en tom tabel — sæt REPORT på en forespørgsel for at lave en.";
     diag_collection_not_loaded => "The collection isn't loaded, so request names can't be checked yet.", "La collection n'est pas chargée, les noms de requêtes ne peuvent donc pas encore être vérifiés.", "Samlingen er ikke indlæst, så forespørgselsnavne kan ikke tjekkes endnu.";
     diag_list_shadowed => "LIST '{}' hides an earlier list of the same name.", "LIST '{}' masque une liste antérieure du même nom.", "LIST '{}' skjuler en tidligere liste med samme navn.";
+    run_conditional_undefined => "IF references undefined variable '{}'.", "IF référence la variable non définie « {} ».", "IF henviser til den udefinerede variabel '{}'.";
+    run_rethrow_outside => "RETHROW requires an active RECOVER block.", "RETHROW nécessite un bloc RECOVER actif.", "RETHROW kræver en aktiv RECOVER-blok.";
+    run_branch_shape => "IF/TRY bodies must be row-local: requests, reports, assignments, CLEANUP, or nested IF/TRY.", "Les blocs IF/TRY doivent rester dans une ligne : requêtes, rapports, affectations, CLEANUP ou IF/TRY imbriqués.", "IF/TRY skal blive inden for én række: forespørgsler, rapporter, tildelinger, CLEANUP eller indlejret IF/TRY.";
+    run_recovered => "Recovered: {}", "Erreur traitée : {}", "Håndteret fejl: {}";
+    diag_image_max_edge_invalid => "PRELUDE_IMAGE_MAX_EDGE is '{}', which is not a whole number of pixels of at least {}; the built-in default is used instead.", "PRELUDE_IMAGE_MAX_EDGE vaut « {} », qui n'est pas un nombre entier de pixels d'au moins {} ; la valeur par défaut intégrée est utilisée à la place.", "PRELUDE_IMAGE_MAX_EDGE er '{}', hvilket ikke er et helt antal pixels på mindst {}; den indbyggede standardværdi bruges i stedet.";
+    diag_image_quality_invalid => "PRELUDE_IMAGE_QUALITY is '{}', which is not a whole number between 1 and 100; the built-in default is used instead.", "PRELUDE_IMAGE_QUALITY vaut « {} », qui n'est pas un nombre entier entre 1 et 100 ; la valeur par défaut intégrée est utilisée à la place.", "PRELUDE_IMAGE_QUALITY er '{}', hvilket ikke er et helt tal mellem 1 og 100; den indbyggede standardværdi bruges i stedet.";
     diag_env_ref_not_in_scope => "ENVS names an environment through '{}', but nothing in scope where the clause is written binds it — declare a PARAM, use a loop variable, or name the environment outright ('{}').", "ENVS désigne un environnement via « {} », mais rien dans la portée où la clause est écrite ne le définit — déclarez un PARAM, utilisez une variable de boucle, ou nommez l'environnement directement (« {} »).", "ENVS navngiver et miljø via '{}', men intet i det omfang, hvor sætningen står, binder det — erklær en PARAM, brug en løkkevariabel, eller navngiv miljøet direkte ('{}').";
     diag_env_ref_default_not_loaded => "ENVS names '{}', which currently means '{}' — an environment that isn't loaded.", "ENVS désigne « {} », qui signifie actuellement « {} » — un environnement qui n'est pas chargé.", "ENVS navngiver '{}', som i øjeblikket betyder '{}' — et miljø, der ikke er indlæst.";
     param_pick_path => "Pick a value for this parameter…", "Choisissez une valeur pour ce paramètre…", "Vælg en værdi til denne parameter…";

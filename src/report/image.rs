@@ -54,6 +54,19 @@ pub struct ImageResolver {
     /// GETs. Local paths and `data:` URIs still resolve, so a dry run of a
     /// file-driven image report still shows its pictures.
     pub offline: bool,
+    /// Longest edge, in pixels, that an embedded picture is scaled down to —
+    /// the effective `PRELUDE_IMAGE_MAX_EDGE`, defaulting to
+    /// [`MAX_EMBED_EDGE`].
+    ///
+    /// Exposed because the right answer depends on what the report is *for*.
+    /// A report that exists to be looked at wants detail; a report over
+    /// thousands of rows of personal documents wants the smallest picture that
+    /// still identifies the case, both to keep the file openable and because a
+    /// recognisable face is a liability in an artefact that gets shared.
+    pub max_edge: u32,
+    /// JPEG quality for a re-encoded picture — the effective
+    /// `PRELUDE_IMAGE_QUALITY`, defaulting to [`JPEG_QUALITY`].
+    pub quality: u8,
     /// Diagnostics worth surfacing in the run log: a value that looked like a
     /// picture but couldn't be turned into one. Silently dropping these would
     /// leave a user staring at a text cell with no idea why.
@@ -72,6 +85,8 @@ impl ImageResolver {
             cache: HashMap::new(),
             total_bytes: 0,
             offline: false,
+            max_edge: MAX_EMBED_EDGE,
+            quality: JPEG_QUALITY,
             notes: Vec::new(),
         }
     }
@@ -147,10 +162,11 @@ impl ImageResolver {
                 .push(format!("value at {value} is not a recognised image format"));
             return None;
         };
-        let (bytes, mime, natural) = match downscale(&bytes, mime, natural) {
-            Some(smaller) => smaller,
-            None => (bytes, mime.to_string(), natural),
-        };
+        let (bytes, mime, natural) =
+            match downscale(&bytes, mime, natural, self.max_edge, self.quality) {
+                Some(smaller) => smaller,
+                None => (bytes, mime.to_string(), natural),
+            };
         Some(ImageData {
             bytes,
             mime,
@@ -170,14 +186,23 @@ impl ImageResolver {
 /// The alternative, embedding the source file untouched, is what made this
 /// necessary: a thousand-row report over 2 MB camera JPEGs produced a file no
 /// browser would open, to show pictures displayed 110 pixels tall.
+///
+/// This is the *default*. A report that needs a different trade-off sets
+/// `PRELUDE_IMAGE_MAX_EDGE` — see [`ImageResolver::max_edge`].
 pub const MAX_EMBED_EDGE: u32 = 640;
 
 /// JPEG quality for a re-encoded picture. High enough that the drill-down view
 /// shows no artefacts at a glance, low enough that the whole point of this
 /// exercise survives.
-const JPEG_QUALITY: u8 = 82;
+///
+/// The default for [`ImageResolver::quality`], overridable with
+/// `PRELUDE_IMAGE_QUALITY`.
+pub const JPEG_QUALITY: u8 = 82;
 
-/// Re-encode a picture no larger than [`MAX_EMBED_EDGE`] on its longest edge.
+/// Image dimensions must be positive.
+pub const MIN_EMBED_EDGE: u32 = 1;
+
+/// Re-encode a picture no larger than `max_edge` on its longest edge.
 ///
 /// Returns `None` — meaning "embed the original untouched" — whenever shrinking
 /// isn't possible or isn't worth it: a picture already within the cap, a format
@@ -187,9 +212,11 @@ fn downscale(
     bytes: &[u8],
     mime: &str,
     natural: (u32, u32),
+    max_edge: u32,
+    quality: u8,
 ) -> Option<(Vec<u8>, String, (u32, u32))> {
     let (w, h) = natural;
-    if w.max(h) <= MAX_EMBED_EDGE || w == 0 || h == 0 {
+    if w.max(h) <= max_edge || w == 0 || h == 0 {
         return None;
     }
     let format = match mime {
@@ -201,7 +228,7 @@ fn downscale(
     // `thumbnail` is a box filter: markedly faster than Lanczos and visually
     // indistinguishable at these ratios, which matters when a run resolves a
     // thousand of them.
-    let scale = f64::from(MAX_EMBED_EDGE) / f64::from(w.max(h));
+    let scale = f64::from(max_edge) / f64::from(w.max(h));
     let (tw, th) = (
         (f64::from(w) * scale).round().max(1.0) as u32,
         (f64::from(h) * scale).round().max(1.0) as u32,
@@ -213,7 +240,7 @@ fn downscale(
     let mime = match format {
         image::ImageFormat::Jpeg => {
             let rgb = small.to_rgb8();
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY)
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
                 .encode_image(&rgb)
                 .ok()?;
             "image/jpeg"
@@ -467,6 +494,75 @@ pub(crate) mod tests {
         let got = r.build("thumb.jpg", small.clone()).unwrap();
         assert_eq!(got.bytes, small);
         assert_eq!(got.natural, (64, 64));
+    }
+
+    /// `PRELUDE_IMAGE_MAX_EDGE` is the reason the cap is a field and not a
+    /// constant: a report over personal documents wants the smallest picture
+    /// that still identifies the case, not the most detailed one.
+    #[test]
+    fn a_configured_edge_decides_the_embedded_size() {
+        let big = noisy_jpeg(1600);
+        let mut r = ImageResolver::new();
+        r.max_edge = 160;
+        let got = r.build("photo.jpg", big).unwrap();
+        assert_eq!(
+            got.natural,
+            (160, 160),
+            "the configured cap, not the built-in one, must decide the size"
+        );
+        assert!(probe(&got.bytes).is_some(), "and it must still be an image");
+    }
+
+    /// The cap is what makes a picture small; a smaller cap must make a
+    /// smaller file, or the setting is decoration.
+    #[test]
+    fn a_smaller_edge_produces_a_smaller_file() {
+        let big = noisy_jpeg(1600);
+        let mut wide = ImageResolver::new();
+        let mut narrow = ImageResolver::new();
+        narrow.max_edge = 160;
+        let large = wide.build("photo.jpg", big.clone()).unwrap();
+        let small = narrow.build("photo.jpg", big).unwrap();
+        assert!(
+            small.bytes.len() < large.bytes.len(),
+            "expected {} < {}",
+            small.bytes.len(),
+            large.bytes.len()
+        );
+    }
+
+    /// Quality trades detail for bytes at a fixed size — the other half of
+    /// getting a thousand-row report under a size limit.
+    #[test]
+    fn a_lower_quality_produces_a_smaller_file_at_the_same_size() {
+        let big = noisy_jpeg(1600);
+        let mut high = ImageResolver::new();
+        let mut low = ImageResolver::new();
+        low.quality = 25;
+        let fine = high.build("photo.jpg", big.clone()).unwrap();
+        let coarse = low.build("photo.jpg", big).unwrap();
+        assert_eq!(
+            coarse.natural, fine.natural,
+            "quality must not change the dimensions"
+        );
+        assert!(
+            coarse.bytes.len() < fine.bytes.len(),
+            "expected {} < {}",
+            coarse.bytes.len(),
+            fine.bytes.len()
+        );
+    }
+
+    /// A picture that is already inside a *raised* cap is still left alone:
+    /// the early return has to read the configured value too, not the default.
+    #[test]
+    fn a_raised_edge_leaves_a_mid_sized_picture_untouched() {
+        let mid = noisy_jpeg(800);
+        let mut r = ImageResolver::new();
+        r.max_edge = 1024;
+        let got = r.build("mid.jpg", mid.clone()).unwrap();
+        assert_eq!(got.bytes, mid, "800 is within a 1024 cap");
+        assert_eq!(got.natural, (800, 800));
     }
 
     /// A format this build has no encoder for keeps its original bytes rather

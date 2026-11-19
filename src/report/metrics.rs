@@ -20,6 +20,7 @@ use super::model::{OutputColumn, ReportResult, StatValue, SummaryRow, Verdict};
 /// a spreadsheet by — so they are English in every language, and the writers
 /// (which carry no `Strings` at all) can emit them unaided.
 pub const COMPARED_LABEL: &str = "Compared";
+pub const CORRECT_LABEL: &str = "Correct";
 pub const INCORRECT_LABEL: &str = "Incorrect";
 pub const ACCURACY_LABEL: &str = "Accuracy";
 pub const FIXED_LABEL: &str = "Fixed";

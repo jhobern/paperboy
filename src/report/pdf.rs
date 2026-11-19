@@ -340,6 +340,15 @@ struct Row<'a> {
     /// Reversed out of a dark band. Only the repeated header row is — a bold
     /// footer on the same band would read as a second set of column names.
     band: bool,
+    /// Column widths of its own, for the summary pages' small tables (a
+    /// confusion matrix, the statistics) that don't share the report's
+    /// columns. `None` is the report table's widths.
+    widths: Option<Vec<f64>>,
+    /// A confusion-matrix cell's heat shade, and whether its text flips to
+    /// white on it.
+    heat: Vec<Option<([u8; 3], bool)>>,
+    /// Ruled like a table row. A summary page's heading is not.
+    grid: bool,
 }
 
 /// A page's worth of laid-out rows.
@@ -409,6 +418,32 @@ impl<'a> Layout<'a> {
             title: first,
         });
 
+        // The summary the app shows beside its table — the confusion matrices
+        // and the paired statistics — on pages of its own after it. They go
+        // after rather than before so the first page is still the report, and
+        // on fresh pages rather than under the footer so they don't inherit a
+        // repeated column header that has nothing to do with them.
+        let summary = self.summary_rows();
+        if !summary.is_empty() {
+            let mut current: Vec<Row<'a>> = Vec::new();
+            let mut y = self.body_top(false);
+            for row in summary {
+                if y - row.height < body_bottom && !current.is_empty() {
+                    pages.push(Page {
+                        rows: std::mem::take(&mut current),
+                        title: false,
+                    });
+                    y = self.body_top(false);
+                }
+                y -= row.height;
+                current.push(row);
+            }
+            pages.push(Page {
+                rows: current,
+                title: false,
+            });
+        }
+
         Doc {
             title: self.title,
             widths: self.widths,
@@ -422,6 +457,119 @@ impl<'a> Layout<'a> {
     fn body_top(&self, first: bool) -> f64 {
         let _ = first;
         PAGE_H - MARGIN - TITLE_SIZE * 1.6
+    }
+
+    /// The summary pages' rows: a heat-shaded table per confusion matrix,
+    /// then the paired statistics, each under a heading. Empty when the
+    /// report has neither.
+    fn summary_rows(&self) -> Vec<Row<'a>> {
+        let mut out = Vec::new();
+        let page_w = PAGE_W - 2.0 * MARGIN;
+        let fit = |mut widths: Vec<f64>| {
+            let total: f64 = widths.iter().sum();
+            if total > page_w {
+                for w in &mut widths {
+                    *w *= page_w / total;
+                }
+            }
+            widths
+        };
+        let heading = |text: &str| -> Row<'a> {
+            let mut row = small_row(vec![text.to_string()], vec![page_w], true);
+            row.grid = false;
+            // A blank line above, so consecutive tables don't run together.
+            if let Some(Cell::Text(lines)) = row.cells.first_mut() {
+                lines.insert(0, String::new());
+            }
+            row.height = row_height(&row.cells);
+            row
+        };
+        if let Some(metrics) = self.result.metrics(self.columns, self.header) {
+            for m in &metrics.columns {
+                let Some(matrix) = &m.matrix else { continue };
+                // The heading is ASCII, like the title: the built-in font
+                // metrics cover nothing else.
+                out.push(heading(&format!(
+                    "{} - rows: ground truth, columns: reported value ({} scored)",
+                    m.header,
+                    matrix.total()
+                )));
+                let widths = fit(std::iter::once(110.0)
+                    .chain(matrix.axis.iter().map(|_| 60.0))
+                    .collect());
+                let mut head = small_row(
+                    std::iter::once(String::new())
+                        .chain(matrix.axis.iter().cloned())
+                        .collect(),
+                    widths.clone(),
+                    true,
+                );
+                head.band = true;
+                out.push(head);
+                let max = matrix.max();
+                for (t, label) in matrix.axis.iter().enumerate() {
+                    let mut row = small_row(
+                        std::iter::once(label.clone())
+                            .chain(matrix.counts[t].iter().map(|n| n.to_string()))
+                            .collect(),
+                        widths.clone(),
+                        false,
+                    );
+                    row.heat = std::iter::once(None)
+                        .chain(
+                            matrix.counts[t]
+                                .iter()
+                                .map(|n| Some(super::metrics::heat_rgb(*n, max))),
+                        )
+                        .collect();
+                    out.push(row);
+                }
+            }
+        }
+        let stats = super::stats::paired_stats(self.result, self.columns, &[]);
+        if !stats.is_empty() {
+            let two = stats.two_sided();
+            out.push(heading("Statistics"));
+            let widths = if two {
+                vec![160.0, 90.0, 90.0]
+            } else {
+                vec![160.0, 90.0]
+            };
+            if two {
+                let mut head = small_row(
+                    vec![String::new(), "Comparison".into(), "Baseline".into()],
+                    widths.clone(),
+                    true,
+                );
+                head.band = true;
+                out.push(head);
+            }
+            let line = |label: &str, cand: &str, base: Option<&str>| {
+                let mut cells = vec![label.to_string(), cand.to_string()];
+                if two {
+                    cells.push(base.unwrap_or("").to_string());
+                }
+                small_row(cells, widths.clone(), false)
+            };
+            let block = |text: &str| {
+                let mut cells = vec![text.to_string(), String::new()];
+                if two {
+                    cells.push(String::new());
+                }
+                small_row(cells, widths.clone(), true)
+            };
+            for b in &stats.blocks {
+                out.push(block(&b.header));
+                for l in &b.lines {
+                    out.push(line(&l.label, &l.comparison, l.baseline.as_deref()));
+                }
+            }
+            if let Some(t) = &stats.total {
+                out.push(block("Total request time"));
+                out.push(line(t.unit, &t.comparison, t.baseline.as_deref()));
+            }
+        }
+        out
     }
 
     /// The repeated header row.
@@ -451,6 +599,9 @@ impl<'a> Layout<'a> {
             height,
             bold: true,
             band: false,
+            widths: None,
+            heat: Vec::new(),
+            grid: true,
         }
     }
 
@@ -486,7 +637,30 @@ impl<'a> Layout<'a> {
             height,
             bold: false,
             band: false,
+            widths: None,
+            heat: Vec::new(),
+            grid: true,
         }
+    }
+}
+
+/// A row of text cells for one of the summary pages' own small tables.
+fn small_row<'a>(values: Vec<String>, widths: Vec<f64>, bold: bool) -> Row<'a> {
+    let cells: Vec<Cell<'a>> = values
+        .iter()
+        .zip(&widths)
+        .map(|(v, w)| Cell::Text(wrap(v, w - 2.0 * CELL_PAD, bold, FONT_SIZE)))
+        .collect();
+    let height = row_height(&cells);
+    Row {
+        tints: vec![None; cells.len()],
+        cells,
+        height,
+        bold,
+        band: false,
+        widths: Some(widths),
+        heat: Vec::new(),
+        grid: true,
     }
 }
 
@@ -631,14 +805,25 @@ fn page_content(
         let top = y;
         y -= row.height;
         let mut x = MARGIN;
+        let widths = row.widths.as_deref().unwrap_or(doc.widths);
         for (i, cell) in row.cells.iter().enumerate() {
-            let w = doc.widths.get(i).copied().unwrap_or(MIN_COL_W);
+            let w = widths.get(i).copied().unwrap_or(MIN_COL_W);
+            let heat = row.heat.get(i).copied().flatten();
             // Fills first, so nothing is painted over text: the header band,
             // then a tinted cell's own background.
             if row.band {
                 c.push_str(&format!(
                     "{HEAD_FILL} {HEAD_FILL} {HEAD_FILL} rg {x:.2} {:.2} {w:.2} {:.2} re f\n",
                     y, row.height
+                ));
+            } else if let Some(([r, g, b], _)) = heat {
+                c.push_str(&format!(
+                    "{:.3} {:.3} {:.3} rg {x:.2} {:.2} {w:.2} {:.2} re f\n",
+                    f64::from(r) / 255.0,
+                    f64::from(g) / 255.0,
+                    f64::from(b) / 255.0,
+                    y,
+                    row.height
                 ));
             } else if let Some(t) = row.tints.get(i).copied().flatten() {
                 let (r, g, b) = match t {
@@ -654,7 +839,8 @@ fn page_content(
             match cell {
                 Cell::Text(lines) => {
                     let font = if row.bold { "F2" } else { "F1" };
-                    let grey = if row.band { 1.0 } else { 0.0 };
+                    let hot = heat.is_some_and(|(_, hot)| hot);
+                    let grey = if row.band || hot { 1.0 } else { 0.0 };
                     c.push_str(&format!(
                         "{grey} {grey} {grey} rg BT /{font} {FONT_SIZE} Tf\n"
                     ));
@@ -688,13 +874,16 @@ fn page_content(
         // One line under every row, and one down each column edge: enough rule
         // to follow a wide row across the page without the table becoming a
         // cage of ink.
+        if !row.grid {
+            continue;
+        }
         c.push_str(&format!("{GRID_GREY} G 0.4 w\n"));
         c.push_str(&format!(
             "{MARGIN:.2} {y:.2} m {:.2} {y:.2} l S\n",
-            MARGIN + doc.widths.iter().sum::<f64>()
+            MARGIN + widths.iter().sum::<f64>()
         ));
         let mut vx = MARGIN;
-        for w in doc.widths {
+        for w in widths {
             c.push_str(&format!("{vx:.2} {top:.2} m {vx:.2} {y:.2} l S\n"));
             vx += w;
         }
@@ -1236,6 +1425,74 @@ mod tests {
         let bytes = pdf(&res, &header);
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("(200) Tj"), "the mean is in the document");
+    }
+
+    /// The statistics the app shows beside its table get a page of their own
+    /// after it, so the first page is still the report.
+    #[test]
+    fn the_statistics_follow_the_table_on_their_own_page() {
+        let mut res = ReportResult {
+            column_order: vec!["Time".into()],
+            rows: vec![row(&[("Time", "100")]), row(&[("Time", "300")])],
+            ..Default::default()
+        };
+        res.no_match_marker = String::new();
+        let mut header = Header::default();
+        header
+            .lines
+            .push(crate::report::flow::HeaderLine::Directive {
+                key: "columns".into(),
+                value: "Time STATISTICS(MEAN)".into(),
+            });
+        let text = String::from_utf8_lossy(&pdf(&res, &header)).into_owned();
+        assert!(text.contains("/Count 2"), "a second page: {text}");
+        assert!(text.contains("(Statistics) Tj"), "under its heading");
+        let plain = String::from_utf8_lossy(&pdf(&result(1), &Header::default())).into_owned();
+        assert!(plain.contains("/Count 1"), "no summary page without one");
+    }
+
+    /// A confusion matrix is drawn as a heat-shaded table, as in the app.
+    #[test]
+    fn a_confusion_matrix_is_drawn_after_the_table() {
+        use crate::report::model::Verdict;
+        let mut res = ReportResult {
+            column_order: vec!["Verdict".into()],
+            rows: vec![row(&[("Verdict", "pass")]), row(&[("Verdict", "pass")])],
+            ..Default::default()
+        };
+        res.verdicts.insert((0, "Verdict".into()), Verdict::Correct);
+        res.verdicts
+            .insert((1, "Verdict".into()), Verdict::Incorrect);
+        res.truths.insert((0, "Verdict".into()), "pass".into());
+        res.truths.insert((1, "Verdict".into()), "fail".into());
+        res.column_truths
+            .insert("Verdict".into(), "{{ expected }}".into());
+        let header = Header {
+            lines: vec![
+                crate::report::flow::HeaderLine::Directive {
+                    key: "labels".into(),
+                    value: "Pass = pass".into(),
+                },
+                crate::report::flow::HeaderLine::Directive {
+                    key: "labels".into(),
+                    value: "Fail = fail".into(),
+                },
+            ],
+        };
+        let text = String::from_utf8_lossy(&pdf(&res, &header)).into_owned();
+        assert!(
+            text.contains("(Verdict - rows: ground truth, columns: reported value"),
+            "the matrix has its heading: {text}"
+        );
+        // The busiest cell is the darkest shade of the ramp.
+        let ([r, g, b], _) = crate::report::metrics::heat_rgb(1, 1);
+        let fill = format!(
+            "{:.3} {:.3} {:.3} rg",
+            f64::from(r) / 255.0,
+            f64::from(g) / 255.0,
+            f64::from(b) / 255.0
+        );
+        assert!(text.contains(&fill), "a heat-shaded cell: {text}");
     }
 
     /// A `DETAIL` column leaves the table: paper has no click, and a drill-down

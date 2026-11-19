@@ -451,6 +451,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
 
     let mut changed = false;
     let mut send = false;
+    let mut copy_curl = false;
     // A right-click "Extract to parameter…" anywhere in the editor lands here
     // and is turned into a dialog below, once the borrow of the entry the menu
     // was drawn over has ended.
@@ -473,16 +474,22 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         let url_hint = app.strings.gui_hint_url;
         ui.horizontal(|ui| {
             ui.label(RichText::new(name_label).color(theme.dim));
+            let copy_w = widgets::button_width(ui, app.strings.gui_copy_as_curl);
+            let name_w = (ui.available_width() - copy_w - ui.spacing().item_spacing.x).max(60.0);
             let name = widgets::flat_fields(ui, |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut entry.title)
-                        .desired_width(f32::INFINITY)
+                        .desired_width(name_w)
                         .hint_text(name_label),
                 )
             });
             if name.changed() {
                 changed = true;
             }
+            copy_curl = ui
+                .button(app.strings.gui_copy_as_curl)
+                .on_hover_text(app.strings.gui_copy_as_curl_hint)
+                .clicked();
         });
         ui.add_space(2.0);
         ui.horizontal(|ui| {
@@ -792,6 +799,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         let col = &mut app.session.collections[ci];
         col.entries[sel].mark_edited();
         col.invalidate_request_json();
+    }
+    if copy_curl {
+        super::curl::copy(app, ui.ctx(), ci, sel);
     }
     if send {
         app.session.collections[ci].selected_entry = sel;
@@ -1164,15 +1174,20 @@ fn draw_section(
                 ui.add_space(4.0);
             }
             if form_mode {
-                if form_editor(
-                    ui,
-                    theme,
-                    st,
-                    &mut entry.form_fields,
-                    browse,
-                    ex_label,
-                    extract,
-                ) {
+                if ui
+                    .push_id(("form", req), |ui| {
+                        form_editor(
+                            ui,
+                            theme,
+                            st,
+                            &mut entry.form_fields,
+                            browse,
+                            ex_label,
+                            extract,
+                        )
+                    })
+                    .inner
+                {
                     changed = true;
                 }
             } else {
@@ -1281,7 +1296,12 @@ fn draw_section(
         }
         EditorSection::Asserts => {
             ui.label(RichText::new(st.gui_response_assertions).color(theme.dim));
-            if assert_editor(ui, theme, st, &mut entry.asserts) {
+            if ui
+                .push_id(("asserts", req), |ui| {
+                    assert_editor(ui, theme, st, &mut entry.asserts)
+                })
+                .inner
+            {
                 changed = true;
             }
             ui.add_space(6.0);
@@ -1335,6 +1355,7 @@ fn assert_editor(
 ) -> bool {
     let mut changed = false;
     let mut remove = None;
+    let mut reorder = widgets::ReorderRows::new(ui, "assert_rows", asserts);
     // Reserve the ✕'s width and give the field the rest, rather than laying the
     // row out right-to-left (see `pair_editor`). A right-to-left child region
     // takes the whole remaining height of the panel and centres its content in
@@ -1346,7 +1367,7 @@ fn assert_editor(
     let row_h = ui.spacing().interact_size.y;
     widgets::table_rows(ui, |ui| {
         for i in 0..asserts.len() {
-            widgets::table_row(ui, |ui| {
+            reorder.row(ui, theme, s, i, |ui| {
                 let val_w = (ui.available_width() - x_w - 8.0).max(40.0);
                 let r = widgets::wrapping_field_font(
                     ui,
@@ -1371,10 +1392,7 @@ fn assert_editor(
             });
         }
     });
-    if let Some(i) = remove {
-        asserts.remove(i);
-        changed = true;
-    }
+    changed |= reorder.finish(ui, asserts, remove);
     if ui.button(s.gui_add_assert).clicked() {
         asserts.push(String::new());
         changed = true;
@@ -1394,12 +1412,13 @@ fn form_editor(
 ) -> bool {
     let mut changed = false;
     let mut remove = None;
+    let mut reorder = widgets::ReorderRows::new(ui, "form_rows", fields);
     // Explicit column widths (not a `ui.horizontal` that lets each cell take
     // what it likes) keep every column aligned across rows: the kind ComboBox
     // is taller than the text cells, so laying each row out freely let the
     // dropdowns and values drift down the further right they sat. The key gets
     // ~40% of the free width — see `widgets::split_key_width`.
-    let key_w = super::widgets::split_key_width(ui, 160.0);
+    let key_w = super::widgets::split_key_width(ui, 160.0 + widgets::ROW_DRAG_SPACE);
     let kind_w = 80.0;
     let check_w = ui.spacing().interact_size.y + 4.0;
     let x_w = super::widgets::remove_width(ui);
@@ -1407,136 +1426,141 @@ fn form_editor(
     let browse_w = super::widgets::button_width(ui, s.gui_browse);
     super::widgets::table_rows(ui, |ui| {
         for i in 0..fields.len() {
-            super::widgets::table_row(ui, |ui| {
-                if ui.checkbox(&mut fields[i].enabled, "").changed() {
-                    changed = true;
-                }
-                // Grey a disabled form field's key/value so it reads as inactive
-                // (it isn't sent), matching the terminal UI.
-                let row_color = if fields[i].enabled {
-                    theme.text
-                } else {
-                    theme.dim
-                };
-                if super::widgets::sized_key(
-                    ui,
-                    key_w,
-                    &mut fields[i].key,
-                    s.gui_hint_field,
-                    row_color,
-                )
-                .changed()
-                {
-                    changed = true;
-                }
-                // Kind picker.
-                let mut kind = fields[i].kind;
-                egui::ComboBox::from_id_salt(("formkind", i))
-                    .selected_text(match kind {
-                        FormFieldKind::Text => s.gui_kind_text,
-                        FormFieldKind::File => s.gui_kind_file,
-                        FormFieldKind::Base64File => s.gui_kind_base64,
-                    })
-                    .width(kind_w)
-                    .show_ui(ui, |ui| {
-                        for (k, label) in [
-                            (FormFieldKind::Text, s.gui_kind_text),
-                            (FormFieldKind::File, s.gui_kind_file),
-                            (FormFieldKind::Base64File, s.gui_kind_base64),
-                        ] {
-                            if super::widgets::selectable(ui, kind == k, label).clicked() {
-                                kind = k;
+            reorder.row(ui, theme, s, i, |ui| {
+                ui.vertical(|ui| {
+                    super::widgets::table_row(ui, |ui| {
+                        if ui.checkbox(&mut fields[i].enabled, "").changed() {
+                            changed = true;
+                        }
+                        // Grey a disabled form field's key/value so it reads as inactive
+                        // (it isn't sent), matching the terminal UI.
+                        let row_color = if fields[i].enabled {
+                            theme.text
+                        } else {
+                            theme.dim
+                        };
+                        if super::widgets::sized_key(
+                            ui,
+                            key_w,
+                            &mut fields[i].key,
+                            s.gui_hint_field,
+                            row_color,
+                        )
+                        .changed()
+                        {
+                            changed = true;
+                        }
+                        // Kind picker.
+                        let mut kind = fields[i].kind;
+                        egui::ComboBox::from_id_salt("formkind")
+                            .selected_text(match kind {
+                                FormFieldKind::Text => s.gui_kind_text,
+                                FormFieldKind::File => s.gui_kind_file,
+                                FormFieldKind::Base64File => s.gui_kind_base64,
+                            })
+                            .width(kind_w)
+                            .show_ui(ui, |ui| {
+                                for (k, label) in [
+                                    (FormFieldKind::Text, s.gui_kind_text),
+                                    (FormFieldKind::File, s.gui_kind_file),
+                                    (FormFieldKind::Base64File, s.gui_kind_base64),
+                                ] {
+                                    if super::widgets::selectable(ui, kind == k, label).clicked() {
+                                        kind = k;
+                                        changed = true;
+                                    }
+                                }
+                            });
+                        fields[i].kind = kind;
+                        let is_file =
+                            matches!(kind, FormFieldKind::File | FormFieldKind::Base64File);
+                        let hint = match kind {
+                            FormFieldKind::Text => s.gui_hint_value,
+                            _ => s.gui_hint_file_path,
+                        };
+                        // The value fills what the ✕ (and, for a path, Browse) leave.
+                        let mut spare = ui.available_width() - x_w - 8.0;
+                        if is_file {
+                            spare -= browse_w + 8.0;
+                        }
+                        // A form value is often a path or a long token, so it
+                        // wraps rather than hiding its tail.
+                        let val = super::widgets::wrapping_field(
+                            ui,
+                            spare.max(40.0),
+                            &mut fields[i].value,
+                            hint,
+                            row_color,
+                        );
+                        if val.changed() {
+                            changed = true;
+                        }
+                        // A form row's value *is* the path — the kind and content-type
+                        // live in their own columns — so there is nothing to select
+                        // within it and the whole cell is what gets extracted.
+                        extract_menu(
+                            &val,
+                            ex_label,
+                            ExtractTarget::FormField(i),
+                            &fields[i].value,
+                            false,
+                            extract,
+                        );
+                        super::widgets::flat_buttons(ui, |ui| {
+                            // File/Base64 values are paths — offer a native file picker
+                            // (the terminal UI has its in-app browser for the same).
+                            if is_file
+                                && ui
+                                    .add_sized([browse_w, row_h], egui::Button::new(s.gui_browse))
+                                    .clicked()
+                            {
+                                // Recorded rather than opened: the picker needs `app`,
+                                // which the section body has already borrowed mutably.
+                                // See `super::filepick`.
+                                *browse = Some(i);
+                            }
+                            if ui
+                                .add_sized(
+                                    [x_w, row_h],
+                                    egui::Button::new(
+                                        RichText::new(super::icons::CLOSE).color(theme.err),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                remove = Some(i);
+                            }
+                        });
+                    });
+                    if fields[i].kind == FormFieldKind::Base64File {
+                        super::widgets::table_row(ui, |ui| {
+                            ui.add_space(check_w);
+                            ui.add_sized(
+                                [key_w, row_h],
+                                egui::Label::new(
+                                    RichText::new(s.gui_base64_prefix).color(theme.dim).small(),
+                                ),
+                            );
+                            ui.add_space(kind_w);
+                            let mut prefix = fields[i].base64_prefix.clone().unwrap_or_default();
+                            let w = (ui.available_width() - x_w - 8.0).max(40.0);
+                            if super::widgets::wrapping_field(ui, w, &mut prefix, "", theme.text)
+                                .changed()
+                            {
+                                fields[i].base64_prefix = if prefix.is_empty() {
+                                    None
+                                } else {
+                                    Some(prefix)
+                                };
                                 changed = true;
                             }
-                        }
-                    });
-                fields[i].kind = kind;
-                let is_file = matches!(kind, FormFieldKind::File | FormFieldKind::Base64File);
-                let hint = match kind {
-                    FormFieldKind::Text => s.gui_hint_value,
-                    _ => s.gui_hint_file_path,
-                };
-                // The value fills what the ✕ (and, for a path, Browse) leave.
-                let mut spare = ui.available_width() - x_w - 8.0;
-                if is_file {
-                    spare -= browse_w + 8.0;
-                }
-                // A form value is often a path or a long token, so it
-                // wraps rather than hiding its tail.
-                let val = super::widgets::wrapping_field(
-                    ui,
-                    spare.max(40.0),
-                    &mut fields[i].value,
-                    hint,
-                    row_color,
-                );
-                if val.changed() {
-                    changed = true;
-                }
-                // A form row's value *is* the path — the kind and content-type
-                // live in their own columns — so there is nothing to select
-                // within it and the whole cell is what gets extracted.
-                extract_menu(
-                    &val,
-                    ex_label,
-                    ExtractTarget::FormField(i),
-                    &fields[i].value,
-                    false,
-                    extract,
-                );
-                super::widgets::flat_buttons(ui, |ui| {
-                    // File/Base64 values are paths — offer a native file picker
-                    // (the terminal UI has its in-app browser for the same).
-                    if is_file
-                        && ui
-                            .add_sized([browse_w, row_h], egui::Button::new(s.gui_browse))
-                            .clicked()
-                    {
-                        // Recorded rather than opened: the picker needs `app`,
-                        // which the section body has already borrowed mutably.
-                        // See `super::filepick`.
-                        *browse = Some(i);
-                    }
-                    if ui
-                        .add_sized(
-                            [x_w, row_h],
-                            egui::Button::new(RichText::new(super::icons::CLOSE).color(theme.err)),
-                        )
-                        .clicked()
-                    {
-                        remove = Some(i);
+                        });
                     }
                 });
             });
-            if fields[i].kind == FormFieldKind::Base64File {
-                super::widgets::table_row(ui, |ui| {
-                    ui.add_space(check_w);
-                    ui.add_sized(
-                        [key_w, row_h],
-                        egui::Label::new(
-                            RichText::new(s.gui_base64_prefix).color(theme.dim).small(),
-                        ),
-                    );
-                    ui.add_space(kind_w);
-                    let mut prefix = fields[i].base64_prefix.clone().unwrap_or_default();
-                    let w = (ui.available_width() - x_w - 8.0).max(40.0);
-                    if super::widgets::wrapping_field(ui, w, &mut prefix, "", theme.text).changed()
-                    {
-                        fields[i].base64_prefix = if prefix.is_empty() {
-                            None
-                        } else {
-                            Some(prefix)
-                        };
-                        changed = true;
-                    }
-                });
-            }
         }
     });
-    if let Some(i) = remove {
-        fields.remove(i);
-        changed = true;
-    }
+    changed |= reorder.finish(ui, fields, remove);
     if ui.button(s.gui_add_field).clicked() {
         fields.push(FormField {
             enabled: true,
@@ -2997,13 +3021,22 @@ mod computed_cell_undo_tests {
     pub(super) struct Harness {
         ctx: egui::Context,
         t: f64,
+        copied: Vec<String>,
     }
 
     impl Harness {
         pub(super) fn new() -> Self {
             let ctx = egui::Context::default();
             GuiTheme::from_spec(&crate::theme::default_preset()).apply(&ctx);
-            Self { ctx, t: 0.0 }
+            Self {
+                ctx,
+                t: 0.0,
+                copied: Vec::new(),
+            }
+        }
+
+        pub(super) fn focused(&self) -> Option<egui::Id> {
+            self.ctx.memory(|m| m.focused())
         }
 
         /// One frame, `dt` seconds after the last (egui's text undoer only
@@ -3025,6 +3058,11 @@ mod computed_cell_undo_tests {
                 ..Default::default()
             };
             let out = self.ctx.run_ui(input, |u| super::ui(app, u));
+            for command in &out.platform_output.commands {
+                if let egui::OutputCommand::CopyText(text) = command {
+                    self.copied.push(text.clone());
+                }
+            }
             placed(&out.shapes)
         }
 
@@ -3078,6 +3116,47 @@ mod computed_cell_undo_tests {
 
     fn rows(app: &GuiApp) -> Vec<(String, String)> {
         app.session.collections[0].entries[0].generators.clone()
+    }
+
+    #[test]
+    fn copy_as_curl_copies_selected_request_without_sending_or_mutating_it() {
+        let mut app = app_with_rows(&[]);
+        let mut selected = app.session.collections[0].entries[0].clone();
+        selected.url = "https://example.com/{{token}}".into();
+        app.session.collections[0].entries.push(selected);
+        app.session.collections[0].selected_entry = 1;
+        app.session.collections[0]
+            .captures
+            .insert("token".into(), "captured".into());
+        let original = app.session.collections[0].entries[1].to_hurl();
+        let mut h = Harness::new();
+        let label = app.strings.gui_copy_as_curl;
+        h.click_text(&mut app, label);
+        assert_eq!(h.copied.len(), 1);
+        assert!(h.copied[0].contains("--url 'https://example.com/captured'"));
+        assert!(matches!(
+            app.session.status,
+            Some(crate::i18n::Status::Copied)
+        ));
+        assert_eq!(app.session.collections[0].entries[1].to_hurl(), original);
+        assert!(
+            app.session.collections[0].entries[1]
+                .last_response
+                .is_none()
+        );
+        assert!(app.session.pending_captures.is_empty());
+
+        app.session.collections[0].entries[1].url = "{{missing}}".into();
+        h.click_text(&mut app, label);
+        assert_eq!(
+            h.copied.len(),
+            1,
+            "failed exports must not replace the clipboard"
+        );
+        assert!(matches!(
+            app.session.status,
+            Some(crate::i18n::Status::Error(_))
+        ));
     }
 
     #[test]
@@ -3708,6 +3787,216 @@ mod computed_suggestion_tests {
     }
 }
 
+#[cfg(test)]
+mod row_reorder_tests {
+    use super::computed_cell_undo_tests::Harness;
+    use super::*;
+
+    fn app(section: EditorSection) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry {
+            method: "POST".into(),
+            url: "https://example.com".into(),
+            title: "Reordering".into(),
+            ..Default::default()
+        };
+        let rows: Vec<KvRow> = (0..3)
+            .map(|i| KvRow {
+                key: format!("row{i}"),
+                value: format!("value{i}"),
+                desc: format!("note{i}"),
+                enabled: i != 0,
+            })
+            .collect();
+        entry.headers = rows.clone();
+        entry.queries = rows.clone();
+        entry.cookies = rows.clone();
+        entry.options = rows;
+        entry.form_fields = (0..3)
+            .map(|i| FormField {
+                key: format!("field{i}"),
+                value: format!("file{i}.txt"),
+                kind: FormFieldKind::Base64File,
+                base64_prefix: Some(format!("prefix{i}")),
+                desc: format!("note{i}"),
+                enabled: i != 0,
+                ..Default::default()
+            })
+            .collect();
+        entry.asserts = (0..3)
+            .map(|i| format!("body contains \"value{i}\""))
+            .collect();
+        entry.captures = (0..3)
+            .map(|i| (format!("capture{i}"), "body".into()))
+            .collect();
+        entry.generators = (0..3)
+            .map(|i| (format!("gen{i}"), format!("\"value{i}\"")))
+            .collect();
+        entry.set_baseline();
+        session.collections[0].entries = vec![entry];
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = section;
+        app
+    }
+
+    fn drag(h: &mut Harness, app: &mut GuiApp, from: usize, to: usize, above: bool) {
+        let mut placed = Vec::new();
+        for _ in 0..3 {
+            placed = h.frame(app, vec![], 0.05);
+        }
+        let handles: Vec<_> = placed
+            .iter()
+            .filter(|(text, _)| text == super::super::icons::DRAG)
+            .map(|(_, rect)| *rect)
+            .collect();
+        assert_eq!(handles.len(), 3);
+        let start = handles[from].center();
+        let end = egui::pos2(
+            handles[to].center().x,
+            if above {
+                handles[to].top()
+            } else if app.editor_section == EditorSection::Body {
+                placed
+                    .iter()
+                    .filter(|(text, _)| text == app.strings.gui_base64_prefix)
+                    .nth(to)
+                    .unwrap()
+                    .1
+                    .bottom()
+            } else {
+                handles[to].bottom()
+            },
+        );
+        drag_pointer(h, app, start, end);
+    }
+
+    fn drag_pointer(h: &mut Harness, app: &mut GuiApp, start: egui::Pos2, end: egui::Pos2) {
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        h.frame(app, vec![egui::Event::PointerMoved(start)], 0.05);
+        h.frame(app, vec![button(start, true)], 0.05);
+        h.frame(app, vec![egui::Event::PointerMoved(end)], 0.05);
+        h.frame(app, vec![], 0.05);
+        h.frame(app, vec![button(end, false)], 0.05);
+    }
+
+    #[test]
+    fn dragging_request_rows_moves_whole_rows_and_marks_the_request_edited() {
+        for section in [
+            EditorSection::Headers,
+            EditorSection::Params,
+            EditorSection::Cookies,
+            EditorSection::Options,
+            EditorSection::Body,
+            EditorSection::Asserts,
+            EditorSection::Captures,
+            EditorSection::Computed,
+        ] {
+            let mut app = app(section);
+            let label = section_title(section, &app.strings);
+            let original = app.session.collections[0].entries[0].clone();
+            let mut h = Harness::new();
+            let cell = match section {
+                EditorSection::Body => "file2.txt",
+                EditorSection::Asserts => "body contains \"value2\"",
+                EditorSection::Captures => "capture2",
+                EditorSection::Computed => "\"value2\"",
+                _ => "value2",
+            };
+            h.click_text(&mut app, cell);
+            let cell_id = h.focused().expect("the cell has focus");
+            // Moving the bottom row above the first also exercises multiline
+            // form rows: the prefix must travel with its field.
+            drag(&mut h, &mut app, 2, 0, true);
+            let entry = &app.session.collections[0].entries[0];
+            assert!(entry.modified, "section {label} did not register a drop");
+            let mut expected = original.clone();
+            fn move_last<T>(rows: &mut Vec<T>) {
+                let row = rows.pop().unwrap();
+                rows.insert(0, row);
+            }
+            match section {
+                EditorSection::Headers => move_last(&mut expected.headers),
+                EditorSection::Params => move_last(&mut expected.queries),
+                EditorSection::Cookies => move_last(&mut expected.cookies),
+                EditorSection::Options => move_last(&mut expected.options),
+                EditorSection::Body => move_last(&mut expected.form_fields),
+                EditorSection::Asserts => move_last(&mut expected.asserts),
+                EditorSection::Captures => move_last(&mut expected.captures),
+                EditorSection::Computed => move_last(&mut expected.generators),
+                _ => unreachable!(),
+            }
+            assert_eq!(entry.to_hurl(), expected.to_hurl(), "{label}");
+            h.click_text(&mut app, cell);
+            assert_eq!(
+                h.focused(),
+                Some(cell_id),
+                "{label}: the cell identity moved"
+            );
+            // Session persistence and the Hurl serializer both retain the order.
+            let saved = app.session.to_persisted();
+            let mut restored = crate::session::Session::default();
+            restored.apply_persisted(saved);
+            assert_eq!(
+                restored.collections[0].entries[0].to_hurl(),
+                expected.to_hurl()
+            );
+            drag(&mut h, &mut app, 0, 2, false);
+            let restored = &app.session.collections[0].entries[0];
+            assert_eq!(restored.to_hurl(), original.to_hurl(), "{label}");
+            assert!(!restored.modified);
+        }
+    }
+
+    #[test]
+    fn dropping_in_place_does_not_edit_headers() {
+        let mut app = app(EditorSection::Headers);
+        let original = app.session.collections[0].entries[0].to_hurl();
+        let mut h = Harness::new();
+        drag(&mut h, &mut app, 0, 0, true);
+        assert_eq!(app.session.collections[0].entries[0].to_hurl(), original);
+        assert!(!app.session.collections[0].entries[0].modified);
+    }
+
+    #[test]
+    fn text_selection_and_dropping_outside_the_table_do_not_reorder() {
+        let mut app = app(EditorSection::Headers);
+        let original = app.session.collections[0].entries[0].to_hurl();
+        let mut h = Harness::new();
+        let mut placed = Vec::new();
+        for _ in 0..3 {
+            placed = h.frame(&mut app, vec![], 0.05);
+        }
+        let first = placed
+            .iter()
+            .find(|(t, _)| t == "value0")
+            .unwrap()
+            .1
+            .center();
+        let last = placed
+            .iter()
+            .find(|(t, _)| t == "value2")
+            .unwrap()
+            .1
+            .center();
+        drag_pointer(&mut h, &mut app, first, last);
+        assert_eq!(app.session.collections[0].entries[0].to_hurl(), original);
+        let handle = placed
+            .iter()
+            .find(|(t, _)| t == super::super::icons::DRAG)
+            .unwrap()
+            .1
+            .center();
+        drag_pointer(&mut h, &mut app, handle, egui::pos2(880.0, 650.0));
+        assert_eq!(app.session.collections[0].entries[0].to_hurl(), original);
+        assert!(!app.session.collections[0].entries[0].modified);
+    }
+}
+
 /// The `[Asserts]` section is a plain list of rows, so it has to sit at the top
 /// of the tab like every other table — and leave "+ Add assert" on screen.
 #[cfg(test)]
@@ -3763,7 +4052,7 @@ mod assert_layout_tests {
     }
 
     #[test]
-    fn an_assert_starts_where_the_help_above_it_starts() {
+    fn an_assert_starts_just_after_its_drag_handle() {
         let mut app = app_with_asserts(&["jsonpath \"$.a\" exists"]);
         let mut h = Harness::new();
         let placed = h.frame(&mut app, vec![], 0.1);
@@ -3778,10 +4067,9 @@ mod assert_layout_tests {
             .find(|(t, _)| t.starts_with("jsonpath"))
             .expect("the assert row should be painted")
             .1;
-        // Only the text edit's own margin should separate them; a right-aligned
-        // field left its unused width as a visible indent instead.
+        // Only the drag handle and the text edit's margin separate them.
         assert!(
-            row.min.x - help.min.x < 6.0,
+            (row.min.x - help.min.x - widgets::ROW_DRAG_SPACE).abs() < 6.0,
             "the assert field should line up with the section: help {help:?}, row {row:?}"
         );
     }

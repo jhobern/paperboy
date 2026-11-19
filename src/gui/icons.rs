@@ -62,6 +62,8 @@ pub const RERUN: &str = p::ARROW_CLOCKWISE;
 pub const PLUS: &str = p::PLUS;
 /// Close / remove action (formerly `✕`).
 pub const CLOSE: &str = p::X;
+/// A request table row's drag handle.
+pub const DRAG: &str = p::DOTS_SIX_VERTICAL;
 /// A passing run or assertion (formerly `✓`).
 pub const PASS: &str = p::CHECK;
 /// A failing run or assertion (formerly `✗`).
