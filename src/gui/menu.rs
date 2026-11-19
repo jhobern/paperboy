@@ -2115,25 +2115,22 @@ pub fn poll_pending_pick(app: &mut GuiApp) {
             return;
         }
         PickAction::ExportResults { field } => {
-            match picked {
-                // The native chooser has already asked about replacing an
-                // existing file, so the pick is written as it stands.
-                Some(path) => {
-                    if let Err(e) = export_report_results(app, &path.to_string_lossy()) {
-                        app.session.status = Some(crate::i18n::Status::Error(e));
-                        app.dialog = Some(Dialog::ExportResults {
-                            path: path.to_string_lossy().into_owned(),
-                            replace: false,
-                        });
-                    }
-                }
-                None => {
-                    app.dialog = Some(Dialog::ExportResults {
-                        path: field,
-                        replace: false,
-                    })
-                }
-            }
+            // Browse… only chooses *where*: the pick goes back into the Export
+            // dialog's field rather than being written straight away, because
+            // the format is chosen in that dialog and the user may not have
+            // settled it yet. The native chooser has already asked about
+            // replacing an existing file, so a pick that exists comes back
+            // with the dialog already saying Replace rather than asking twice.
+            app.dialog = Some(match picked {
+                Some(path) => Dialog::ExportResults {
+                    replace: path.exists(),
+                    path: path.to_string_lossy().into_owned(),
+                },
+                None => Dialog::ExportResults {
+                    path: field,
+                    replace: false,
+                },
+            });
             app.session.save();
             return;
         }
@@ -2745,6 +2742,7 @@ fn prompt_dialog(app: &mut GuiApp, ctx: &egui::Context, kind: PromptKind, mut te
     let title = match &kind {
         PromptKind::BaseUrl => app.strings.gui_base_url_title,
         PromptKind::NewEnvName => app.strings.gui_new_env_name_title,
+        PromptKind::DuplicateEnv(_) => app.strings.gui_duplicate_env_title,
         PromptKind::NewCollectionName => app.strings.gui_new_collection_name_title,
         PromptKind::NewWorkspaceFolder { .. } => app.strings.gui_ws_new_folder_title,
     };
@@ -2786,6 +2784,9 @@ fn prompt_dialog(app: &mut GuiApp, ctx: &egui::Context, kind: PromptKind, mut te
                     text.clone()
                 };
                 app.session.add_environment(name);
+            }
+            PromptKind::DuplicateEnv(id) => {
+                super::environments::duplicate_environment(app, *id, text.trim());
             }
             PromptKind::NewCollectionName => {
                 let name = if text.trim().is_empty() {
@@ -3359,10 +3360,10 @@ mod tests {
         );
     }
 
-    /// Browse… from the Export dialog writes where the chooser says, and a
-    /// cancelled chooser hands the dialog back as it was.
+    /// Browse… from the Export dialog fills the dialog with the chooser's pick
+    /// (without writing), and a cancelled chooser hands it back as it was.
     #[test]
-    fn browsing_from_the_export_dialog_writes_the_pick_or_returns_to_the_dialog() {
+    fn browsing_from_the_export_dialog_fills_in_the_pick_or_returns_to_the_dialog() {
         use crate::report::model::{ReportResult, ReportRow};
         let mut app = app();
         let mut ed = crate::gui::report_editor::ReportEditor::new(
@@ -3393,7 +3394,8 @@ mod tests {
             Some(Dialog::ExportResults { path, .. }) if *path == field
         ));
 
-        // Picked: written there, and the dialog is done.
+        // Picked: the dialog comes back pointing there, with nothing written
+        // yet — the format may still be about to change.
         app.dialog = None;
         let picked = dir.join("elsewhere.csv");
         app.pending_pick = Some(super::super::filepick::resolved(
@@ -3403,10 +3405,15 @@ mod tests {
             Some(picked.clone()),
         ));
         poll_pending_pick(&mut app);
-        let written = std::fs::read_to_string(&picked).unwrap_or_default();
+        let written = picked.exists();
+        let back = app.dialog.take();
         std::fs::remove_dir_all(&dir).ok();
-        assert!(written.contains("Time"), "{written:?}");
-        assert!(app.dialog.is_none());
+        assert!(!written, "the chooser alone writes nothing");
+        assert!(matches!(
+            &back,
+            Some(Dialog::ExportResults { path, replace: false })
+                if *path == picked.to_string_lossy()
+        ));
     }
 
     /// Asking for a second chooser while one is open says so, rather than

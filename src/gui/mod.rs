@@ -9,6 +9,7 @@
 //! natively by egui rather than the hand-written plumbing the terminal UI needs.
 
 mod app;
+mod curl;
 #[cfg(test)]
 mod dialog_style;
 mod editor;

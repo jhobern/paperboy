@@ -121,6 +121,9 @@ impl Default for Context<'_> {
 /// Whether any step anywhere in the flow (loop bodies included) emits a column.
 fn emits_a_column(nodes: &[FlowNode]) -> bool {
     nodes.iter().any(|n| match n {
+        FlowNode::Branch {
+            body, alternative, ..
+        } => emits_a_column(body) || emits_a_column(alternative),
         FlowNode::Report(_) => true,
         FlowNode::ForEach { body, .. }
         | FlowNode::ForEnvs { body, .. }
@@ -129,10 +132,55 @@ fn emits_a_column(nodes: &[FlowNode]) -> bool {
     })
 }
 
+pub(crate) fn branch_truth_errors(flow: &ReportFlow, strings: &Strings) -> Vec<String> {
+    flow.conflicting_branch_truths()
+        .iter()
+        .map(|name| fill(strings.diag_branch_truth_conflict, &[name]))
+        .collect()
+}
+
 /// Validate `flow` against `ctx`, returning all diagnostics (errors + warnings).
 pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let s = ctx.strings;
+    diags.extend(
+        branch_truth_errors(flow, s)
+            .into_iter()
+            .map(Diagnostic::error),
+    );
+
+    fn check_rethrow(
+        nodes: &[FlowNode],
+        recovering: bool,
+        s: &Strings,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        for node in nodes {
+            match node {
+                FlowNode::Rethrow if !recovering => {
+                    diags.push(Diagnostic::error(s.run_rethrow_outside))
+                }
+                FlowNode::Branch {
+                    kind,
+                    body,
+                    alternative,
+                } => {
+                    check_rethrow(body, recovering, s, diags);
+                    check_rethrow(
+                        alternative,
+                        recovering || matches!(kind, super::flow::BranchKind::Try { .. }),
+                        s,
+                        diags,
+                    );
+                }
+                FlowNode::ForEach { body, .. }
+                | FlowNode::ForEnvs { body, .. }
+                | FlowNode::Graph { body, .. } => check_rethrow(body, recovering, s, diags),
+                _ => {}
+            }
+        }
+    }
+    check_rethrow(&flow.nodes, false, s, &mut diags);
 
     // Header: collection binding + output format. A `REQUESTS` section is its
     // own declaration — a flow that carries its requests needs no binding, and
@@ -362,6 +410,12 @@ fn nested_params<'a>(nodes: &'a [FlowNode]) -> Vec<&'a super::flow::ParamDecl> {
     let mut out = Vec::new();
     for node in nodes {
         match node {
+            FlowNode::Branch {
+                body, alternative, ..
+            } => {
+                out.extend(nested_params(body));
+                out.extend(nested_params(alternative));
+            }
             FlowNode::Param(p) => out.push(p),
             FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
                 out.extend(nested_params(body));
@@ -492,6 +546,55 @@ fn check_param_default(p: &super::flow::ParamDecl, ctx: &Context, diags: &mut Ve
     }
 }
 
+/// Warn about a `PRELUDE_*` setting whose literal value cannot mean what it
+/// says. Only literals are judged: a value still carrying `{{…}}` is not known
+/// until the run, and guessing at it would produce a warning the author cannot
+/// act on.
+///
+/// A warning, not an error, because an unusable setting has a defined outcome —
+/// the built-in default — and a report full of pictures should not refuse to
+/// run over one mistyped number.
+fn check_prelude_setting(key: &str, value: &str, ctx: &Context, diags: &mut Vec<Diagnostic>) {
+    if value.contains("{{") {
+        return;
+    }
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value);
+    if let Some(message) = image_setting_warning(key, value, ctx.strings) {
+        diags.push(Diagnostic::warning(message));
+    }
+}
+
+pub(crate) fn image_setting_warning(
+    key: &str,
+    value: &str,
+    strings: &crate::i18n::Strings,
+) -> Option<String> {
+    match key {
+        "PRELUDE_IMAGE_MAX_EDGE" => {
+            let ok = value
+                .parse::<u32>()
+                .is_ok_and(|edge| edge >= super::image::MIN_EMBED_EDGE);
+            if !ok {
+                return Some(fill(
+                    strings.diag_image_max_edge_invalid,
+                    &[value, &super::image::MIN_EMBED_EDGE.to_string()],
+                ));
+            }
+        }
+        "PRELUDE_IMAGE_QUALITY" => {
+            if !value.parse::<u8>().is_ok_and(|q| (1..=100).contains(&q)) {
+                return Some(fill(strings.diag_image_quality_invalid, &[value]));
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 fn walk(
     nodes: &[FlowNode],
     ctx: &Context,
@@ -502,7 +605,9 @@ fn walk(
         match node {
             // Nothing to check in a comment.
             FlowNode::Comment(_) => {}
-            FlowNode::Assign { .. } => {}
+            FlowNode::Assign { key, value } => {
+                check_prelude_setting(key, value, ctx, diags);
+            }
             // Parameters are checked as a set, before this walk.
             FlowNode::Param(_) => {}
             FlowNode::ListDecl { name, producer } => {
@@ -545,6 +650,26 @@ fn walk(
             // they use come from outside it. It reorders its body; it does not
             // enclose anything.
             FlowNode::Graph { body, .. } => walk(body, ctx, scopes, diags),
+            FlowNode::Branch {
+                body, alternative, ..
+            } => {
+                for arm in [body, alternative] {
+                    if arm.iter().any(|n| {
+                        matches!(
+                            n,
+                            FlowNode::ForEach { .. }
+                                | FlowNode::ForEnvs { .. }
+                                | FlowNode::Graph { .. }
+                                | FlowNode::Param(_)
+                                | FlowNode::ListDecl { .. }
+                        )
+                    }) {
+                        diags.push(Diagnostic::error(ctx.strings.run_branch_shape));
+                    }
+                    walk(arm, ctx, &mut scopes.clone(), diags);
+                }
+            }
+            FlowNode::Rethrow => {}
         }
     }
 }
@@ -881,6 +1006,12 @@ fn check_embedded_requests(
 fn collect_called(nodes: &[FlowNode], out: &mut Vec<String>) {
     for node in nodes {
         match node {
+            FlowNode::Branch {
+                body, alternative, ..
+            } => {
+                collect_called(body, out);
+                collect_called(alternative, out);
+            }
             FlowNode::Request { name, .. } | FlowNode::Cleanup { name, .. } => {
                 out.push(name.clone())
             }
@@ -1022,6 +1153,12 @@ fn check_regions(nodes: &[FlowNode], ctx: &Context, in_region: bool, diags: &mut
     let s = ctx.strings;
     for node in nodes {
         match node {
+            FlowNode::Branch {
+                body, alternative, ..
+            } => {
+                check_regions(body, ctx, in_region, diags);
+                check_regions(alternative, ctx, in_region, diags);
+            }
             FlowNode::Graph { body, .. } => {
                 if in_region {
                     diags.push(Diagnostic::error(s.diag_graph_nested.to_string()));
@@ -1102,6 +1239,7 @@ fn check_step_names(flow: &ReportFlow, ctx: &Context, diags: &mut Vec<Diagnostic
 }
 
 /// What the lexical walk remembers about a step already in scope.
+#[derive(Clone)]
 struct StepInfo {
     /// Whether the name was written with `AS`. Recorded so a clash can name the
     /// mistake actually made: two `AS Foo`s are a duplicate the author chose,
@@ -1175,6 +1313,26 @@ fn walk_step_names(
                 path.push(HashMap::new());
                 walk_step_names(body, ctx, path, false, diags);
                 path.pop();
+            }
+            FlowNode::Branch {
+                body,
+                alternative,
+                kind,
+            } => {
+                let mut first = path.clone();
+                walk_step_names(body, ctx, &mut first, false, diags);
+                let mut second = if matches!(kind, super::flow::BranchKind::Try { .. }) {
+                    first.clone()
+                } else {
+                    path.clone()
+                };
+                walk_step_names(alternative, ctx, &mut second, false, diags);
+                // Either arm may produce a qualified capture. Runtime checks
+                // still reject using an output from an arm that did not run.
+                for (dst, src) in path.iter_mut().zip(first.iter().zip(second.iter())) {
+                    dst.extend(src.0.clone());
+                    dst.extend(src.1.clone());
+                }
             }
             // A region is not a lexical frame — its steps are named in the
             // enclosing one — but its names are registered *before* its body is
@@ -1341,6 +1499,10 @@ pub(super) fn interpolated_source(node: &FlowNode) -> Vec<&str> {
         }
     }
     match node {
+        FlowNode::Branch {
+            kind: super::flow::BranchKind::If(condition),
+            ..
+        } => condition.values(),
         FlowNode::ForEach { producer: p, .. } => {
             let mut out = Vec::new();
             producer(p, &mut out);
@@ -1825,6 +1987,8 @@ fn initial_defined_vars(ctx: &Context) -> HashSet<String> {
         "PRELUDE_NO_MATCH_MARKER",
         "PRELUDE_RESPONSE_FORMAT",
         "PRELUDE_MAX_PARALLEL",
+        "PRELUDE_IMAGE_MAX_EDGE",
+        "PRELUDE_IMAGE_QUALITY",
     ] {
         defined.insert(name.to_string());
     }
@@ -1991,6 +2155,22 @@ fn check_var_availability(
 ) {
     for node in nodes {
         match node {
+            FlowNode::Branch {
+                kind,
+                body,
+                alternative,
+            } => {
+                let mut first = defined.clone();
+                check_var_availability(body, ctx, &mut first, diags);
+                let mut second = defined.clone();
+                if let super::flow::BranchKind::Try { error_var } = kind {
+                    second.extend(first.iter().cloned());
+                    second.insert(error_var.clone());
+                }
+                check_var_availability(alternative, ctx, &mut second, diags);
+                defined.extend(first.intersection(&second).cloned());
+            }
+            FlowNode::Rethrow => {}
             // A comment defines nothing and uses nothing.
             FlowNode::Comment(_) => {}
             // An assignment defines the key for all subsequent nodes.
@@ -2851,6 +3031,65 @@ mod tests {
             .filter(|d| d.severity == Severity::Error)
             .map(|d| d.message)
             .collect()
+    }
+
+    /// An image setting that cannot mean what it says is worth saying, but not
+    /// worth refusing the run over: the outcome is defined (the built-in
+    /// default), and a report full of pictures should not fail over one
+    /// mistyped number.
+    #[test]
+    fn an_unusable_image_setting_warns_and_names_itself() {
+        let warns = |src: &str| -> Vec<String> {
+            diags_for(src, None, None)
+                .into_iter()
+                .filter(|d| d.severity == Severity::Warning)
+                .map(|d| d.message)
+                .collect()
+        };
+
+        let edge = warns("# collection: c\nPRELUDE_IMAGE_MAX_EDGE=0\nREPORT REQUEST r\n");
+        assert!(
+            edge.iter().any(|w| w.contains("PRELUDE_IMAGE_MAX_EDGE")),
+            "says which setting: {edge:?}"
+        );
+
+        let quality = warns("# collection: c\nPRELUDE_IMAGE_QUALITY=0\nREPORT REQUEST r\n");
+        assert!(
+            quality.iter().any(|w| w.contains("PRELUDE_IMAGE_QUALITY")),
+            "says which setting: {quality:?}"
+        );
+
+        let text = warns("# collection: c\nPRELUDE_IMAGE_MAX_EDGE=small\nREPORT REQUEST r\n");
+        assert!(
+            text.iter().any(|w| w.contains("PRELUDE_IMAGE_MAX_EDGE")),
+            "a word is not a pixel count: {text:?}"
+        );
+
+        assert!(
+            errors_for("# collection: c\nPRELUDE_IMAGE_MAX_EDGE=0\nREPORT REQUEST r\n").is_empty(),
+            "a bad setting must not stop the run"
+        );
+
+        let fine = warns(
+            "# collection: c\nPRELUDE_IMAGE_MAX_EDGE=320\nPRELUDE_IMAGE_QUALITY=60\nREPORT REQUEST r\n",
+        );
+        assert!(
+            !fine.iter().any(
+                |w| w.contains("PRELUDE_IMAGE_MAX_EDGE") || w.contains("PRELUDE_IMAGE_QUALITY")
+            ),
+            "a usable setting is silent: {fine:?}"
+        );
+
+        // Still a template at validation time: what it will say is not known
+        // yet, so guessing would produce a warning nobody can act on.
+        let templated =
+            warns("# collection: c\nPRELUDE_IMAGE_MAX_EDGE={{EDGE}}\nREPORT REQUEST r\n");
+        assert!(
+            !templated
+                .iter()
+                .any(|w| w.contains("PRELUDE_IMAGE_MAX_EDGE")),
+            "an unresolved template is not yet wrong: {templated:?}"
+        );
     }
 
     /// A parameter is only useful if it can be offered *before* the run, which

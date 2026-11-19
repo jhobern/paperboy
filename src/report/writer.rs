@@ -249,8 +249,72 @@ impl ReportWriter for JsonWriter {
                 .unwrap()
                 .insert("metrics".to_string(), metrics_json(&metrics));
         }
+        // The rest of what the app's results view shows beside the table, each
+        // only when there is something in it: the paired statistics, what
+        // differed from the baseline row by row (the drill-down's comparison
+        // section, so a consumer doesn't have to re-parse the `Result` cell's
+        // JSON-in-a-string), and the run's own errors.
+        let obj = doc.as_object_mut().unwrap();
+        let stats = super::stats::paired_stats(result, &columns, &[]);
+        if !stats.is_empty() {
+            obj.insert("statistics".to_string(), stats_json(&stats));
+        }
+        let differences: Vec<serde_json::Value> = result
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(r, row)| match super::detail::comparison_section(row)? {
+                super::detail::DetailSection::Comparison {
+                    baseline,
+                    comparison,
+                    fields,
+                } => Some(serde_json::json!({
+                    "row": r,
+                    "baseline": baseline,
+                    "comparison": comparison,
+                    "fields": fields.iter().map(|f| serde_json::json!({
+                        "field": f.path,
+                        "baseline": f.baseline,
+                        "comparison": f.candidate,
+                    })).collect::<Vec<_>>(),
+                })),
+                _ => None,
+            })
+            .collect();
+        if !differences.is_empty() {
+            obj.insert("differences".to_string(), differences.into());
+        }
+        if !result.errors.is_empty() {
+            obj.insert("errors".to_string(), result.errors.clone().into());
+        }
         serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())
     }
+}
+
+/// The `statistics` object of the JSON export: the paired statistics panel,
+/// each figure with its baseline counterpart (`null` when there is none).
+fn stats_json(stats: &super::stats::PairedStats) -> serde_json::Value {
+    let mut doc = serde_json::json!({
+        "columns": stats.blocks.iter().map(|b| serde_json::json!({
+            "column": b.header,
+            "lines": b.lines.iter().map(|l| serde_json::json!({
+                "label": l.label,
+                "comparison": l.comparison,
+                "baseline": l.baseline,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    });
+    if let Some(t) = &stats.total {
+        doc.as_object_mut().unwrap().insert(
+            "total_request_time".to_string(),
+            serde_json::json!({
+                "unit": t.unit,
+                "comparison": t.comparison,
+                "baseline": t.baseline,
+            }),
+        );
+    }
+    doc
 }
 
 /// The `metrics` object of the JSON export: the same figures the footer rows
@@ -337,7 +401,7 @@ const HTML_HEAD: &str = r##"<!DOCTYPE html>
   --panel-bg:#fafafa; --btn-line:#bbb; --on-bg:#333; --on-fg:#fff;
   --foot-bg:#ececec; --foot-line:#999; --fdiff-head-bg:#eee;
   --pass-bg:#c6efce; --fail-bg:#ffc7ce; --warn-bg:#ffeb9c; --tint-fg:#222;
-  --cell-fg:#12305a; --pick-line:#12305a;
+  --cell-fg:#12305a; --pick-line:#12305a; --good-fg:#1e7a3c; --bad-fg:#c0262d;
 }
 @media (prefers-color-scheme: dark){
   :root:not([data-pb-theme="light"]){
@@ -348,7 +412,7 @@ const HTML_HEAD: &str = r##"<!DOCTYPE html>
     --panel-bg:#1b1f25; --btn-line:#454b54; --on-bg:#dfe3e8; --on-fg:#14161a;
     --foot-bg:#22262c; --foot-line:#555c66; --fdiff-head-bg:#22262c;
     --pass-bg:#1e4620; --fail-bg:#5b1f26; --warn-bg:#5c4a12; --tint-fg:#f2f2f2;
-    --cell-fg:#cfe0ff; --pick-line:#7aa7ff;
+    --cell-fg:#cfe0ff; --pick-line:#7aa7ff; --good-fg:#6fd08c; --bad-fg:#ff7b7b;
   }
 }
 :root[data-pb-theme="dark"]{
@@ -359,7 +423,7 @@ const HTML_HEAD: &str = r##"<!DOCTYPE html>
   --panel-bg:#1b1f25; --btn-line:#454b54; --on-bg:#dfe3e8; --on-fg:#14161a;
   --foot-bg:#22262c; --foot-line:#555c66; --fdiff-head-bg:#22262c;
   --pass-bg:#1e4620; --fail-bg:#5b1f26; --warn-bg:#5c4a12; --tint-fg:#f2f2f2;
-  --cell-fg:#cfe0ff; --pick-line:#7aa7ff;
+  --cell-fg:#cfe0ff; --pick-line:#7aa7ff; --good-fg:#6fd08c; --bad-fg:#ff7b7b;
 }
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:1rem;
 background:var(--bg);color:var(--fg)}
@@ -427,6 +491,36 @@ td.warn{background:var(--warn-bg);color:var(--tint-fg)}
 .card .k{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;
 letter-spacing:.04em}
 .card .v{display:block;font-size:20px;font-weight:600}
+/* Sortable, resizable headers. The arrow sits before the label so a long
+   header that ellipsises still shows which way its column is sorted. */
+thead th{cursor:pointer;user-select:none;position:sticky;overflow:hidden;text-overflow:ellipsis}
+thead th .arrow:empty{display:none}
+thead th .arrow{margin-right:.3rem}
+thead th .rz{position:absolute;top:0;right:0;width:6px;height:100%;cursor:col-resize}
+thead th .rz:hover,thead th .rz.drag{background:var(--pick-line)}
+.card.pick{cursor:pointer}
+.card.pick:hover{outline:2px solid var(--pick-line);outline-offset:-2px}
+.card.pick.on{background:var(--on-bg);border-color:var(--on-bg)}
+.card.pick.on .k,.card.pick.on .v{color:var(--on-fg)}
+.card.good .v{color:var(--good-fg)}
+.card.bad .v{color:var(--bad-fg)}
+.errors{margin:0 0 .8rem;padding:.4rem .9rem;border:1px solid var(--fail-bg);
+border-left:5px solid var(--fail-bg);border-radius:5px;background:var(--panel-bg);font-size:13px}
+.errors summary{cursor:pointer;font-weight:600}
+.errors ul{margin:.4rem 0 0;padding-left:1.2rem;max-height:12rem;overflow:auto}
+/* Matrices on the left, statistics to their right; wraps under on a narrow
+   window rather than squeezing either. */
+.summary{display:flex;flex-wrap:wrap;align-items:flex-start;gap:1rem 2rem;margin:0 0 1.25rem}
+.summary .matrix{margin:0 0 1rem}
+.stats h2{font-size:17px;font-weight:600;margin:0 0 .45rem}
+.stats table{width:auto;min-width:0;font-size:14px}
+.stats th,.stats td{border:none;padding:2px 10px 2px 0;white-space:nowrap}
+.stats thead th{position:static;background:none;color:var(--muted);font-weight:600;cursor:default}
+.stats th.col{color:var(--muted);font-weight:600;padding-top:.6rem;text-transform:uppercase;
+font-size:12px;letter-spacing:.04em}
+.stats td.lbl{color:var(--muted)}
+.stats td.v{font-weight:600}
+.panel section.cmp{max-width:min(100%,60rem)}
 .matrix{margin:0 0 1.25rem}
 .matrix h2{font-size:17px;font-weight:600;margin:0 0 .45rem}
 .matrix table{width:auto;min-width:0;font-size:20px}
@@ -503,14 +597,34 @@ impl ReportWriter for HtmlWriter {
         // decisions themselves are made by the same `RowFilter` the in-app
         // views use, and the two can't drift.
         let (filters, buttons) = super::filter::all_filters(result, metrics.as_ref());
+        // Run-level errors come before the toolbar, as they do in the app:
+        // a step that failed for every row explains the rest of the page.
+        push_run_errors(&mut out, &result.errors);
         push_filter_toolbar(&mut out, &filters[..buttons]);
         if let Some(metrics) = &metrics {
-            push_metric_cards(&mut out, metrics);
-            for m in &metrics.columns {
-                if let Some(matrix) = &m.matrix {
-                    push_confusion_matrix(&mut out, &m.header, matrix, &filters);
+            push_metric_cards(&mut out, metrics, &filters);
+        }
+        // The matrices, with the paired statistics to their right, as in the
+        // app's results view. The statistics go in the space a matrix leaves
+        // beside it rather than below, where they would push the table further
+        // down. They wrap underneath when the window is too narrow for both.
+        let stats = super::stats::paired_stats(result, &columns, &[]);
+        let matrices: Vec<_> = metrics
+            .iter()
+            .flat_map(|m| m.columns.iter())
+            .filter_map(|m| m.matrix.as_ref().map(|x| (&m.header, x)))
+            .collect();
+        if !matrices.is_empty() || !stats.is_empty() {
+            out.push_str("<div class=\"summary\">");
+            if !matrices.is_empty() {
+                out.push_str("<div class=\"matrices\">");
+                for (header, matrix) in matrices {
+                    push_confusion_matrix(&mut out, header, matrix, &filters);
                 }
+                out.push_str("</div>");
             }
+            push_stats_panel(&mut out, &stats);
+            out.push_str("</div>\n");
         }
         out.push_str("<table>\n");
         // Sized columns, so the browser doesn't squeeze a short column to a few
@@ -523,12 +637,24 @@ impl ReportWriter for HtmlWriter {
             out.push_str(&format!("<col style=\"width:{w}ch\">"));
         }
         out.push_str("</colgroup>\n<thead>\n<tr>");
-        for c in &columns {
-            out.push_str("<th>");
+        // Every header sorts its column (ascending, descending, then back to
+        // run order, as in the app) and has a handle on its right edge that
+        // resizes it. The label is in a span of its own so the script can add
+        // the sort arrow without overwriting the handle.
+        for (ci, c) in columns.iter().enumerate() {
+            out.push_str(&format!(
+                "<th data-c=\"{ci}\" title=\"Click to sort; drag the right edge to resize\">\
+                 <span class=\"arrow\"></span><span class=\"lbl\">"
+            ));
             push_escaped(&mut out, &c.header);
-            out.push_str("</th>");
+            out.push_str("</span><span class=\"rz\"></span></th>");
         }
         out.push_str("</tr>\n</thead>\n<tbody>\n");
+        // Each row's position under every sort, worked out here with the same
+        // `sort_rows` the app uses, so a sorted export orders its rows exactly
+        // as the app does (numbers by value, natural order for text, blanks
+        // last either way) without reimplementing those rules in JavaScript.
+        let (sort_asc, sort_desc) = sort_positions(result, &columns);
         for (r, row) in result.rows.iter().enumerate() {
             // The filters this row passes, and the text the search runs over --
             // both computed here so the browser needs no report knowledge.
@@ -551,7 +677,10 @@ impl ReportWriter for HtmlWriter {
             if r % 2 == 1 {
                 out.push_str(" alt");
             }
-            out.push_str("\" data-f=\"");
+            out.push_str(&format!(
+                "\" data-o=\"{r}\" data-sa=\"{}\" data-sd=\"{}\" data-f=\"",
+                sort_asc[r], sort_desc[r]
+            ));
             out.push_str(&passes.join(" "));
             out.push_str("\" data-t=\"");
             push_escaped(&mut out, &searchable);
@@ -713,6 +842,39 @@ fn push_detail_row(
                 push_escaped(out, value);
                 out.push_str("</pre></section>");
             }
+            DetailSection::Comparison {
+                baseline,
+                comparison,
+                fields,
+            } => {
+                // Each side's heading names the environment it ran against:
+                // "Baseline" alone doesn't say which server gave which answer.
+                let head = |label: &str, env: &str| {
+                    if env.is_empty() {
+                        label.to_string()
+                    } else {
+                        format!("{label} ({env})")
+                    }
+                };
+                out.push_str(
+                    "<section class=\"cmp\"><h3>What differed from the baseline</h3>\
+                     <table class=\"fdiff\"><thead><tr><th>Field</th><th>",
+                );
+                push_escaped(out, &head("Baseline", baseline));
+                out.push_str("</th><th>");
+                push_escaped(out, &head("Comparison", comparison));
+                out.push_str("</th></tr></thead><tbody>");
+                for f in fields {
+                    out.push_str("<tr class=\"chg\"><td>");
+                    push_escaped(out, &f.path);
+                    out.push_str("</td><td>");
+                    push_escaped(out, f.baseline.as_deref().unwrap_or("\u{2014}"));
+                    out.push_str("</td><td>");
+                    push_escaped(out, f.candidate.as_deref().unwrap_or("\u{2014}"));
+                    out.push_str("</td></tr>");
+                }
+                out.push_str("</tbody></table></section>");
+            }
             DetailSection::Diff { header, fields } => {
                 out.push_str("<section><h3>");
                 push_escaped(out, &format!("{header} \u{2014} changed fields"));
@@ -794,8 +956,9 @@ const INTERACTIVE_SCRIPT: &str = r#"<script>
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
     });
   });
-  var buttons = Array.prototype.slice.call(document.querySelectorAll('.toolbar button'));
-  var picks = Array.prototype.slice.call(document.querySelectorAll('.matrix td.pick'));
+  var buttons = Array.prototype.slice.call(document.querySelectorAll('.toolbar button[data-i]'));
+  // Matrix cells and the linked metric cards both pick a filter.
+  var picks = Array.prototype.slice.call(document.querySelectorAll('.matrix td.pick, .card.pick'));
   var find = document.getElementById('pb-find');
   var count = document.getElementById('pb-count');
   var active = 0;
@@ -809,7 +972,9 @@ const INTERACTIVE_SCRIPT: &str = r#"<script>
       tr.style.display = ok ? '' : 'none';
       var p = panelOf(tr);
       if (p) p.style.display = ok ? '' : 'none';
-      if (ok) shown++;
+      // Striping follows the visible rows, so filtering or sorting never
+      // leaves two shaded rows side by side.
+      if (ok) { tr.classList.toggle('alt', shown % 2 === 1); shown++; }
     });
     buttons.forEach(function (b) {
       b.classList.toggle('on', Number(b.getAttribute('data-i')) === active);
@@ -839,6 +1004,73 @@ const INTERACTIVE_SCRIPT: &str = r#"<script>
     });
   });
   if (find) find.addEventListener('input', apply);
+
+  // Sorting. Each row carries its position under every column's ascending
+  // (`data-sa`) and descending (`data-sd`) sort, computed by the writer with
+  // the app's own ordering rules; a click cycles ascending, descending, then
+  // back to run order (`data-o`), as the app's headers do. A row's drill-down
+  // panel moves with it.
+  var body = rows.length ? rows[0].parentNode : null;
+  var heads = Array.prototype.slice.call(document.querySelectorAll('thead th[data-c]'));
+  var sortCol = -1, sortDesc = false;
+  var keyOf = function (tr) {
+    if (sortCol < 0) return Number(tr.getAttribute('data-o'));
+    var k = (tr.getAttribute(sortDesc ? 'data-sd' : 'data-sa') || '').split(' ');
+    return Number(k[sortCol]);
+  };
+  var resort = function () {
+    rows.sort(function (a, b) { return keyOf(a) - keyOf(b); });
+    rows.forEach(function (tr) {
+      var p = panelOf(tr);
+      body.appendChild(tr);
+      if (p) body.appendChild(p);
+    });
+    heads.forEach(function (th) {
+      var c = Number(th.getAttribute('data-c'));
+      var on = c === sortCol;
+      th.querySelector('.arrow').textContent = on ? (sortDesc ? '\u25bc' : '\u25b2') : '';
+      th.setAttribute('aria-sort', on ? (sortDesc ? 'descending' : 'ascending') : 'none');
+    });
+    apply();
+  };
+  heads.forEach(function (th) {
+    th.addEventListener('click', function (e) {
+      if (e.target.classList.contains('rz') || !body) return;
+      var c = Number(th.getAttribute('data-c'));
+      if (sortCol !== c) { sortCol = c; sortDesc = false; }
+      else if (!sortDesc) { sortDesc = true; }
+      else { sortCol = -1; sortDesc = false; }
+      resort();
+    });
+  });
+
+  // Column resizing: drag a header's right edge. The width goes on the
+  // matching <col>, which `table-layout:fixed` makes binding.
+  var grid = heads.length ? heads[0].closest('table') : null;
+  var cols = grid ? grid.querySelectorAll(':scope > colgroup > col') : [];
+  heads.forEach(function (th) {
+    var handle = th.querySelector('.rz');
+    var col = cols[Number(th.getAttribute('data-c'))];
+    if (!handle || !col) return;
+    handle.addEventListener('mousedown', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      var startX = e.clientX, startW = th.getBoundingClientRect().width;
+      handle.classList.add('drag');
+      var move = function (ev) {
+        col.style.width = Math.max(40, startW + ev.clientX - startX) + 'px';
+      };
+      var up = function () {
+        handle.classList.remove('drag');
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+      };
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    });
+    // A click on the handle is the end of a drag, not a sort.
+    handle.addEventListener('click', function (e) { e.stopPropagation(); });
+  });
   apply();
 
   // Dark mode. The page already follows the reader's system setting on its own
@@ -888,16 +1120,130 @@ const INTERACTIVE_SCRIPT: &str = r#"<script>
 </script>
 "#;
 
+/// Each row's position in every column's ascending and descending sort, one
+/// space-separated list per row (column order), for the HTML export's
+/// `data-sa`/`data-sd` attributes.
+///
+/// Both directions are stored, rather than one being the reverse of the
+/// other, because they are not reverses: blanks sort last either way, and a
+/// stable sort keeps tied rows in run order both ways.
+fn sort_positions(result: &ReportResult, columns: &[OutputColumn]) -> (Vec<String>, Vec<String>) {
+    let n = result.rows.len();
+    let mut asc = vec![Vec::with_capacity(columns.len()); n];
+    let mut desc = vec![Vec::with_capacity(columns.len()); n];
+    for col in columns {
+        for (descending, out) in [(false, &mut asc), (true, &mut desc)] {
+            let mut order: Vec<usize> = (0..n).collect();
+            super::filter::sort_rows(result, col, descending, &mut order);
+            for (pos, r) in order.into_iter().enumerate() {
+                out[r].push(pos.to_string());
+            }
+        }
+    }
+    let join = |v: Vec<Vec<String>>| v.into_iter().map(|p| p.join(" ")).collect();
+    (join(asc), join(desc))
+}
+
+/// The run's own errors (an unresolved request, a producer that failed), in a
+/// box that can be folded away.
+///
+/// A step that fails usually fails for every row, so this list can be as
+/// long as the table. It is capped in height and scrolls, so the rows it is
+/// about stay reachable, the same way the app handles it.
+fn push_run_errors(out: &mut String, errors: &[String]) {
+    if errors.is_empty() {
+        return;
+    }
+    out.push_str(&format!(
+        "<details class=\"errors\" open><summary>\u{2716} {} error(s)</summary><ul>",
+        errors.len()
+    ));
+    for e in errors {
+        out.push_str("<li>");
+        push_escaped(out, e);
+        out.push_str("</li>");
+    }
+    out.push_str("</ul></details>\n");
+}
+
+/// The paired statistics panel (see [`super::stats`]): each statistic once,
+/// with the comparison's figure and the baseline's beside it.
+fn push_stats_panel(out: &mut String, stats: &super::stats::PairedStats) {
+    if stats.is_empty() {
+        return;
+    }
+    let two = stats.two_sided();
+    out.push_str("<div class=\"stats\"><h2>Statistics</h2><table>");
+    if two {
+        out.push_str("<thead><tr><th></th><th>Comparison</th><th>Baseline</th></tr></thead>");
+    }
+    out.push_str("<tbody>");
+    let span = if two { 3 } else { 2 };
+    let line = |out: &mut String, label: &str, cand: &str, base: Option<&str>| {
+        out.push_str("<tr><td class=\"lbl\">");
+        push_escaped(out, label);
+        out.push_str("</td><td class=\"v\">");
+        push_escaped(out, cand);
+        out.push_str("</td>");
+        if two {
+            out.push_str("<td>");
+            push_escaped(out, base.unwrap_or(""));
+            out.push_str("</td>");
+        }
+        out.push_str("</tr>");
+    };
+    for block in &stats.blocks {
+        out.push_str(&format!("<tr><th class=\"col\" colspan=\"{span}\">"));
+        push_escaped(out, &block.header);
+        out.push_str("</th></tr>");
+        for l in &block.lines {
+            line(out, &l.label, &l.comparison, l.baseline.as_deref());
+        }
+    }
+    if let Some(t) = &stats.total {
+        out.push_str(&format!(
+            "<tr><th class=\"col\" colspan=\"{span}\">Total request time</th></tr>"
+        ));
+        line(out, t.unit, &t.comparison, t.baseline.as_deref());
+    }
+    out.push_str("</tbody></table></div>");
+}
+
 /// The metric cards drawn above the table: one group per ground-truthed column
 /// (plus the row roll-up), each stating what was compared, how much of it was
 /// wrong, and the resulting accuracy.
-fn push_metric_cards(out: &mut String, metrics: &super::metrics::Metrics) {
+fn push_metric_cards(
+    out: &mut String,
+    metrics: &super::metrics::Metrics,
+    filters: &[super::filter::RowFilter],
+) {
+    use super::filter::RowFilter;
     use super::metrics::{
-        ACCURACY_LABEL, COMPARED_LABEL, FIXED_LABEL, INCORRECT_LABEL, MOVEMENT_LABEL,
-        REGRESSED_LABEL, STILL_WRONG_LABEL,
+        ACCURACY_LABEL, COMPARED_LABEL, CORRECT_LABEL, FIXED_LABEL, INCORRECT_LABEL,
+        MOVEMENT_LABEL, REGRESSED_LABEL, STILL_WRONG_LABEL,
     };
     fn card(out: &mut String, k: &str, v: &str) {
-        out.push_str("<div class=\"card\"><span class=\"k\">");
+        linked_card(out, k, v, "", None, &[]);
+    }
+    // A card that counts the rows a filter shows works as a button for that
+    // filter, as in the app and like a confusion-matrix cell: "which three
+    // regressed?" is the next question, and a click should answer it. A
+    // filter the run doesn't offer leaves the card plain.
+    fn linked_card(
+        out: &mut String,
+        k: &str,
+        v: &str,
+        extra_class: &str,
+        filter: Option<RowFilter>,
+        filters: &[RowFilter],
+    ) {
+        match filter.and_then(|f| filters.iter().position(|g| *g == f)) {
+            Some(i) => out.push_str(&format!(
+                "<div class=\"card pick{extra_class}\" data-i=\"{i}\" title=\"Show these rows\">"
+            )),
+            None => out.push_str(&format!("<div class=\"card{extra_class}\">")),
+        }
+        out.push_str("<span class=\"k\">");
         push_escaped(out, k);
         out.push_str("</span><span class=\"v\">");
         push_escaped(out, v);
@@ -912,8 +1258,24 @@ fn push_metric_cards(out: &mut String, metrics: &super::metrics::Metrics) {
         if mv.is_still() {
             card(out, MOVEMENT_LABEL, "Nothing moved");
         } else {
-            card(out, FIXED_LABEL, &mv.fixed.to_string());
-            card(out, REGRESSED_LABEL, &mv.regressed.to_string());
+            linked_card(
+                out,
+                FIXED_LABEL,
+                &mv.fixed.to_string(),
+                " good",
+                Some(RowFilter::Fixed),
+                filters,
+            );
+            // Only a non-zero regression count is red: red on a `0` teaches
+            // the eye to ignore the colour.
+            linked_card(
+                out,
+                REGRESSED_LABEL,
+                &mv.regressed.to_string(),
+                if mv.regressed > 0 { " bad" } else { "" },
+                Some(RowFilter::Regressed),
+                filters,
+            );
         }
         if mv.still_wrong > 0 {
             card(out, STILL_WRONG_LABEL, &mv.still_wrong.to_string());
@@ -928,14 +1290,38 @@ fn push_metric_cards(out: &mut String, metrics: &super::metrics::Metrics) {
         .iter()
         .chain(metrics.columns.iter())
         .collect::<Vec<_>>();
+    // The Correct and Incorrect filters count rows by their overall verdict,
+    // so only the roll-up's cards (or a lone scored column's, whose verdict
+    // is the roll-up) count the same rows the filter shows. With several
+    // scored columns, a column's own cards count a different set of rows, so
+    // they stay plain. The app applies the same rule.
+    let single = metrics.columns.len() == 1;
+    let overall_header = metrics.overall.as_ref().map(|o| o.header.as_str());
     for m in groups {
+        let linked = single || overall_header == Some(m.header.as_str());
+        let pick = |f: RowFilter| linked.then_some(f);
         out.push_str("<div class=\"metrics\">");
         card(
             out,
             &format!("{} — {COMPARED_LABEL}", m.header),
             &format!("{} of {}", m.compared, m.total),
         );
-        card(out, INCORRECT_LABEL, &m.incorrect.to_string());
+        linked_card(
+            out,
+            CORRECT_LABEL,
+            &m.correct.to_string(),
+            "",
+            pick(RowFilter::Correct),
+            filters,
+        );
+        linked_card(
+            out,
+            INCORRECT_LABEL,
+            &m.incorrect.to_string(),
+            "",
+            pick(RowFilter::Incorrect),
+            filters,
+        );
         card(
             out,
             ACCURACY_LABEL,
@@ -1370,24 +1756,30 @@ impl ReportWriter for XlsxWriter {
         // rows: a confusion matrix is a second table with its own axes, and
         // pasting it under a filtered data table would put it inside the
         // filter's range — where sorting the report would scramble it.
-        if let Some(metrics) = result.metrics(&columns, header) {
-            write_metrics_sheet(&mut workbook, &metrics)?;
+        // The paired statistics share that sheet, to the right of the
+        // matrices as in the app; a run with statistics but no ground truth
+        // gets the sheet for them alone.
+        let metrics = result.metrics(&columns, header);
+        let stats = super::stats::paired_stats(result, &columns, &[]);
+        if metrics.is_some() || !stats.is_empty() {
+            write_metrics_sheet(&mut workbook, metrics.as_ref(), &stats)?;
         }
+        write_differences_sheet(&mut workbook, result, &columns)?;
+        write_errors_sheet(&mut workbook, &result.errors)?;
 
         workbook.save_to_buffer().map_err(|e| e.to_string())
     }
 }
 
 /// The `Metrics` worksheet: the accuracy figures, then one confusion matrix per
-/// ground-truthed column that declared a label vocabulary.
+/// ground-truthed column that declared a label vocabulary, with the paired
+/// statistics to their right. Named `Statistics` when the run has statistics
+/// but no ground truth, since there are then no metrics on it.
 fn write_metrics_sheet(
     workbook: &mut rust_xlsxwriter::Workbook,
-    metrics: &super::metrics::Metrics,
+    metrics: Option<&super::metrics::Metrics>,
+    stats: &super::stats::PairedStats,
 ) -> Result<(), String> {
-    use super::metrics::{
-        ACCURACY_LABEL, COMPARED_LABEL, FIXED_LABEL, INCORRECT_LABEL, MOVEMENT_LABEL,
-        REGRESSED_LABEL, STILL_WRONG_LABEL, UNCHANGED_LABEL,
-    };
     use rust_xlsxwriter::{Color, Format, FormatAlign};
 
     let head = Format::new()
@@ -1397,10 +1789,15 @@ fn write_metrics_sheet(
     let label = Format::new().set_bold();
     let axis = Format::new().set_bold().set_align(FormatAlign::Right);
     let sheet = workbook.add_worksheet();
-    sheet.set_name("Metrics").map_err(|e| e.to_string())?;
+    sheet
+        .set_name(if metrics.is_some() {
+            "Metrics"
+        } else {
+            "Statistics"
+        })
+        .map_err(|e| e.to_string())?;
     sheet.set_column_width(0, 28.0).map_err(|e| e.to_string())?;
 
-    let mut r: u32 = 0;
     let put = |sheet: &mut rust_xlsxwriter::Worksheet,
                row: u32,
                col: u16,
@@ -1412,15 +1809,148 @@ fn write_metrics_sheet(
             .map(|_| ())
             .map_err(|e| e.to_string())
     };
-    for (c, h) in ["Column", COMPARED_LABEL, INCORRECT_LABEL, ACCURACY_LABEL]
-        .iter()
-        .enumerate()
+    // The widest column the metrics use, so the statistics can start clear
+    // of them: the accuracy table is five wide, a matrix one more than its
+    // axis.
+    let mut used: u16 = 0;
+    if let Some(metrics) = metrics {
+        used = 5;
+        for m in &metrics.columns {
+            if let Some(matrix) = &m.matrix {
+                used = used.max(matrix.axis.len() as u16 + 1);
+            }
+        }
+        write_metrics_tables(sheet, metrics, &head, &label, &axis, &put)?;
+    }
+    if !stats.is_empty() {
+        // One empty column between the two, so neither reads as part of
+        // the other.
+        let at = if used == 0 { 0 } else { used + 1 };
+        write_stats_block(sheet, at, stats, &head, &label, &put)?;
+    }
+    Ok(())
+}
+
+type Put = dyn Fn(
+    &mut rust_xlsxwriter::Worksheet,
+    u32,
+    u16,
+    &str,
+    &rust_xlsxwriter::Format,
+) -> Result<(), String>;
+
+/// The paired statistics, from column `at` of the metrics sheet: a block per
+/// column with the comparison's figure and the baseline's beside it, then the
+/// total request time — the panel the app shows beside its matrices.
+fn write_stats_block(
+    sheet: &mut rust_xlsxwriter::Worksheet,
+    at: u16,
+    stats: &super::stats::PairedStats,
+    head: &rust_xlsxwriter::Format,
+    label: &rust_xlsxwriter::Format,
+    put: &Put,
+) -> Result<(), String> {
+    let plain = rust_xlsxwriter::Format::new();
+    let two = stats.two_sided();
+    sheet
+        .set_column_width(at, 24.0)
+        .map_err(|e| e.to_string())?;
+    sheet
+        .set_column_width(at + 1, 16.0)
+        .map_err(|e| e.to_string())?;
+    if two {
+        sheet
+            .set_column_width(at + 2, 16.0)
+            .map_err(|e| e.to_string())?;
+    }
+    let mut r: u32 = 0;
+    put(sheet, r, at, "Statistics", head)?;
+    put(sheet, r, at + 1, if two { "Comparison" } else { "" }, head)?;
+    if two {
+        put(sheet, r, at + 2, "Baseline", head)?;
+    }
+    r += 1;
+    // A figure that parses as a number is written as one, so it can be
+    // charted or compared with a formula, like the rest of the workbook.
+    let value = |sheet: &mut rust_xlsxwriter::Worksheet,
+                 r: u32,
+                 c: u16,
+                 text: &str|
+     -> Result<(), String> {
+        match parse_report_number(text) {
+            Some(n) => sheet
+                .write_number(r, c, n)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            None => put(sheet, r, c, text, &plain),
+        }
+    };
+    let line = |sheet: &mut rust_xlsxwriter::Worksheet,
+                r: &mut u32,
+                name: &str,
+                cand: &str,
+                base: Option<&str>|
+     -> Result<(), String> {
+        put(sheet, *r, at, name, &plain)?;
+        value(sheet, *r, at + 1, cand)?;
+        if two && let Some(b) = base {
+            value(sheet, *r, at + 2, b)?;
+        }
+        *r += 1;
+        Ok(())
+    };
+    for block in &stats.blocks {
+        put(sheet, r, at, &block.header, label)?;
+        r += 1;
+        for l in &block.lines {
+            line(
+                sheet,
+                &mut r,
+                &l.label,
+                &l.comparison,
+                l.baseline.as_deref(),
+            )?;
+        }
+    }
+    if let Some(t) = &stats.total {
+        put(sheet, r, at, "Total request time", label)?;
+        r += 1;
+        line(sheet, &mut r, t.unit, &t.comparison, t.baseline.as_deref())?;
+    }
+    Ok(())
+}
+
+/// The accuracy table, how the run moved, and the confusion matrices, down
+/// the left of the metrics sheet.
+fn write_metrics_tables(
+    sheet: &mut rust_xlsxwriter::Worksheet,
+    metrics: &super::metrics::Metrics,
+    head: &rust_xlsxwriter::Format,
+    label: &rust_xlsxwriter::Format,
+    axis: &rust_xlsxwriter::Format,
+    put: &Put,
+) -> Result<(), String> {
+    use super::metrics::{
+        ACCURACY_LABEL, COMPARED_LABEL, CORRECT_LABEL, FIXED_LABEL, INCORRECT_LABEL,
+        MOVEMENT_LABEL, REGRESSED_LABEL, STILL_WRONG_LABEL, UNCHANGED_LABEL,
+    };
+    use rust_xlsxwriter::{Color, Format};
+    let mut r: u32 = 0;
+    for (c, h) in [
+        "Column",
+        COMPARED_LABEL,
+        CORRECT_LABEL,
+        INCORRECT_LABEL,
+        ACCURACY_LABEL,
+    ]
+    .iter()
+    .enumerate()
     {
-        put(sheet, r, c as u16, h, &head)?;
+        put(sheet, r, c as u16, h, head)?;
     }
     r += 1;
     for m in metrics.overall.iter().chain(metrics.columns.iter()) {
-        put(sheet, r, 0, &m.header, &label)?;
+        put(sheet, r, 0, &m.header, label)?;
         put(
             sheet,
             r,
@@ -1429,13 +1959,16 @@ fn write_metrics_sheet(
             &Format::new(),
         )?;
         sheet
-            .write_number(r, 2, m.incorrect as f64)
+            .write_number(r, 2, m.correct as f64)
+            .map_err(|e| e.to_string())?;
+        sheet
+            .write_number(r, 3, m.incorrect as f64)
             .map_err(|e| e.to_string())?;
         // Written as a real percentage, not the "95.9%" string the flat
         // formats show, so the cell can be charted or thresholded.
         if let Some(a) = m.accuracy() {
             sheet
-                .write_number_with_format(r, 3, a, &Format::new().set_num_format("0.0%"))
+                .write_number_with_format(r, 4, a, &Format::new().set_num_format("0.0%"))
                 .map_err(|e| e.to_string())?;
         }
         r += 1;
@@ -1444,7 +1977,7 @@ fn write_metrics_sheet(
     // How the run moved, under the accuracy table it can't be read from.
     if let Some(mv) = &metrics.movement {
         r += 2;
-        put(sheet, r, 0, MOVEMENT_LABEL, &head)?;
+        put(sheet, r, 0, MOVEMENT_LABEL, head)?;
         r += 1;
         for (name, n) in [
             (FIXED_LABEL, mv.fixed),
@@ -1452,7 +1985,7 @@ fn write_metrics_sheet(
             (STILL_WRONG_LABEL, mv.still_wrong),
             (UNCHANGED_LABEL, mv.unchanged),
         ] {
-            put(sheet, r, 0, name, &label)?;
+            put(sheet, r, 0, name, label)?;
             sheet
                 .write_number(r, 1, n as f64)
                 .map_err(|e| e.to_string())?;
@@ -1468,22 +2001,154 @@ fn write_metrics_sheet(
             r,
             0,
             &format!("{} — truth (down) by reported value (across)", m.header),
-            &label,
+            label,
         )?;
         r += 1;
         for (c, a) in matrix.axis.iter().enumerate() {
-            put(sheet, r, c as u16 + 1, a, &head)?;
+            put(sheet, r, c as u16 + 1, a, head)?;
         }
         r += 1;
+        // Shaded with the same blue ramp as the app's and the HTML's matrices,
+        // so the busy cells stand out the same way in every format.
+        let max = matrix.max();
         for (t, a) in matrix.axis.iter().enumerate() {
-            put(sheet, r, 0, a, &axis)?;
+            put(sheet, r, 0, a, axis)?;
             for (p, n) in matrix.counts[t].iter().enumerate() {
+                let ([red, green, blue], hot) = super::metrics::heat_rgb(*n, max);
+                let mut fmt = Format::new()
+                    .set_align(rust_xlsxwriter::FormatAlign::Center)
+                    .set_background_color(Color::RGB(
+                        (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue),
+                    ));
+                if hot {
+                    fmt = fmt.set_font_color(Color::White);
+                }
                 sheet
-                    .write_number(r, p as u16 + 1, *n as f64)
+                    .write_number_with_format(r, p as u16 + 1, *n as f64, &fmt)
                     .map_err(|e| e.to_string())?;
             }
             r += 1;
         }
+    }
+    Ok(())
+}
+
+/// The `Differences` worksheet: what differed from the baseline, one line per
+/// changed field — the drill-down's comparison section for every row at once,
+/// since a spreadsheet has no row to click. Each line names its data row (the
+/// row number on the report sheet, and the row's first value, which survives
+/// re-sorting that sheet). Omitted when nothing differed.
+fn write_differences_sheet(
+    workbook: &mut rust_xlsxwriter::Workbook,
+    result: &ReportResult,
+    columns: &[OutputColumn],
+) -> Result<(), String> {
+    use super::detail::DetailSection;
+    use rust_xlsxwriter::{Color, Format, FormatAlign};
+    let diffs: Vec<(usize, String, String, Vec<super::jsondiff::FieldDiff>)> = result
+        .rows
+        .iter()
+        .enumerate()
+        .filter_map(|(r, row)| match super::detail::comparison_section(row)? {
+            DetailSection::Comparison {
+                baseline,
+                comparison,
+                fields,
+            } => Some((r, baseline, comparison, fields)),
+            _ => None,
+        })
+        .collect();
+    let Some((_, base_env, cand_env, _)) = diffs.first() else {
+        return Ok(());
+    };
+    let head = Format::new()
+        .set_bold()
+        .set_background_color(Color::RGB(0x33_3333))
+        .set_font_color(Color::White);
+    let wrap = Format::new().set_text_wrap().set_align(FormatAlign::Top);
+    let changed = wrap.clone().set_background_color(Color::RGB(0xFF_EB9C));
+    let sheet = workbook.add_worksheet();
+    sheet.set_name("Differences").map_err(|e| e.to_string())?;
+    let first = columns.first().map_or("", |c| c.header.as_str());
+    let side = |label: &str, env: &str| {
+        if env.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label} ({env})")
+        }
+    };
+    let heads = [
+        "Row".to_string(),
+        first.to_string(),
+        "Field".to_string(),
+        side("Baseline", base_env),
+        side("Comparison", cand_env),
+    ];
+    for (c, (h, w)) in heads.iter().zip([6.0, 24.0, 28.0, 40.0, 40.0]).enumerate() {
+        sheet
+            .write_string_with_format(0, c as u16, h, &head)
+            .map_err(|e| e.to_string())?;
+        sheet
+            .set_column_width(c as u16, w)
+            .map_err(|e| e.to_string())?;
+    }
+    let mut x: u32 = 1;
+    for (r, _, _, fields) in &diffs {
+        let name = columns
+            .first()
+            .map(|c| c.value(&result.rows[*r], &result.no_match_marker))
+            .unwrap_or_default();
+        for f in fields {
+            // The report sheet's own row number: its header is row 1.
+            sheet
+                .write_number_with_format(x, 0, (*r + 2) as f64, &wrap)
+                .map_err(|e| e.to_string())?;
+            for (c, text, fmt) in [
+                (1, name.as_str(), &wrap),
+                (2, f.path.as_str(), &wrap),
+                (3, f.baseline.as_deref().unwrap_or("\u{2014}"), &changed),
+                (4, f.candidate.as_deref().unwrap_or("\u{2014}"), &changed),
+            ] {
+                sheet
+                    .write_string_with_format(x, c, text, fmt)
+                    .map_err(|e| e.to_string())?;
+            }
+            x += 1;
+        }
+    }
+    sheet.set_freeze_panes(1, 0).map_err(|e| e.to_string())?;
+    sheet
+        .autofilter(0, 0, x - 1, 4)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The `Errors` worksheet: the run's own errors, one per row, as the app and
+/// the HTML list them. Omitted when there were none.
+fn write_errors_sheet(
+    workbook: &mut rust_xlsxwriter::Workbook,
+    errors: &[String],
+) -> Result<(), String> {
+    use rust_xlsxwriter::{Color, Format};
+    if errors.is_empty() {
+        return Ok(());
+    }
+    let head = Format::new()
+        .set_bold()
+        .set_background_color(Color::RGB(0x33_3333))
+        .set_font_color(Color::White);
+    let sheet = workbook.add_worksheet();
+    sheet.set_name("Errors").map_err(|e| e.to_string())?;
+    sheet
+        .set_column_width(0, 100.0)
+        .map_err(|e| e.to_string())?;
+    sheet
+        .write_string_with_format(0, 0, "Error", &head)
+        .map_err(|e| e.to_string())?;
+    for (i, e) in errors.iter().enumerate() {
+        sheet
+            .write_string(i as u32 + 1, 0, e)
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -2341,7 +3006,10 @@ mod tests {
         let html = String::from_utf8(bytes).unwrap();
         assert!(html.starts_with("<!DOCTYPE html>"), "is an HTML document");
         assert!(html.contains("<table>"), "has a table");
-        assert!(html.contains("<th>FILE</th>"), "header cell: {html}");
+        assert!(
+            html.contains("<span class=\"lbl\">FILE</span>"),
+            "header cell: {html}"
+        );
         // The special characters in the first FILE cell are escaped.
         assert!(
             html.contains("a &amp; &lt;b&gt;.jpg"),
@@ -3474,6 +4142,180 @@ mod tests {
 
     /// Every column being `DETAIL` would leave an empty grid, which helps
     /// nobody, so the flag is ignored rather than obeyed off a cliff.
+    /// The JSON carries the rest of the results view in structured form: the
+    /// paired statistics, what differed from the baseline, and the run's
+    /// errors.
+    #[test]
+    fn json_carries_statistics_differences_and_errors() {
+        let cell = r#"{"prod (baseline)":{"status":"ok"},"staging":{"status":"err"}}"#;
+        let mut res = ReportResult {
+            column_order: vec!["Ms".into(), "baseline.Ms".into()],
+            rows: vec![
+                row(&[
+                    ("Ms", "10"),
+                    ("baseline.Ms", "20"),
+                    (crate::report::compare::RESULT_COLUMN, cell),
+                ]),
+                row(&[("Ms", "30"), ("baseline.Ms", "40")]),
+            ],
+            errors: vec!["login failed".into()],
+            ..Default::default()
+        };
+        for c in ["Ms", "baseline.Ms"] {
+            res.column_stats
+                .insert(c.into(), vec![crate::report::model::StatKind::Mean]);
+        }
+        let doc: serde_json::Value =
+            serde_json::from_slice(&JsonWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        let line = &doc["statistics"]["columns"][0]["lines"][0];
+        assert_eq!(line["comparison"], "20", "{doc}");
+        assert_eq!(line["baseline"], "30", "{doc}");
+        let d = &doc["differences"][0];
+        assert_eq!(d["row"], 0);
+        assert_eq!(d["baseline"], "prod");
+        assert_eq!(d["fields"][0]["field"], "status");
+        assert_eq!(d["fields"][0]["comparison"], "err");
+        assert_eq!(doc["errors"][0], "login failed");
+        // And none of the three when there is nothing to say.
+        let plain = ReportResult {
+            column_order: vec!["Ms".into()],
+            rows: vec![row(&[("Ms", "1")])],
+            ..Default::default()
+        };
+        let doc: serde_json::Value =
+            serde_json::from_slice(&JsonWriter.write(&plain, &Header::default()).unwrap()).unwrap();
+        for k in ["statistics", "differences", "errors"] {
+            assert!(doc.get(k).is_none(), "{k}: {doc}");
+        }
+    }
+
+    /// The workbook takes the same additions as sheets of their own; this
+    /// checks they all write (an out-of-range cell or a bad autofilter would
+    /// fail the export) and add to the workbook.
+    #[test]
+    fn xlsx_writes_statistics_differences_and_errors_sheets() {
+        let cell = r#"{"prod (baseline)":{"status":"ok"},"staging":{"status":"err"}}"#;
+        let mut res = ReportResult {
+            column_order: vec!["Ms".into(), "baseline.Ms".into()],
+            rows: vec![row(&[
+                ("Ms", "10"),
+                ("baseline.Ms", "20"),
+                (crate::report::compare::RESULT_COLUMN, cell),
+            ])],
+            errors: vec!["login failed".into()],
+            ..Default::default()
+        };
+        for c in ["Ms", "baseline.Ms"] {
+            res.column_stats
+                .insert(c.into(), vec![crate::report::model::StatKind::Mean]);
+        }
+        let full = XlsxWriter.write(&res, &Header::default()).unwrap();
+        assert_eq!(&full[..2], b"PK");
+        let mut bare = res.clone();
+        bare.errors.clear();
+        bare.rows[0]
+            .cells
+            .remove(crate::report::compare::RESULT_COLUMN);
+        let bare = XlsxWriter.write(&bare, &Header::default()).unwrap();
+        assert!(full.len() > bare.len(), "the extra sheets are written");
+    }
+
+    /// Each row carries its position under every column's sort, worked out
+    /// with the app's own `sort_rows`, so the page sorts exactly as the app.
+    #[test]
+    fn html_rows_carry_the_apps_sort_order_for_every_column() {
+        let res = ReportResult {
+            column_order: vec!["Name".into(), "Ms".into()],
+            rows: vec![
+                row(&[("Name", "b"), ("Ms", "10")]),
+                row(&[("Name", "a"), ("Ms", "")]),
+                row(&[("Name", "c"), ("Ms", "9")]),
+            ],
+            ..Default::default()
+        };
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            html.contains("<th data-c=\"0\""),
+            "headers are sortable: {html}"
+        );
+        assert!(html.contains("class=\"rz\""), "and resizable");
+        // Name ascending is a, b, c; Ms ascending is 9, 10, then the blank
+        // (blanks last both ways, so descending is 10, 9, blank).
+        assert!(
+            html.contains("data-o=\"0\" data-sa=\"1 1\" data-sd=\"1 0\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("data-o=\"1\" data-sa=\"0 2\" data-sd=\"2 2\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("data-o=\"2\" data-sa=\"2 0\" data-sd=\"0 1\""),
+            "{html}"
+        );
+    }
+
+    /// The statistics sit beside the matrices, comparison and baseline side
+    /// by side, as in the app.
+    #[test]
+    fn html_states_paired_statistics_beside_the_table() {
+        let mut res = ReportResult {
+            column_order: vec!["Ms".into(), "baseline.Ms".into()],
+            rows: vec![
+                row(&[("Ms", "10"), ("baseline.Ms", "20")]),
+                row(&[("Ms", "30"), ("baseline.Ms", "40")]),
+            ],
+            ..Default::default()
+        };
+        res.column_stats
+            .insert("Ms".into(), vec![crate::report::model::StatKind::Mean]);
+        res.column_stats.insert(
+            "baseline.Ms".into(),
+            vec![crate::report::model::StatKind::Mean],
+        );
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        let stats = &html[html.find("<div class=\"stats\">").expect(&html)..];
+        assert!(
+            stats.contains("<th>Comparison</th><th>Baseline</th>"),
+            "{stats}"
+        );
+        assert!(
+            stats.contains("<td class=\"v\">20</td><td>30</td>"),
+            "{stats}"
+        );
+    }
+
+    /// The drill-down names what differed from the baseline.
+    #[test]
+    fn html_detail_lists_what_differed_from_the_baseline() {
+        let cell = r#"{"prod (baseline)":{"status":"ok"},"staging":{"status":"err"}}"#;
+        let res = ReportResult {
+            column_order: vec!["Name".into()],
+            rows: vec![row(&[
+                ("Name", "x"),
+                (crate::report::compare::RESULT_COLUMN, cell),
+            ])],
+            ..Default::default()
+        };
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(html.contains("What differed from the baseline"), "{html}");
+        assert!(html.contains("<th>Baseline (prod)</th><th>Comparison (staging)</th>"));
+        assert!(html.contains("<tr class=\"chg\"><td>status</td><td>ok</td><td>err</td></tr>"));
+    }
+
+    /// Run-level errors are listed ahead of the table.
+    #[test]
+    fn html_lists_the_runs_own_errors() {
+        let res = ReportResult {
+            column_order: vec!["Name".into()],
+            rows: vec![row(&[("Name", "x")])],
+            errors: vec!["login failed <401>".into()],
+            ..Default::default()
+        };
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(html.contains("<li>login failed &lt;401&gt;</li>"), "{html}");
+    }
+
     #[test]
     fn an_all_detail_report_still_renders_its_grid() {
         let mut res = ReportResult {
@@ -3483,7 +4325,10 @@ mod tests {
         };
         res.column_details.insert("Raw".to_string());
         let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
-        assert!(html.contains("<th>Raw</th>"), "the grid survives: {html}");
+        assert!(
+            html.contains("<span class=\"lbl\">Raw</span>"),
+            "the grid survives: {html}"
+        );
     }
 
     /// The browser makes no decisions about the report: each row carries the
@@ -3562,11 +4407,13 @@ mod tests {
         );
         // The empty Pass/Fail cell is not: clicking it could only ever empty
         // the table.
-        // Three buttons (All, Correct, Incorrect) plus the two cells that
-        // counted something; the empty Pass/Fail cell is not pickable, since
-        // clicking it could only ever empty the table.
+        // Three buttons (All, Correct, Incorrect), the Correct and Incorrect
+        // cards of the roll-up and of the lone scored column (both count the
+        // same rows, as in the app), plus the two cells that counted
+        // something; the empty Pass/Fail cell is not pickable, since clicking
+        // it could only ever empty the table.
         let picks = html.matches("data-i=\"").count();
-        assert_eq!(picks, 5, "{html}");
+        assert_eq!(picks, 9, "{html}");
     }
 
     /// When a comparison kept the baseline row, a JSON detail column is shown

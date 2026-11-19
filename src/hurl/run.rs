@@ -799,10 +799,18 @@ fn assert_detail(e: &RunnerError) -> String {
     e.description()
 }
 
-/// A concise, single-line rendering of a runner error for the status bar:
-/// its description plus the offending source line when available.
+/// Keep the transport cause, not just Hurl's generic "HTTP connection" heading.
+/// Do not append the request source: its URL can contain resolved credentials.
 fn render_error(e: &RunnerError, lines: &[&str]) -> String {
     let desc = e.description();
+    if let hurl::runner::RunnerErrorKind::Http(error) = &e.kind {
+        let detail = error
+            .message()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        return format!("{desc}: {detail}");
+    }
     let line = e.source_info().start.line;
     match lines.get(line.saturating_sub(1)) {
         Some(l) if !l.trim().is_empty() => format!("{desc}: {}", l.trim()),
@@ -839,6 +847,67 @@ fn reason(status: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_diagnostics_preserve_codes_and_causes_without_copying_request_secrets() {
+        use hurl::runner::RunnerErrorKind;
+        use hurl_core::ast::SourceInfo;
+        use hurl_core::reader::Pos;
+
+        let source = ["GET https://user:password@example.test/?token=private"];
+        for code in [6, 7, 28, 35, 60] {
+            let curl_error = curl::Error::new(code);
+            let cause = curl_error.description().to_string();
+            let error = RunnerError::new(
+                SourceInfo::new(Pos::new(1, 5), Pos::new(1, 20)),
+                RunnerErrorKind::Http(curl_error.into()),
+                false,
+            );
+            let message = render_error(&error, &source);
+            assert!(message.contains(&format!("({code})")), "{message}");
+            assert!(message.contains(&cause), "{message}");
+            assert!(
+                !message.contains("password") && !message.contains("private"),
+                "{message}"
+            );
+            assert!(
+                !message.contains('\n') && !message.contains('\u{1b}'),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn stalled_connections_report_the_cause_in_single_and_streaming_results() {
+        // The kernel completes the connection, but nobody accepts or replies.
+        // No DNS dependency, abandoned server thread, or unbounded socket wait.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let content = format!(
+            "GET http://{}/\n[Options]\nproxy:\nmax-time: 100ms\n",
+            listener.local_addr().unwrap()
+        );
+        let single = run_hurl(&content, &HashMap::new(), None);
+        let mut streamed = Vec::new();
+        let streaming = run_hurl_streaming_with(
+            &content,
+            &HashMap::new(),
+            None,
+            |_, _| EntrySetup::Bind(Vec::new()),
+            |entry| streamed.push(entry.error.clone()),
+            |_, _, _| {},
+        );
+        for output in [single, streaming] {
+            assert_eq!(output.entries.len(), 1);
+            let entry = &output.entries[0];
+            assert_eq!(entry.status, 0);
+            assert!(!entry.ok);
+            let message = entry.error.as_deref().expect("transport diagnostic");
+            assert!(message.contains("(28)"), "{message}");
+            assert!(message.to_lowercase().contains("time"), "{message}");
+            assert_eq!(output.error.as_deref(), Some(message));
+            assert_eq!(streamed[0].as_deref(), Some(message));
+        }
+    }
 
     /// Removes a path when it goes out of scope, so a failing assertion can't
     /// leave scratch files behind. The plain `remove_*` call these tests used to

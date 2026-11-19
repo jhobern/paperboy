@@ -78,6 +78,18 @@ pub trait EntryRunner: Sync {
     fn offline(&self) -> bool {
         false
     }
+
+    /// Offline dependency discovery visits both conditional arms, unlike a
+    /// dry-run row preview. These names cannot be known without live execution.
+    fn dependency_probe(&self) -> Option<&std::collections::HashSet<String>> {
+        None
+    }
+
+    /// File references are fingerprinted by the durable headless planner using
+    /// the same root that will be used when the request is actually sent.
+    fn input_root(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 /// Production [`EntryRunner`]: routes each send through
@@ -89,6 +101,9 @@ pub struct LiveRunner {
 }
 
 impl EntryRunner for LiveRunner {
+    fn input_root(&self) -> Option<&std::path::Path> {
+        self.file_root.as_deref()
+    }
     fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
         crate::request::run_resolved_entry(base, vars, self.file_root.as_deref(), &[])
     }
@@ -174,6 +189,9 @@ pub enum RowEvent<'r> {
 /// (the `path` still identifies the target row).
 pub type RowSink<'a> = dyn Fn(RowEvent) + Sync + 'a;
 
+/// The lexical execution scope responsible for an inherited diagnostic.
+pub type ScopedError = (Vec<(usize, usize)>, String);
+
 /// A cooperative stop switch for a run in progress: flip it and the flow stops
 /// *starting* work, without abandoning what is already under way.
 ///
@@ -184,11 +202,13 @@ pub type RowSink<'a> = dyn Fn(RowEvent) + Sync + 'a;
 /// leaves the rows that never ran present-but-failed, blaming the API for a
 /// stop the user asked for. Cancelling mid-row would emit half-filled rows.
 ///
-/// So this flag is only read where a *new* unit of work would be claimed (see
+/// Ordinarily this flag is read where a *new* unit of work would be claimed (see
 /// [`Exec::run_iterations`]): a loop iteration already running finishes its
 /// requests and emits its row whole, every block still returns normally, and
 /// `run_cleanups` therefore runs on its ordinary path. What a stopped run
 /// leaves is a report with fewer rows, each of them complete and honest.
+/// Conditional bodies may also stop between statements. Such a row is left
+/// unfinished and emits no completion; saved resume must replay it.
 #[derive(Debug, Default)]
 pub struct Cancel(AtomicBool);
 
@@ -382,6 +402,12 @@ fn planned_columns(flow: &ReportFlow, ctx: &RunContext) -> std::collections::Has
                 FlowNode::ForEach { body, .. }
                 | FlowNode::ForEnvs { body, .. }
                 | FlowNode::Graph { body, .. } => walk(body, ctx, w),
+                FlowNode::Branch {
+                    body, alternative, ..
+                } => {
+                    walk(body, ctx, w);
+                    walk(alternative, ctx, w);
+                }
                 _ => {}
             }
         }
@@ -449,6 +475,9 @@ fn template_refs(template: &str) -> Vec<String> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RowSelection {
     patterns: Vec<Vec<(usize, Option<usize>)>>,
+    /// Execution-only replacements, applied after tuple bindings and captures.
+    bindings: HashMap<Vec<(usize, usize)>, HashMap<String, String>>,
+    inspect: bool,
 }
 
 impl RowSelection {
@@ -461,6 +490,7 @@ impl RowSelection {
                 .iter()
                 .map(|p| p.iter().map(|&(n, i)| (n, Some(i))).collect())
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -494,7 +524,23 @@ impl RowSelection {
                     .collect()
             })
             .collect();
-        RowSelection { patterns }
+        RowSelection {
+            patterns,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_bindings(
+        mut self,
+        bindings: HashMap<Vec<(usize, usize)>, HashMap<String, String>>,
+    ) -> Self {
+        self.bindings = bindings;
+        self
+    }
+
+    pub fn with_inspection(mut self) -> Self {
+        self.inspect = true;
+        self
     }
 }
 
@@ -531,6 +577,13 @@ pub fn run_flow_raw_selected(
     ctx: &RunContext,
     selection: Option<&RowSelection>,
 ) -> ReportResult {
+    let errors = super::validate::branch_truth_errors(flow, ctx.strings);
+    if !errors.is_empty() {
+        return ReportResult {
+            errors,
+            ..Default::default()
+        };
+    }
     let mut ex = Exec::new(ctx);
     ex.selection = selection.cloned().map(std::sync::Arc::new);
     // Only `baseline_show` is wanted here, and it is a list of field names: no
@@ -550,8 +603,23 @@ pub fn run_flow_raw_selected(
         .and_then(|f| f.get("PRELUDE_NO_MATCH_MARKER"))
         .cloned()
         .unwrap_or_else(|| DEFAULT_NO_MATCH.to_string());
+    let mut image_setting = |key: &str| {
+        let value = ex.lookup(key)?;
+        if let Some(message) =
+            super::validate::image_setting_warning(key, value.trim(), ctx.strings)
+        {
+            ex.warnings.push(message);
+            None
+        } else {
+            Some(value.trim().to_string())
+        }
+    };
+    let image_max_edge =
+        image_setting("PRELUDE_IMAGE_MAX_EDGE").and_then(|v| v.parse::<u32>().ok());
+    let image_quality = image_setting("PRELUDE_IMAGE_QUALITY").and_then(|v| v.parse::<u8>().ok());
     ReportResult {
         rows,
+        unfinished_rows: ex.unfinished_rows,
         // A run that returned produced every row it was going to; only a
         // caller that stopped one part-way (see [`Cancel`]) can say otherwise,
         // and it sets this afterwards.
@@ -561,6 +629,8 @@ pub fn run_flow_raw_selected(
         planned_columns: planned_columns(flow, ctx),
         column_order: ex.column_order,
         no_match_marker,
+        image_max_edge,
+        image_quality,
         errors: ex.errors,
         skipped: ex.skipped,
         warnings: ex.warnings,
@@ -595,6 +665,12 @@ pub fn run_flow_raw_selected(
 /// snapshot (a no-op otherwise). Done off the row model so the CSV writer and
 /// the TUI grid both pick it up unchanged. Applied once, after the emit phase.
 pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
+    finalize_data(result, flow, ctx);
+    resolve_images(result, flow, ctx);
+}
+
+/// Finalize authoritative saved rows without re-fetching images or HTTP.
+pub fn finalize_data(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
     // What kind of result this is, decided before anything reads it: an
     // offline runner sent nothing, so every response-shaped cell below is
     // blank by construction, and the collapse and the scoring must say
@@ -634,7 +710,6 @@ pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) 
         }
     }
     resolve_truths(result, flow);
-    resolve_images(result, flow, ctx);
     result.finalized = true;
 }
 
@@ -915,7 +990,7 @@ fn resolve_truths(result: &mut ReportResult, flow: &ReportFlow) {
 /// an API run must not fail because an illustration beside it was unreachable.
 /// The cell simply stays as its text, which is what CSV and JSON would have
 /// written anyway.
-fn resolve_images(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
+pub fn resolve_images(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
     let columns = result.resolved_columns(&flow.header);
     let image_columns: Vec<&super::model::OutputColumn> =
         columns.iter().filter(|c| c.image.is_some()).collect();
@@ -924,6 +999,12 @@ fn resolve_images(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext
     }
     let mut resolver = super::image::ImageResolver::new();
     resolver.offline = ctx.runner.offline();
+    if let Some(edge) = result.image_max_edge {
+        resolver.max_edge = edge;
+    }
+    if let Some(quality) = result.image_quality {
+        resolver.quality = quality;
+    }
     let mut images = HashMap::new();
     for (r, row) in result.rows.iter().enumerate() {
         for col in &image_columns {
@@ -943,6 +1024,9 @@ fn resolve_images(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext
 /// Mutable interpreter state threaded through the walk.
 struct Exec<'a> {
     ctx: &'a RunContext<'a>,
+    /// A branch stopped mid-row. It must not emit a durable completion.
+    interrupted: bool,
+    unfinished_rows: Vec<ReportRow>,
     /// The rows this run is limited to, when it is re-producing some rows of an
     /// earlier run rather than all of them (see [`RowSelection`]). `None` runs
     /// every iteration of every loop.
@@ -1065,6 +1149,7 @@ struct Exec<'a> {
     /// request that failed was written outside its loop. Never re-raised:
     /// the run's own flat error list keeps each error exactly once.
     inherited_errors: Vec<String>,
+    inherited_error_origins: Vec<ScopedError>,
     /// The spans of [`errors`](Self::errors) that were merged *up* from a
     /// finished loop's iterations rather than raised in this scope. They belong
     /// to the rows that loop produced and are already attributed there, so they
@@ -1098,12 +1183,14 @@ struct ExecState {
     broadcast: HashMap<String, String>,
     baseline_show: Vec<String>,
     inherited_errors: Vec<String>,
+    inherited_error_origins: Vec<ScopedError>,
 }
 
 /// The per-iteration output collected from a forked [`Exec`], reassembled in
 /// iteration order after a (possibly parallel) loop.
 struct IterOut {
     rows: Vec<ReportRow>,
+    unfinished_rows: Vec<ReportRow>,
     /// See [`ReportResult::role_targets`]: an `ENVS` loop nested in another
     /// loop resolves its roles on the fork, so the answer has to travel back
     /// with the rows it tagged.
@@ -1630,6 +1717,8 @@ impl<'a> Exec<'a> {
     fn new(ctx: &'a RunContext<'a>) -> Self {
         Exec {
             ctx,
+            interrupted: false,
+            unfinished_rows: Vec::new(),
             selection: None,
             scopes: vec![HashMap::new()],
             lists: HashMap::new(),
@@ -1656,6 +1745,7 @@ impl<'a> Exec<'a> {
             role_targets: HashMap::new(),
             baseline_show: Vec::new(),
             inherited_errors: Vec::new(),
+            inherited_error_origins: Vec::new(),
             borrowed_errors: Vec::new(),
         }
     }
@@ -1703,6 +1793,15 @@ impl<'a> Exec<'a> {
                 .chain(self.scope_errors())
                 .cloned()
                 .collect(),
+            inherited_error_origins: if self.selection.as_ref().is_some_and(|s| s.inspect) {
+                self.inherited_error_origins
+                    .iter()
+                    .cloned()
+                    .chain(self.scope_errors().map(|e| (self.path.clone(), e.clone())))
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -1725,6 +1824,8 @@ impl<'a> Exec<'a> {
     fn from_state(ctx: &'a RunContext<'a>, state: ExecState) -> Self {
         Exec {
             ctx,
+            interrupted: false,
+            unfinished_rows: Vec::new(),
             selection: state.selection,
             scopes: state.scopes,
             lists: state.lists,
@@ -1742,6 +1843,7 @@ impl<'a> Exec<'a> {
             target_env: state.target_env,
             broadcast: state.broadcast,
             inherited_errors: state.inherited_errors,
+            inherited_error_origins: state.inherited_error_origins,
             borrowed_errors: Vec::new(),
             column_order: Vec::new(),
             timing_columns: Vec::new(),
@@ -1830,6 +1932,36 @@ impl<'a> Exec<'a> {
             m.insert(k.clone(), v.clone());
         }
         m
+    }
+
+    fn request_vars(&self, qualified: bool) -> HashMap<String, String> {
+        let mut vars = if qualified {
+            self.vars_for_source()
+        } else {
+            self.vars_for()
+        };
+        if let Some(bindings) = self
+            .selection
+            .as_ref()
+            .and_then(|s| s.bindings.get(&self.path))
+        {
+            if qualified {
+                for (key, value) in &mut vars {
+                    if let Some((_, name)) = key.rsplit_once('.')
+                        && let Some(replacement) = bindings.get(name)
+                    {
+                        *value = replacement.clone();
+                    }
+                }
+            }
+            vars.extend(bindings.clone());
+        }
+        if let Some(unknown) = self.ctx.runner.dependency_probe() {
+            for name in unknown {
+                vars.insert(name.clone(), format!("{{{{{name}}}}}"));
+            }
+        }
+        vars
     }
 
     /// [`Exec::vars_for`] plus the `step.var` names.
@@ -2039,6 +2171,9 @@ impl<'a> Exec<'a> {
         let mut cleanups: Vec<&FlowNode> = Vec::new();
 
         for (node_index, node) in nodes.iter().enumerate() {
+            if self.interrupted {
+                break;
+            }
             match node {
                 // Comments are carried through the AST so edits don't delete
                 // them; they do nothing at run time.
@@ -2124,11 +2259,15 @@ impl<'a> Exec<'a> {
                     self.run_graph(body, parallel.as_ref(), &mut own)
                 }
                 FlowNode::Cleanup { .. } => cleanups.push(node),
+                FlowNode::Branch { .. } => self.exec_branch(node, &mut own, None),
+                FlowNode::Rethrow if self.ctx.runner.dependency_probe().is_some() => {}
+                FlowNode::Rethrow => self
+                    .errors
+                    .push(self.ctx.strings.run_rethrow_outside.into()),
             }
         }
 
         self.run_cleanups(&cleanups);
-
         if has_loop {
             for row in &mut child_rows {
                 for (k, v) in &own {
@@ -2136,8 +2275,166 @@ impl<'a> Exec<'a> {
                 }
             }
             child_rows
+        } else if self.interrupted {
+            if is_leaf {
+                self.unfinished_rows.push(self.make_row(own, err_mark));
+            }
+            Vec::new()
         } else {
             vec![self.emit_row(own, err_mark)]
+        }
+    }
+
+    fn eval_condition(&self, condition: &super::flow::Condition) -> Result<bool, String> {
+        use super::flow::Condition;
+        match condition {
+            Condition::Equal {
+                left,
+                right,
+                negate,
+            } => {
+                let vars = self.request_vars(true);
+                for value in [left, right] {
+                    for key in crate::environment::referenced_keys(value) {
+                        if !vars.contains_key(&key) {
+                            return Err(crate::i18n::fill(
+                                self.ctx.strings.run_conditional_undefined,
+                                &[&key],
+                            ));
+                        }
+                    }
+                }
+                Ok((substitute(left, &vars) == substitute(right, &vars)) != *negate)
+            }
+            Condition::And(a, b) => Ok(self.eval_condition(a)? && self.eval_condition(b)?),
+            Condition::Or(a, b) => Ok(self.eval_condition(a)? || self.eval_condition(b)?),
+        }
+    }
+
+    fn exec_branch(
+        &mut self,
+        node: &FlowNode,
+        own: &mut HashMap<String, String>,
+        recovering: Option<&[String]>,
+    ) {
+        use super::flow::BranchKind;
+        let FlowNode::Branch {
+            kind,
+            body,
+            alternative,
+        } = node
+        else {
+            return;
+        };
+        // Offline expansion must not guess a branch from absent HTTP results.
+        // Branches are row-local, so the enclosing loop still defines every slot.
+        if self.ctx.runner.offline() {
+            if self.ctx.runner.dependency_probe().is_some() {
+                for arm in [body, alternative] {
+                    let mut probe = Self::from_state(self.ctx, self.to_state());
+                    probe.exec_block(arm);
+                    self.errors.extend(probe.errors);
+                }
+            }
+            return;
+        }
+        match kind {
+            BranchKind::If(condition) => match self.eval_condition(condition) {
+                Ok(test) => {
+                    self.exec_inline(if test { body } else { alternative }, own, recovering)
+                }
+                Err(error) => self.errors.push(error),
+            },
+            BranchKind::Try { error_var } => {
+                let mark = self.errors.len();
+                let skip_mark = self.skipped.len();
+                let previous_cells = own.clone();
+                self.exec_inline(body, own, recovering);
+                if self.errors.len() == mark || self.ctx.cancel.is_some_and(Cancel::stopped) {
+                    return;
+                }
+                let caught = self.errors.split_off(mark);
+                let caught_skips = self.skipped.split_off(skip_mark);
+                *own = previous_cells;
+                let previous = self
+                    .scopes
+                    .last_mut()
+                    .unwrap()
+                    .insert(error_var.clone(), caught.join("\n"));
+                let previous_capture = self.captures.insert(error_var.clone(), caught.join("\n"));
+                self.exec_inline(alternative, own, Some(&caught));
+                if let Some(value) = previous_capture {
+                    self.captures.insert(error_var.clone(), value);
+                } else {
+                    self.captures.remove(error_var);
+                }
+                let frame = self.scopes.last_mut().unwrap();
+                if let Some(value) = previous {
+                    frame.insert(error_var.clone(), value);
+                } else {
+                    frame.remove(error_var);
+                }
+                if self.errors.len() == mark && !self.ctx.cancel.is_some_and(Cancel::stopped) {
+                    self.warnings.extend(
+                        caught
+                            .iter()
+                            .map(|e| crate::i18n::fill(self.ctx.strings.run_recovered, &[e])),
+                    );
+                } else {
+                    // Failed recovery retains the original cause as well as its own error.
+                    for error in caught {
+                        if !self.errors[mark..].contains(&error) {
+                            self.errors.push(error);
+                        }
+                    }
+                    self.skipped.extend(caught_skips);
+                }
+            }
+        }
+    }
+
+    fn exec_inline(
+        &mut self,
+        nodes: &[FlowNode],
+        own: &mut HashMap<String, String>,
+        recovering: Option<&[String]>,
+    ) {
+        let mark = self.errors.len();
+        let mut cleanups = Vec::new();
+        for node in nodes {
+            if self.errors.len() > mark || self.ctx.cancel.is_some_and(Cancel::stopped) {
+                break;
+            }
+            match node {
+                FlowNode::Comment(_) => {}
+                FlowNode::Assign { key, value } => {
+                    self.set_var(key, substitute(&unquote(value), &self.vars_for_source()));
+                }
+                FlowNode::Request {
+                    name, alias, using, ..
+                } => {
+                    self.run_request(name, alias.as_deref(), using);
+                }
+                FlowNode::Report(stmt) => {
+                    for (key, value) in self.eval_report(stmt) {
+                        self.note_column(&key);
+                        own.insert(key, value);
+                    }
+                }
+                FlowNode::Cleanup { .. } => cleanups.push(node),
+                FlowNode::Branch { .. } => self.exec_branch(node, own, recovering),
+                FlowNode::Rethrow => match recovering {
+                    Some(errors) => self.errors.extend_from_slice(errors),
+                    None => self
+                        .errors
+                        .push(self.ctx.strings.run_rethrow_outside.into()),
+                },
+                _ => self.errors.push(self.ctx.strings.run_branch_shape.into()),
+            }
+        }
+        self.run_cleanups(&cleanups);
+        if self.ctx.cancel.is_some_and(Cancel::stopped) {
+            self.interrupted = true;
         }
     }
 
@@ -2157,6 +2454,17 @@ impl<'a> Exec<'a> {
     /// every time.
     fn run_cleanups(&mut self, cleanups: &[&FlowNode]) {
         if cleanups.is_empty() {
+            return;
+        }
+        if self.ctx.runner.dependency_probe().is_some() {
+            for node in cleanups {
+                if let FlowNode::Cleanup {
+                    name, alias, using, ..
+                } = node
+                {
+                    self.run_request(name, alias.as_deref(), using);
+                }
+            }
             return;
         }
         // Work out every cleanup's dependencies and position *before* running
@@ -2524,9 +2832,34 @@ impl<'a> Exec<'a> {
     /// keeps the returned rows correct even for reports that follow the loop.
     /// Fires the streaming [`RowSink`] (if any) with the finished row before
     /// returning it, so a live front-end sees each row as it completes.
-    fn emit_row(&self, mut cells: HashMap<String, String>, err_mark: usize) -> ReportRow {
+    fn emit_row(&self, cells: HashMap<String, String>, err_mark: usize) -> ReportRow {
+        let row = self.make_row(cells, err_mark);
+        if let Some(sink) = self.ctx.sink {
+            sink(RowEvent::Completed {
+                row: &row,
+                errors: &row.errors,
+            });
+        }
+        row
+    }
+
+    fn make_row(&self, mut cells: HashMap<String, String>, err_mark: usize) -> ReportRow {
         for (k, v) in &self.broadcast {
             cells.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        if self.selection.as_ref().is_some_and(|s| s.inspect) {
+            cells.insert(
+                "\0skipped".into(),
+                serde_json::to_string(&self.skipped).unwrap(),
+            );
+            cells.insert(
+                "\0warnings".into(),
+                serde_json::to_string(&self.warnings).unwrap(),
+            );
+            cells.insert(
+                "\0shared_errors".into(),
+                serde_json::to_string(&self.inherited_error_origins).unwrap(),
+            );
         }
         // `run_cleanups` *drains* the errors a teardown raised (they become
         // warnings), so the list can be shorter than the mark taken when the
@@ -2537,7 +2870,7 @@ impl<'a> Exec<'a> {
             .chain(self.errors[err_mark.min(self.errors.len())..].iter())
             .cloned()
             .collect();
-        let row = ReportRow {
+        ReportRow {
             cells,
             vars: self.visible_vars(),
             key: self.key_parts.clone(),
@@ -2546,14 +2879,7 @@ impl<'a> Exec<'a> {
             role: self.role,
             comparison: self.comparison.clone(),
             errors,
-        };
-        if let Some(sink) = self.ctx.sink {
-            sink(RowEvent::Completed {
-                row: &row,
-                errors: &row.errors,
-            });
         }
-        row
     }
 
     // --- requests & reports ------------------------------------------------
@@ -2577,7 +2903,7 @@ impl<'a> Exec<'a> {
                 return None;
             }
         };
-        let base = match self.apply_using(name, base, using, &self.vars_for_source()) {
+        let base = match self.apply_using(name, base, using, &self.request_vars(true)) {
             Ok(base) => base,
             Err(e) => {
                 self.errors.push(e);
@@ -2585,18 +2911,27 @@ impl<'a> Exec<'a> {
                 return None;
             }
         };
-        let out = self.ctx.runner.run(&base, &self.vars_for());
+        let out = self.ctx.runner.run(&base, &self.request_vars(false));
         self.record_generated(&step, &out.generated);
         if let Some(err) = &out.error {
             self.errors.push(format!("{name}: {err}"));
         }
-        let eo = out.entries.into_iter().next();
+        let successful = out.error.is_none();
+        let surviving: Vec<_> = out.entries.into_iter().filter(|e| !e.superseded).collect();
+        let representative = surviving.iter().position(|e| !e.ok).unwrap_or(0);
+        let eo = surviving.into_iter().nth(representative);
         match &eo {
             Some(eo) => {
                 self.record_captures(&step, &eo.captures);
-                self.note_step(&step, name, eo.ok);
+                self.note_step(&step, name, eo.ok && successful);
             }
-            None => self.note_step(&step, name, false),
+            None => {
+                if successful {
+                    self.errors
+                        .push(format!("{name}: request produced no response"));
+                }
+                self.note_step(&step, name, false);
+            }
         }
         eo
     }
@@ -2751,7 +3086,7 @@ impl<'a> Exec<'a> {
         // An unmet `USING` requirement means the request would send something
         // other than what the flow asked for, so it is not sent at all: the row
         // gets an `Error` cell instead of a plausible-looking success.
-        let base = match self.apply_using(name, base, using, &self.vars_for_source()) {
+        let base = match self.apply_using(name, base, using, &self.request_vars(true)) {
             Ok(base) => base,
             Err(e) => {
                 self.errors.push(e.clone());
@@ -2760,7 +3095,7 @@ impl<'a> Exec<'a> {
                 return cells;
             }
         };
-        let out = self.ctx.runner.run(&base, &self.vars_for());
+        let out = self.ctx.runner.run(&base, &self.request_vars(false));
         self.record_generated(&alias, &out.generated);
         // The run's verdict, decided over the *surviving* attempts only: with
         // `[Options] retry`, a poll that answered twice and then succeeded is
@@ -2917,6 +3252,15 @@ impl<'a> Exec<'a> {
             cells.push((key, value));
         }
 
+        // Private native-state inspection is explicit and does not widen the
+        // rendered table or record unreported authentication/setup responses.
+        let inspection = self.selection.as_ref().is_some_and(|s| s.inspect).then(|| {
+            cells
+                .iter()
+                .map(|(key, value)| (format!("\0inspect:{key}"), value.clone()))
+                .collect::<Vec<_>>()
+        });
+
         // Column selection is applied to the fully-built `cells` list.
         //
         // `has_declared`: true when this request has at least one declared field
@@ -2972,6 +3316,9 @@ impl<'a> Exec<'a> {
             });
         }
 
+        if let Some(inspection) = inspection {
+            cells.extend(inspection);
+        }
         cells
     }
 
@@ -3023,6 +3370,7 @@ impl<'a> Exec<'a> {
             let rows = sub.exec_block(body);
             IterOut {
                 rows,
+                unfinished_rows: sub.unfinished_rows,
                 role_targets: sub.role_targets,
                 columns: sub.column_order,
                 timing_columns: sub.timing_columns,
@@ -3251,6 +3599,7 @@ impl<'a> Exec<'a> {
             let rows = sub.exec_block(body);
             IterOut {
                 rows,
+                unfinished_rows: sub.unfinished_rows,
                 role_targets: sub.role_targets,
                 columns: sub.column_order,
                 timing_columns: sub.timing_columns,
@@ -3400,6 +3749,7 @@ impl<'a> Exec<'a> {
                 }
             }
             rows.extend(out.rows);
+            self.unfinished_rows.extend(out.unfinished_rows);
         }
         if self.errors.len() > borrowed_from {
             self.borrowed_errors
@@ -4076,7 +4426,7 @@ mod tests {
         entries: &[HurlEntry],
         base_vars: &[(&str, &str)],
         named_envs: &[(&str, &[(&str, &str)])],
-        fake: &Fake,
+        fake: &dyn EntryRunner,
     ) -> ReportResult {
         let flow = parse_flow(src).expect("flow parses");
         let ctx = RunContext {
@@ -9794,6 +10144,218 @@ mod tests {
         assert_eq!(res.column_order, vec!["r.Response", "r.A", "r.B"]);
     }
 
+    #[test]
+    fn image_settings_resolve_templates_and_warn_on_invalid_runtime_values() {
+        let fake = Fake::new(&[]);
+        let src = "PRELUDE_IMAGE_MAX_EDGE=\"{{EDGE}}\"\nREPORT \"case\" AS Case\n";
+        let good = run(
+            src,
+            &[],
+            &[("EDGE", "160"), ("PRELUDE_IMAGE_QUALITY", "40")],
+            &[],
+            &fake,
+        );
+        assert_eq!(good.image_max_edge, Some(160));
+        assert_eq!(good.image_quality, Some(40));
+        let bad = run(src, &[], &[("EDGE", "bad")], &[], &fake);
+        assert_eq!(bad.image_max_edge, None);
+        assert!(
+            bad.warnings
+                .iter()
+                .any(|w| w.contains("PRELUDE_IMAGE_MAX_EDGE"))
+        );
+    }
+
+    #[test]
+    fn conditional_truth_conflicts_fail_before_requests_or_scoring() {
+        let fake = Fake::new(&[]);
+        for alternative in [
+            "REPORT \"Fake\" AS Verdict TRUTH \"Fake\"",
+            "REPORT \"Real\" AS Verdict",
+        ] {
+            let source = format!(
+                "REQUEST send\nFOR item IN [\"Real\",\"Fake\"]\nIF \"{{{{item}}}}\" == \"Real\"\nREPORT \"Real\" AS Verdict TRUTH \"Real\"\nELSE\n{alternative}\nEND\nEND\n"
+            );
+            let result = run(&source, &[entry("send", &[])], &[], &[], &fake);
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("conflicting conditional TRUTH"))
+            );
+            assert!(result.rows.is_empty());
+            assert!(result.verdicts.is_empty());
+            assert_eq!(fake.call_count(), 0);
+        }
+        for show in ["", " SHOW(HttpStatus)"] {
+            let source = format!(
+                "IF \"a\" == \"b\"\nREPORT REQUEST send WITH\nVerdict: body TRUTH \"Real\"\nEND\nELSE\nREPORT REQUEST send{show}\nEND\n"
+            );
+            let result = run(
+                &source,
+                &[entry("send", &[("Verdict", "body")])],
+                &[],
+                &[],
+                &fake,
+            );
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("conflicting conditional TRUTH"))
+            );
+            assert_eq!(fake.call_count(), 0);
+        }
+        let result = run(
+            "FOR item IN [\"Real\",\"Fake\"]\nIF \"{{item}}\" == \"Real\"\nREPORT item AS Verdict TRUTH \"{{item}}\"\nELSE\nREPORT item AS Verdict TRUTH \"{{item}}\"\nEND\nEND\n",
+            &[],
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.rows.len(), 2);
+        assert!(result.verdicts.values().all(|v| *v == Verdict::Correct));
+    }
+
+    #[test]
+    fn conditional_probe_uses_the_surviving_retry_captures() {
+        struct Retrying(Fake);
+        impl EntryRunner for Retrying {
+            fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
+                let mut out = self.0.run(base, vars);
+                let mut replaced = DryRunner.run(base, vars).entries.pop().unwrap();
+                replaced.status = 400;
+                replaced.superseded = true;
+                replaced.ok = false;
+                replaced.error = Some("temporary failure".into());
+                replaced.captures = vec![("probe_status".into(), "400".into())];
+                out.entries.insert(0, replaced);
+                out
+            }
+        }
+        let runner = Retrying(Fake::new(&[(
+            "probe",
+            Canned {
+                status: 200,
+                captures: vec![("probe_status".into(), "200".into())],
+                ..Default::default()
+            },
+        )]));
+        let result = run(
+            "TRY\nREQUEST probe\nRECOVER failure\nRETHROW\nEND\nIF \"{{probe_status}}\" == \"200\"\nREPORT \"ok\" AS Status\nELSE\nREPORT \"wrong\" AS Status\nEND\n",
+            &[entry("probe", &[])],
+            &[],
+            &[],
+            &runner,
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.rows[0].cells["Status"], "ok");
+    }
+
+    #[test]
+    fn conditional_recovery_is_fail_fast_and_keeps_one_row_per_case() {
+        let fake = Fake::new(&[(
+            "probe",
+            Canned {
+                error: Some("missing document".into()),
+                captures: vec![("status".into(), "400".into())],
+                ..Default::default()
+            },
+        )]);
+        let entries = [
+            entry("probe", &[]),
+            entry("unreachable", &[]),
+            entry("repair", &[]),
+            entry("final", &[]),
+        ];
+        let result = run(
+            "PARALLEL(2) FOR case IN [\"a\", \"b\"]\nTRY\nREQUEST probe\nREQUEST unreachable\nRECOVER failure\nIF \"{{status}}\" == \"400\"\nREQUEST repair\nELSE\nRETHROW\nEND\nEND\nREPORT REQUEST final\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(result.rows.len(), 2);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.rows.iter().all(|r| r.errors.is_empty()));
+        assert_eq!(fake.call_count(), 6);
+        assert!(!fake.call_order().contains(&"unreachable".into()));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("missing document"))
+        );
+    }
+
+    #[test]
+    fn conditional_recovery_does_not_hide_failed_recovery_or_prior_errors() {
+        let fake = Fake::new(&[
+            (
+                "probe",
+                Canned {
+                    error: Some("probe failed".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "repair",
+                Canned {
+                    error: Some("repair failed".into()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let entries = [entry("probe", &[]), entry("repair", &[])];
+        for recovery in ["REQUEST repair", "RETHROW"] {
+            let result = run(
+                &format!(
+                    "TRY\nREQUEST probe\nRECOVER failure\n{recovery}\nEND\nREPORT \"case\" AS Case\n"
+                ),
+                &entries,
+                &[],
+                &[],
+                &fake,
+            );
+            assert!(result.errors.iter().any(|e| e.contains("probe failed")));
+            if recovery == "REQUEST repair" {
+                assert!(result.errors.iter().any(|e| e.contains("repair failed")));
+            }
+        }
+        let result = run(
+            "REQUEST probe AS earlier\nTRY\nREQUEST probe AS later\nRECOVER failure\nREPORT failure\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(result.errors.len(), 1, "the earlier failure must survive");
+    }
+
+    #[test]
+    fn conditionals_short_circuit_and_do_not_guess_undefined_values() {
+        let fake = Fake::new(&[]);
+        let entries = [entry("yes", &[]), entry("no", &[])];
+        let result = run(
+            "IF \"a\" == \"a\" OR \"{{undefined}}\" == \"b\"\nREQUEST yes\nELSE\nREQUEST no\nEND\nREPORT \"case\" AS Case\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(result.errors.is_empty());
+        assert_eq!(fake.call_order(), vec!["yes"]);
+        let result = run(
+            "IF \"{{undefined}}\" == \"b\"\nREQUEST yes\nEND\nREPORT \"case\" AS Case\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(result.errors.iter().any(|e| e.contains("undefined")));
+    }
+
     /// End-to-end: a file-driven report whose column carries `IMAGE` resolves
     /// each row's value into [`ReportResult::images`], keyed by `(row, header)`,
     /// while the cell text is left exactly as produced.
@@ -9842,6 +10404,7 @@ mod tests {
             assert_eq!(img.mime, "image/png");
             assert_eq!(img.bytes, png);
         }
+
         assert!(
             !res.images
                 .contains_key(&(row_of("c.png"), "Frame".to_string())),

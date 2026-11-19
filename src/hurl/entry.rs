@@ -1261,7 +1261,8 @@ impl HurlEntry {
     /// already set a `Content-Length` header. Applied only to the transient
     /// copy that's run — never to what's saved to disk — so saved `.hurl`
     /// files stay free of synthesized headers.
-    pub fn ensure_run_content_length(&mut self) {
+    /// Returns whether a header was added.
+    pub fn ensure_run_content_length(&mut self) -> bool {
         let carries_body = matches!(
             self.method.to_ascii_uppercase().as_str(),
             "POST" | "PUT" | "PATCH" | "DELETE"
@@ -1278,6 +1279,9 @@ impl HurlEntry {
             .any(|r| r.key.eq_ignore_ascii_case("content-length"));
         if carries_body && !has_body && !has_content_length && !has_forms {
             self.headers.push(KvRow::new("Content-Length", "0"));
+            true
+        } else {
+            false
         }
     }
 

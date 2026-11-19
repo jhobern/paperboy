@@ -217,6 +217,7 @@ pub enum RenameTarget {
 pub enum PromptKind {
     BaseUrl,
     NewEnvName,
+    DuplicateEnv(u64),
     NewCollectionName,
     /// Name for a new subfolder in a Workspace tab's tree, with the tab and the
     /// folder it goes inside. Asked for in-app rather than through the
@@ -648,15 +649,107 @@ impl GuiApp {
         // The run being shown is polled by the editor itself.
         let showing = self.report_editor.as_ref().map(|e| e.run_key());
         let mut live = false;
+        // What a run nobody is watching would like the status line to say.
+        let mut parked_status = None;
         for (key, parked) in self.report_runs.iter_mut() {
             if Some(key) == showing.as_ref() {
                 continue;
             }
             live |= parked.pump();
+            if let Some((rows, errors)) = parked.finished.take() {
+                parked_status = Some(crate::i18n::Status::ReportRunDone { rows, errors });
+            } else if parked.run.is_some()
+                && let Some(p) = &parked.progress
+            {
+                parked_status = Some(crate::i18n::Status::ReportRunProgress {
+                    done: p.done,
+                    total: p.total,
+                });
+            }
+        }
+        // A run goes on whether or not its grid is on screen, so the line that
+        // reports it should too: navigating away used to freeze the count at
+        // whatever it read when you left, which is indistinguishable from a run
+        // that stalled. The editor on screen owns the line while *it* is
+        // running -- that is the run the user is watching.
+        if !self.report_editor.as_ref().is_some_and(|e| e.is_running())
+            && let Some(status) = parked_status
+        {
+            self.session.status = Some(status);
         }
         if live {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
+    }
+
+    /// The report a "Running report…" line is about, when it is one the centre
+    /// column isn't already showing.
+    fn running_elsewhere(&self) -> Option<super::report_run::RunKey> {
+        if self.report_editor.as_ref().is_some_and(|e| e.is_running()) {
+            return None;
+        }
+        self.report_runs
+            .iter()
+            .find(|(_, p)| p.run.is_some())
+            .map(|(k, _)| k.clone())
+    }
+
+    /// Put the report that is currently running back in the centre column, on
+    /// its results.
+    ///
+    /// A long run is started and then left — that is the point of running it in
+    /// the background — and finding the way back to it meant remembering which
+    /// tab it was on and which file it was. The line already announcing the run
+    /// is the obvious thing to click, so it is.
+    ///
+    /// Returns whether it found somewhere to go: a scratch report that has
+    /// never been saved has no path to look it up by, and the caller keeps the
+    /// line's ordinary click behaviour for those.
+    pub(super) fn reveal_running_report(&mut self) -> bool {
+        // Already on screen: the only thing left to do is show the rows it is
+        // filling, in case the editor was left on Blocks or Source.
+        if let Some(ed) = &mut self.report_editor
+            && ed.is_running()
+        {
+            ed.view = report_editor::EditorView::Results;
+            self.show_reports = false;
+            self.focus = Focus::Main;
+            return true;
+        }
+        let Some(super::report_run::RunKey::Path(path)) = self.running_elsewhere() else {
+            return false;
+        };
+        // A standalone report tab: the centre column is its own, so it is
+        // simply opened.
+        if let Some(i) = self.session.reports.iter().position(|r| {
+            r.path
+                .as_ref()
+                .is_some_and(|p| std::path::Path::new(p) == path)
+        }) {
+            let report = self.session.reports[i].clone().into_report();
+            self.open_report_editor(ReportOrigin::Session(i), report);
+            self.show_reports = true;
+        } else {
+            // A report opened from a Workspace tree belongs to that tab, and
+            // switching to a tab restores whatever its tree had selected — so
+            // pointing the selection at the running report and going there
+            // reopens it by the same path a restart would.
+            let found = self.session.collections.iter().position(|c| {
+                c.workspace_root
+                    .as_ref()
+                    .is_some_and(|root| path.starts_with(root))
+            });
+            let Some(ci) = found else {
+                return false;
+            };
+            self.session.collections[ci].workspace_selected = Some(path.clone());
+            self.switch_to_tab(ci);
+        }
+        if let Some(ed) = &mut self.report_editor {
+            ed.view = report_editor::EditorView::Results;
+        }
+        self.focus = Focus::Main;
+        true
     }
 
     /// Open `report` in the block editor, restoring the panel sizes the user
@@ -1494,6 +1587,17 @@ impl GuiApp {
         // somewhere. The message is left on screen afterwards rather than
         // replaced with "copied": what was copied is the thing worth still
         // being able to read.
+        // A run announced here is one the reader may have walked away from, so
+        // the line is the way back to it rather than something to paste.
+        let running = matches!(
+            status,
+            crate::i18n::Status::ReportRunning | crate::i18n::Status::ReportRunProgress { .. }
+        );
+        let hint = if running {
+            self.strings.gui_status_running_hint
+        } else {
+            self.strings.gui_status_copy_hint
+        };
         if ui
             .add(
                 egui::Label::new(
@@ -1503,8 +1607,9 @@ impl GuiApp {
                 )
                 .sense(egui::Sense::click()),
             )
-            .on_hover_text(self.strings.gui_status_copy_hint)
+            .on_hover_text(hint)
             .clicked()
+            && !(running && self.reveal_running_report())
         {
             ui.ctx().copy_text(text);
         }
@@ -2684,6 +2789,140 @@ mod report_run_persistence_tests {
                 .contains_key(&RunKey::Path("/tmp/nightly.trail".into())),
             "the run is held in one place at a time, not two"
         );
+    }
+
+    /// A run goes on whether or not anyone is watching it, and the line that
+    /// announces it has to as well: frozen at the count it read when the user
+    /// walked away, it describes a run that stalled rather than one in
+    /// progress.
+    #[test]
+    fn a_run_left_behind_keeps_the_status_line_counting() {
+        let mut app = app();
+        app.open_report_editor(ReportOrigin::Workspace, report("nightly"));
+        let (handle, tx) = crate::gui::report_run::test_handle();
+        app.report_editor.as_mut().expect("editor is open").run = Some(handle);
+        app.close_report_editor();
+
+        let mut skeleton = ReportResult::default();
+        for i in 0..2 {
+            let mut row = ReportRow::default();
+            row.path = vec![(0, i)];
+            skeleton.rows.push(row);
+        }
+        tx.send(RunUpdate::Skeleton(skeleton))
+            .expect("worker sends");
+        let mut landed = ReportRow::default();
+        landed.path = vec![(0, 0)];
+        tx.send(RunUpdate::Row(Box::new(landed)))
+            .expect("worker sends");
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.poll_parked_runs(ui.ctx())
+        });
+        assert!(
+            matches!(
+                app.session.status,
+                Some(crate::i18n::Status::ReportRunProgress { done: 1, total: 2 })
+            ),
+            "{:?}",
+            app.session.status
+        );
+
+        // And it says so when the run it was counting finishes, rather than
+        // stopping one short of the total for good.
+        tx.send(RunUpdate::Done(ReportResult::default()))
+            .expect("worker sends");
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.poll_parked_runs(ui.ctx())
+        });
+        assert!(
+            matches!(
+                app.session.status,
+                Some(crate::i18n::Status::ReportRunDone { .. })
+            ),
+            "{:?}",
+            app.session.status
+        );
+    }
+
+    /// The run being watched owns the line: a second report finishing in the
+    /// background must not overwrite the count of the one on screen.
+    #[test]
+    fn the_report_on_screen_keeps_the_line_while_it_runs() {
+        let mut app = app();
+        // One running in the background…
+        app.open_report_editor(ReportOrigin::Workspace, report("background"));
+        let (parked_handle, parked_tx) = crate::gui::report_run::test_handle();
+        app.report_editor.as_mut().expect("editor is open").run = Some(parked_handle);
+        app.close_report_editor();
+        parked_tx
+            .send(RunUpdate::Skeleton(ReportResult::default()))
+            .expect("worker sends");
+
+        // …and one being watched.
+        app.open_report_editor(ReportOrigin::Workspace, report("watched"));
+        let (handle, _tx) = crate::gui::report_run::test_handle();
+        app.report_editor.as_mut().expect("editor is open").run = Some(handle);
+        app.session.status = Some(crate::i18n::Status::ReportRunProgress { done: 9, total: 10 });
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.poll_parked_runs(ui.ctx())
+        });
+        assert!(
+            matches!(
+                app.session.status,
+                Some(crate::i18n::Status::ReportRunProgress { done: 9, total: 10 })
+            ),
+            "the watched run's own count stands: {:?}",
+            app.session.status
+        );
+    }
+
+    /// Clicking the "Running report…" line is the way back to the report it is
+    /// about — the whole point of a background run being that you left it.
+    #[test]
+    fn the_running_line_leads_back_to_the_report() {
+        let dir = std::env::temp_dir().join(format!("pb-reveal-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let trail = dir.join("nightly.trail");
+        std::fs::write(&trail, "# name: nightly\n").expect("write the report");
+
+        let mut app = app();
+        app.session.collections[0].workspace_root = Some(dir.clone());
+        let mut running = Report::scratch("nightly");
+        running.path = Some(trail.clone());
+        app.open_report_editor(ReportOrigin::Workspace, running);
+        let (handle, _tx) = crate::gui::report_run::test_handle();
+        app.report_editor.as_mut().expect("editor is open").run = Some(handle);
+
+        // The user goes and looks at something else.
+        app.close_report_editor();
+        assert!(app.report_editor.is_none(), "really gone");
+
+        assert!(app.reveal_running_report(), "there is somewhere to go");
+        let ed = app.report_editor.as_ref().expect("the report is back");
+        assert_eq!(ed.path(), Some(trail.as_path()), "and it is the right one");
+        assert!(
+            ed.view == crate::gui::report_editor::EditorView::Results,
+            "on the rows it is filling, not the blocks it was built from"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A report that has never been saved has no path to find it by, so the
+    /// line keeps its ordinary behaviour rather than clicking to nowhere.
+    #[test]
+    fn an_unsaved_reports_run_leaves_the_line_alone() {
+        let mut app = app();
+        app.open_report_editor(ReportOrigin::Workspace, Report::scratch("scratch"));
+        let (handle, _tx) = crate::gui::report_run::test_handle();
+        app.report_editor.as_mut().expect("editor is open").run = Some(handle);
+        app.close_report_editor();
+
+        assert!(!app.reveal_running_report(), "nowhere to go, so says so");
     }
 
     /// Editing a report and then clicking anything else in the workspace — an

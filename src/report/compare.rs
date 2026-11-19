@@ -87,10 +87,10 @@ const INTRINSICS: [&str; 8] = [
 /// The baseline/comparison environment roles that drive a comparison run.
 pub struct Roles {
     /// Environment names that act as the reference (usually one).
-    baseline: HashSet<String>,
+    pub(crate) baseline: HashSet<String>,
     /// Candidate environment names, in clause order (each compared to the
     /// baseline; duplicates removed).
-    comparisons: Vec<String>,
+    pub(crate) comparisons: Vec<String>,
     /// Field suffixes from the `BASELINE(…) SHOW(…)` clause.  For each such
     /// field, matching baseline cells (`<alias>.<field>`) are copied into the
     /// candidate row as `baseline.<alias>.<field>` — but only for aliases where

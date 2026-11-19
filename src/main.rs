@@ -137,6 +137,8 @@ Postman JSON is imported automatically."
     after_help = AFTER_HELP.as_str()
 )]
 struct Cli {
+    #[command(flatten)]
+    saved: report::saved::Options,
     /// Run the given collection (Hurl `.hurl` or Postman `.json`) headlessly and print the results.
     #[arg(short = 'c', long, value_name = "FILE")]
     collection: Option<String>,
@@ -271,7 +273,7 @@ struct Cli {
     /// identifying the slot, which is stable under `PARALLEL`; row events also
     /// carry `row_index`, the row's position in a `-o out.json` report — so a
     /// live UI can link the two.
-    #[arg(long, requires = "report")]
+    #[arg(long)]
     progress_json: bool,
 
     /// With `-r`: also accept a stop request on **stdin** — a line `stop`, or
@@ -384,6 +386,34 @@ fn percentage(raw: &str) -> Result<f64, String> {
 fn main() {
     let cli = Cli::parse();
 
+    if cli.saved.run_state.is_some() {
+        use report::saved::Action;
+        let offline = matches!(cli.saved.state_action, Action::Inspect | Action::Render);
+        if cli.postman_import
+            || cli.batch
+            || cli.gui
+            || cli.dry_run
+            || (offline
+                && (cli.report.is_some() || cli.collection.is_some() || !cli.env.is_empty()))
+            || (!offline && cli.report.is_none())
+        {
+            eprintln!(
+                "error: saved execution requires -r; inspect/render require only --run-state, without other run modes"
+            );
+            std::process::exit(2);
+        }
+        if offline {
+            std::process::exit(report_cli::read_saved(
+                &cli.saved,
+                &cli.outputs,
+                cli.progress_json,
+            ));
+        }
+    } else if cli.progress_json && cli.report.is_none() {
+        eprintln!("error: --progress-json requires --report or --run-state");
+        std::process::exit(2);
+    }
+
     // `-o` belongs to a headless mode: `-r` writes the report there and
     // `--postman-import` downloads into it. clap has no attribute for "requires
     // one of these two", and the `requires = "report"` this carried instead
@@ -423,10 +453,10 @@ fn main() {
 
     // Headless report mode (`-r`): run a PaperTrail report. `-c` may be omitted
     // — the report's `# collection:` header (resolved relative to the report's
-    // folder) is used instead; `report_cli::run` raises a clear error if neither
+    // folder) is used instead; `report_cli::run_with_state` raises a clear error if neither
     // is available.
     if let Some(report) = cli.report {
-        std::process::exit(report_cli::run(
+        std::process::exit(report_cli::run_with_state(
             cli.collection,
             cli.env,
             report,
@@ -442,6 +472,7 @@ fn main() {
             cli.progress_json,
             cli.grace,
             cli.stop_on_stdin,
+            cli.saved,
         ));
     }
 

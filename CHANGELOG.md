@@ -8,9 +8,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
-## [0.7.2] - 2026-10-28
+## [0.8.1] - 2026-11-17
+
+### Fixed
+
+- Collection runs (`-c`, including `--batch`) now send `Content-Length: 0`
+  for bodyless POST/PUT/PATCH/DELETE requests, matching the other runners.
+  Existing Content-Length headers and requests with bodies or forms are
+  unchanged; synthesized headers are not saved to the collection file.
+
+## [0.8.0] - Unreleased
 
 ### Added
+
+- **Row-local conditional recovery in PaperTrail.** `IF`/`ELSE` compares
+  interpolated strings with `==`, `!=`, `AND` and `OR`. `TRY`/`RECOVER`
+  handles request failures explicitly; `RETHROW` preserves an unhandled
+  failure. Successful recovery remains visible in warnings. Existing trails
+  retain their assertion semantics.
+- **Configurable report image encoding.** `PRELUDE_IMAGE_MAX_EDGE` and
+  `PRELUDE_IMAGE_QUALITY` control embedded image dimensions and JPEG quality,
+  including saved runs. Invalid values produce diagnostics.
+- Saved-run validation names collection entries that could not be parsed.
+
+- **Durable headless report bundles.** `--run-state` saves authoritative raw
+  target executions with stable case/execution IDs, private inspection,
+  bundled images, revision checks, atomic snapshots and active completion
+  journals. Separate processes can inspect, render, resume pending work, or
+  rerun selected executions with validated request-only replacement bindings.
+- **Exact-side repair.** Candidate-only reruns retain successful baselines;
+  baseline-only reruns refresh every dependent comparison without executing
+  candidates. `--whole-comparison` explicitly selects all sides. Existing GUI
+  pair-wide behavior is unchanged.
+- Saved-mode progress schema 2 carries run/revision/execution identity without
+  streaming private response data. Existing report progress remains schema 1.
+  Safe-state restrictions and possible replay after interruption are documented.
+- **Copy as cURL in the GUI request editor.** Copy a POSIX-shell command for the
+  selected request without sending it, using the active environment, captures,
+  parameter defaults and freshly computed values. Includes request headers,
+  cookies, query parameters, bodies and form/file fields, with response headers
+  enabled for troubleshooting. The tooltip warns that resolved credentials are
+  included. Unresolved variables and unsupported options are reported rather
+  than silently producing an incomplete command.
+- **Duplicate environments in the GUI.** Choose Duplicate from an environment's
+  buttons or right-click menu and name the copy. Copies retain current variables
+  and secret references without sharing the original's file or remote destination.
+- **Drag to reorder request rows in the GUI.** Drag handles and insertion markers
+  are available for headers, query parameters, cookies, options, form fields,
+  assertions, captures and computed values.
+- **What differed from the baseline, in the drill-down.** Clicking a row whose
+  comparison didn't match now opens on a table of the fields that differed,
+  the baseline's value beside the comparison's, each side named for its
+  environment. A nested JSON value is broken down to the leaves that changed.
+  The same section is in the HTML export's drill-down.
+- **The HTML export matches the in-app results view.**
+  - Click a column header to sort it: ascending, then descending, then back to
+    run order. The ordering is the app's own (numbers by value, natural order
+    for text, blanks last).
+  - Drag a header's right edge to resize the column.
+  - The paired statistics (comparison and baseline side by side) sit to the
+    right of the confusion matrices.
+  - The Fixed, Regressed, Correct and Incorrect cards filter the table when
+    clicked, as in the app. Clicking the selected card again shows every row.
+  - The run's own errors are listed above the table.
+  - Row striping follows the visible rows after filtering or sorting.
+- **The other exports carry the same summary.**
+  - **Excel**: the Metrics sheet gains a Correct column, heat-shaded confusion
+    matrices, and the paired statistics to their right. Statistics without
+    ground truth get a Statistics sheet of their own. A Differences sheet lists
+    what differed from the baseline, row by row. An Errors sheet lists the
+    run's errors. Columns were already sortable from the header filters.
+  - **JSON**: new `statistics`, `differences` and `errors` keys, each present
+    only when there is something in it.
+  - **PDF**: the confusion matrices (heat-shaded) and the paired statistics
+    follow the table on pages of their own.
+- **The running-report line follows the run, and leads back to it.** Starting a
+  long report and going off to do something else is the point of running it in
+  the background, but the **Running report… 502/684** line on the menu row was
+  written by the editor on screen: navigate away and the count froze where you
+  left it, which reads as a run that stalled rather than one still going. A
+  parked run now keeps the line counting, and says so when it finishes.
+  Clicking the line goes back to the report it is about — reopening it in the
+  centre column, switching to its Workspace tab where it came from one, and
+  landing on its results rather than the blocks it was built from. A report
+  that has never been saved has no path to find it by, so for those the line
+  keeps its ordinary click-to-copy.
 
 - **Re-run many rows at once.** Re-running rows one right-click at a time was
   the wrong tool for what actually goes wrong: a network blip takes out dozens
@@ -61,10 +143,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   rows — this is a second reading of the same numbers, for the reader who wants
   the comparison rather than the column, and it uses space a matrix would
   otherwise leave empty to its right.
-
-## [0.7.1] - 2026-10-21
-
-### Added
 
 - **Re-run a single row of a finished report.** A transient failure — a dropped
   connection, a momentary 503 — used to leave one row wrong, and in a comparison
@@ -149,6 +227,39 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Request failures retain their cause.** Shared runner diagnostics now include
+  Hurl's detailed HTTP failure reason and available libcurl error code instead
+  of only a generic connection heading and request URL.
+- **GUI failures no longer hide HTTP status or imply an empty response.**
+  Received statuses, headers and bodies remain visible alongside validation
+  failures. Attempts without a retained HTTP response say so explicitly, and
+  an in-flight rerun no longer displays its previous failure.
+- **Long GUI diagnostics wrap and can be copied.** Errors are selectable in a
+  bounded scrolling area, with a Copy error action and a reminder to review
+  potentially sensitive details before sharing.
+- **Replacing long GUI field values no longer loses keyboard focus.** Fields
+  retain their identity when shrinking out of or growing into a scrolling layout,
+  so typing continues after replacing a long environment or request value.
+- **Invalid request fields explain the problem inline.** Only the offending
+  key or value turns red, with a visible explanation beneath its row. Value
+  errors identify the unsupported character, including invisible line breaks
+  and tabs; long valid values are still accepted.
+- **Exporting a report's results ignored the report.** The GUI's Export
+  dialog offered `results.csv` in whatever folder PaperBoy was started from,
+  whatever the report's `# output:` said and wherever it was saved; it now
+  offers the declared format, named for the report and beside it.
+- **Browse… in the Export dialog no longer writes the file on the spot.** The
+  location picked in the file chooser goes back into the Export dialog, so the
+  format can still be changed before pressing Export.
+- **Statistics claimed more precision than the figures they were computed
+  from.** The mean of several hundred whole-millisecond timings was stated as
+  `10365.865672` — six decimals, a millionth of a millisecond, from values
+  measured to the nearest one. A derived statistic (`MEAN`, `MEDIAN`, `STDDEV`)
+  is now stated to one decimal more than its inputs carry, which keeps the half
+  an even-count median of whole numbers lands on, and never to more than three.
+  `SUM`, `MIN` and `MAX` are exact — a min *is* one of the values — and print
+  as they always did. The figures are the same everywhere they appear: the grid
+  footer, the statistics panel, the terminal UI and every export.
 - **The GUI's Export dialog and its Browse… disagreed about where the file
   goes.** Export wrote to the path in the dialog — for a report with no folder
   of its own, a bare name resolved against wherever PaperBoy was started — while

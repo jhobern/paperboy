@@ -209,8 +209,18 @@ impl Header {
 /// One statement in a flow body (or loop body).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlowNode {
+    /// Row-local control flow. Branches share the enclosing scope and row.
+    Branch {
+        kind: BranchKind,
+        body: Vec<FlowNode>,
+        alternative: Vec<FlowNode>,
+    },
+    Rethrow,
     /// `KEY=value` — set `{{KEY}}` in the current scope (includes `PRELUDE_*`).
-    Assign { key: String, value: String },
+    Assign {
+        key: String,
+        value: String,
+    },
     /// `PARAM <kind> NAME = "default" [LABEL "…"]` — declare a run parameter.
     ///
     /// A parameter behaves exactly like an [`Assign`](FlowNode::Assign) of its
@@ -228,7 +238,10 @@ pub enum FlowNode {
     /// without executing it.
     Param(ParamDecl),
     /// `LIST NAME = <producer>` — declare a named, iteration-only list.
-    ListDecl { name: String, producer: Producer },
+    ListDecl {
+        name: String,
+        producer: Producer,
+    },
     /// A whole-line `# …` comment in the body.
     ///
     /// Comments are kept in the AST, not skipped as trivia, because every
@@ -329,6 +342,49 @@ pub enum FlowNode {
         /// the grammar does.
         parallel: Option<ParallelSpec>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchKind {
+    If(Condition),
+    Try { error_var: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Condition {
+    Equal {
+        left: String,
+        right: String,
+        negate: bool,
+    },
+    And(Box<Condition>, Box<Condition>),
+    Or(Box<Condition>, Box<Condition>),
+}
+
+impl Condition {
+    pub fn text(&self) -> String {
+        match self {
+            Self::Equal {
+                left,
+                right,
+                negate,
+            } => format!(
+                "{} {} {}",
+                name_text(left),
+                if *negate { "!=" } else { "==" },
+                name_text(right)
+            ),
+            Self::And(a, b) => format!("({}) AND ({})", a.text(), b.text()),
+            Self::Or(a, b) => format!("({}) OR ({})", a.text(), b.text()),
+        }
+    }
+
+    pub fn values(&self) -> Vec<&str> {
+        match self {
+            Self::Equal { left, right, .. } => vec![left, right],
+            Self::And(a, b) | Self::Or(a, b) => a.values().into_iter().chain(b.values()).collect(),
+        }
+    }
 }
 
 /// The `PARALLEL` marker on a loop: run its iterations concurrently.
@@ -644,7 +700,7 @@ pub enum ReportStmt {
 /// exports lossless, keeps baseline comparison textual, and lets a format with
 /// no picture support degrade to the text automatically rather than needing a
 /// fallback rule of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ImageSpec {
     /// Target height in pixels. With no `width`, the picture scales
     /// proportionally to this height.
@@ -1052,6 +1108,98 @@ impl ReportFlow {
         collect_column_meta(&self.nodes, &mut out);
         out
     }
+
+    /// Column metadata is global. A conditional declaration cannot choose a
+    /// different truth (or omit it) for the same column in another statement.
+    pub fn conflicting_branch_truths(&self) -> Vec<String> {
+        use std::collections::{BTreeMap, HashSet};
+        type Declarations = BTreeMap<String, (HashSet<Option<String>>, bool)>;
+        fn walk<'a>(
+            nodes: &'a [FlowNode],
+            conditional: bool,
+            out: &mut Declarations,
+            requests: &mut Vec<(&'a ReportStmt, bool)>,
+        ) {
+            for node in nodes {
+                let mut add = |name: String, truth: Option<String>| {
+                    let (values, in_branch) = out.entry(name).or_default();
+                    values.insert(truth);
+                    *in_branch |= conditional;
+                };
+                match node {
+                    FlowNode::Report(ReportStmt::Vars(names)) => {
+                        for name in names {
+                            add(name.clone(), None);
+                        }
+                    }
+                    FlowNode::Report(ReportStmt::VarAs { name, truth, .. })
+                    | FlowNode::Report(ReportStmt::Computed { name, truth, .. }) => {
+                        add(name.clone(), truth.clone());
+                    }
+                    FlowNode::Report(
+                        stmt @ ReportStmt::Request {
+                            name, alias, with, ..
+                        },
+                    ) => {
+                        requests.push((stmt, conditional));
+                        for item in with {
+                            if let WithItem::Field {
+                                name: field, truth, ..
+                            } = item
+                            {
+                                add(field_header(name, alias, field), truth.clone());
+                            }
+                        }
+                    }
+                    FlowNode::Branch {
+                        body, alternative, ..
+                    } => {
+                        walk(body, true, out, requests);
+                        walk(alternative, true, out, requests);
+                    }
+                    FlowNode::ForEach { body, .. }
+                    | FlowNode::ForEnvs { body, .. }
+                    | FlowNode::Graph { body, .. } => walk(body, conditional, out, requests),
+                    _ => {}
+                }
+            }
+        }
+        let mut declarations = Declarations::new();
+        let mut requests = Vec::new();
+        walk(&self.nodes, false, &mut declarations, &mut requests);
+        for (stmt, conditional) in requests {
+            let ReportStmt::Request {
+                name,
+                alias,
+                with,
+                hide,
+                ..
+            } = stmt
+            else {
+                continue;
+            };
+            let prefix = field_header(name, alias, "");
+            for (header, (truths, in_branch)) in &mut declarations {
+                let Some(field) = header.strip_prefix(&prefix) else {
+                    continue;
+                };
+                if !hide.iter().any(|h| h == field)
+                    && !with
+                        .iter()
+                        .any(|w| matches!(w, WithItem::Field {name, ..} if name == field))
+                {
+                    truths.insert(None);
+                    *in_branch |= conditional;
+                }
+            }
+        }
+        declarations
+            .into_iter()
+            .filter_map(|(name, (values, conditional))| {
+                (conditional && values.len() > 1).then_some(name)
+            })
+            .collect()
+    }
 }
 
 /// Everything the flow says about its output columns, gathered in one walk.
@@ -1189,6 +1337,12 @@ pub fn collect_column_meta(nodes: &[FlowNode], out: &mut FlowColumnMeta) {
             FlowNode::ForEach { body, .. } | FlowNode::Graph { body, .. } => {
                 collect_column_meta(body, out);
             }
+            FlowNode::Branch {
+                body, alternative, ..
+            } => {
+                collect_column_meta(body, out);
+                collect_column_meta(alternative, out);
+            }
             _ => {}
         }
     }
@@ -1203,6 +1357,36 @@ fn indent(out: &mut String, depth: usize) {
 fn write_node(out: &mut String, node: &FlowNode, depth: usize) {
     indent(out, depth);
     match node {
+        FlowNode::Rethrow => out.push_str("RETHROW\n"),
+        FlowNode::Branch {
+            kind,
+            body,
+            alternative,
+        } => {
+            match kind {
+                BranchKind::If(condition) => {
+                    let _ = writeln!(out, "IF {}", condition.text());
+                }
+                BranchKind::Try { .. } => out.push_str("TRY\n"),
+            }
+            for n in body {
+                write_node(out, n, depth + 1);
+            }
+            if !alternative.is_empty() || matches!(kind, BranchKind::Try { .. }) {
+                indent(out, depth);
+                match kind {
+                    BranchKind::If(_) => out.push_str("ELSE\n"),
+                    BranchKind::Try { error_var } => {
+                        let _ = writeln!(out, "RECOVER {error_var}");
+                    }
+                }
+                for n in alternative {
+                    write_node(out, n, depth + 1);
+                }
+            }
+            indent(out, depth);
+            out.push_str("END\n");
+        }
         FlowNode::Assign { key, value } => {
             let _ = writeln!(out, "{key}={value}");
         }
@@ -1628,6 +1812,11 @@ impl FlowNode {
     /// a `REPORT REQUEST … WITH …` is summarised with a trailing `WITH …`.
     pub fn label(&self) -> String {
         match self {
+            FlowNode::Branch { kind, .. } => match kind {
+                BranchKind::If(c) => format!("IF {}", c.text()),
+                BranchKind::Try { error_var } => format!("TRY / RECOVER {error_var}"),
+            },
+            FlowNode::Rethrow => "RETHROW".into(),
             FlowNode::Assign { key, value } => format!("{key} = {value}"),
             FlowNode::ListDecl { name, producer } => {
                 format!("LIST {name} = {}", producer_text(producer))
