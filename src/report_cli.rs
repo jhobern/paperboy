@@ -824,6 +824,7 @@ fn run_with_options(
     let ctx = Context {
         request_titles: Some(&titles),
         env_names: Some(&env_names),
+        params: Some(&params),
         request_fields: Some(&fields),
         root: root.as_deref(),
         base_var_names: Some(&base_var_names_owned),
@@ -2975,6 +2976,81 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn environment_param_warnings_follow_cli_overrides() {
+        let dir = temp_dir("param-env-warnings");
+        let coll = dir.join("api.hurl");
+        fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
+        let env = dir.join("loaded.vars");
+        fs::write(&env, "KEY=value\n").unwrap();
+        let report = dir.join("r.trail");
+
+        // ENV declarations and untyped parameters both support ENVS references.
+        for kind in ["ENV ", ""] {
+            fs::write(
+                &report,
+                format!(
+                    "# name: r\n# collection: api.hurl\n\
+                     PARAM {kind}COMPARE_ENV = \"eapi_dev\"\n\
+                     PARAM {kind}BASELINE_ENV = \"eapi_staging\"\n\
+                     FOR TARGET IN ENVS BASELINE(\"{{{{BASELINE_ENV}}}}\"), COMPARISON(\"{{{{COMPARE_ENV}}}}\")\n\
+                         REPORT REQUEST Ping\nEND\n"
+                ),
+            )
+            .unwrap();
+            for (compare, baseline) in [
+                (None, None),
+                (Some("loaded"), None),
+                (Some("loaded"), Some("loaded")),
+                (Some("missing"), Some("loaded")),
+            ] {
+                let params = [("COMPARE_ENV", compare), ("BASELINE_ENV", baseline)]
+                    .into_iter()
+                    .filter_map(|(name, value)| value.map(|v| (name.to_string(), v.to_string())))
+                    .collect();
+                let (progress, log) = capturing();
+                let code = run_with_progress(
+                    Some(coll.to_string_lossy().into_owned()),
+                    vec![env.to_string_lossy().into_owned()],
+                    report.to_string_lossy().into_owned(),
+                    vec![dir.join("out.csv").to_string_lossy().into_owned()],
+                    true,
+                    Vec::new(),
+                    None,
+                    params,
+                    Gates::default(),
+                    progress,
+                    Control::for_test(),
+                );
+                assert_eq!(
+                    code,
+                    i32::from(compare != Some("loaded") || baseline != Some("loaded")),
+                    "missing effective environments remain run errors"
+                );
+                let events = events(&log);
+                let finished = events.last().unwrap();
+                assert_eq!(finished["event"], "run_finished");
+                let warnings = finished["warnings"].as_array().unwrap();
+                for (name, expected) in [
+                    ("eapi_dev", compare.is_none()),
+                    ("eapi_staging", baseline.is_none()),
+                    ("missing", compare == Some("missing")),
+                ] {
+                    assert_eq!(
+                        warnings.iter().any(|w| {
+                            let message = w.as_str().unwrap();
+                            message.contains(name) && message.contains("isn't loaded")
+                        }),
+                        expected,
+                        "{kind:?}, {compare:?}, {baseline:?}: {warnings:?}"
+                    );
+                }
+            }
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A `--param` the report doesn't declare is a caller whose command line
