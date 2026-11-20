@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.8.2] - 2026-11-20
+
+### Fixed
+
+- Command-line report validation now honours `--param` overrides when checking
+  environment references, without warning about unused environment defaults.
+  Missing environments still warn when their defaults remain in use.
+
 ## [0.8.1] - 2026-11-17
 
 ### Fixed

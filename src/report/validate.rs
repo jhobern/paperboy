@@ -58,6 +58,9 @@ pub struct Context<'a> {
     pub request_titles: Option<&'a [String]>,
     /// Names of environments currently loaded (for `ENVS` resolution).
     pub env_names: Option<&'a [String]>,
+    /// Values chosen for this run. `None` validates the declaration's defaults
+    /// for an editor that has not chosen run settings yet.
+    pub params: Option<&'a super::params::ParamValues>,
     /// Each bound-collection entry's full title paired with its `[Reports]`
     /// field names — used to validate a `SHOW(...)` selector's field list
     /// against the fields the request can actually produce. `None` when no
@@ -106,6 +109,7 @@ impl Default for Context<'_> {
         Self {
             request_titles: None,
             env_names: None,
+            params: None,
             request_fields: None,
             root: None,
             base_var_names: None,
@@ -427,7 +431,7 @@ fn nested_params<'a>(nodes: &'a [FlowNode]) -> Vec<&'a super::flow::ParamDecl> {
 }
 
 /// Judge the `ENVS` names that are written as `{{PARAM}}` rather than spelled
-/// out: once the parameters' defaults are filled in, is what the name
+/// out: once the parameters' effective values are filled in, is what the name
 /// currently means actually loaded? Only a warning — changing it per run is
 /// the entire point — and only answerable at all when every reference in the
 /// name is a parameter, since nothing else has a value to substitute here.
@@ -443,9 +447,10 @@ fn nested_params<'a>(nodes: &'a [FlowNode]) -> Vec<&'a super::flow::ParamDecl> {
 fn check_env_refs(flow: &ReportFlow, ctx: &Context, diags: &mut Vec<Diagnostic>) {
     let s = ctx.strings;
     let declared = flow.params();
-    let defaults = super::params::effective(&declared, &Default::default());
+    let empty = super::params::ParamValues::new();
+    let values = super::params::effective(&declared, ctx.params.unwrap_or(&empty));
     for name in env_ref_names(&flow.nodes) {
-        let resolved = crate::environment::substitute(name, &defaults);
+        let resolved = crate::environment::substitute(name, &values);
         if resolved.contains("{{") {
             // Still unresolved: a required parameter with no default. What it
             // will be is decided in the run settings, so there is nothing to
@@ -531,7 +536,12 @@ fn check_param_default(p: &super::flow::ParamDecl, ctx: &Context, diags: &mut Ve
         // warning, not an error — unlike the `# environment:` directive, which
         // is the report's fixed choice.
         ParamKind::Env => {
-            if let Some(d) = default.filter(|d| !d.is_empty())
+            // An overridden default is not used by this run. ENVS references
+            // are checked separately against the effective parameter values.
+            if !ctx
+                .params
+                .is_some_and(|values| values.contains_key(&p.name))
+                && let Some(d) = default.filter(|d| !d.is_empty())
                 && !d.contains("{{")
                 && let Some(loaded) = ctx.env_names
                 && !loaded.iter().any(|e| e == d)

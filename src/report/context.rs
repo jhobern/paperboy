@@ -361,6 +361,7 @@ pub fn report_diagnostics(
     let ctx = Context {
         request_titles: titles.as_deref(),
         env_names: Some(&env_names),
+        params: None,
         request_fields: fields.as_deref(),
         root: anchored.then_some(base_dir.as_path()),
         base_var_names: base_var_names.as_deref(),
