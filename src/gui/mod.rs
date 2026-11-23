@@ -16,6 +16,7 @@ mod editor;
 mod environments;
 mod filepick;
 mod icons;
+mod launch;
 mod menu;
 mod postman;
 mod probe;
@@ -32,6 +33,7 @@ mod theme;
 mod widgets;
 
 pub use app::GuiApp;
+pub use launch::start;
 
 use eframe::egui;
 
@@ -43,7 +45,7 @@ pub const DEFAULT_WINDOW: (f32, f32) = (1280.0, 820.0);
 pub const MIN_WINDOW: (f32, f32) = (760.0, 500.0);
 
 /// Launch the GUI. Blocks until the window is closed.
-pub fn run() -> Result<(), String> {
+fn run(ready_file: Option<std::path::PathBuf>) -> Result<(), String> {
     // Best-effort: register a freedesktop launcher so Linux taskbars/docks show
     // the PaperBoy logo instead of a generic icon (see the function's docs).
     install_desktop_integration();
@@ -80,7 +82,13 @@ pub fn run() -> Result<(), String> {
     eframe::run_native(
         "PaperBoy",
         native_options,
-        Box::new(|cc| Ok(Box::new(GuiApp::new(cc)))),
+        Box::new(move |cc| {
+            let app = GuiApp::new(cc);
+            if let Some(path) = ready_file {
+                std::fs::File::create_new(path)?;
+            }
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| e.to_string())
 }

@@ -69,6 +69,10 @@ pub const APP_NAME: &str = "PaperBoy";
 
 strings! {
     app_heading => "PaperBoy", "PaperBoy", "PaperBoy";
+    gui_foreground_help => "Keep the GUI attached to this terminal (logs and exit status); requires --gui.", "Garder l'interface graphique attachée à ce terminal (journaux et code de sortie) ; nécessite --gui.", "Behold GUI'en tilknyttet denne terminal (log og afslutningskode); kræver --gui.";
+    gui_log_unavailable => "Cannot locate the GUI log directory; use --gui --foreground.", "Impossible de trouver le dossier des journaux ; utilisez --gui --foreground.", "Kan ikke finde GUI-logmappen; brug --gui --foreground.";
+    gui_launch_exited => "GUI exited before startup completed ({status}).", "L'interface graphique s'est arrêtée avant la fin du démarrage ({status}).", "GUI'en afsluttede før opstarten var færdig ({status}).";
+    gui_log_label => "GUI log", "Journal de l'interface graphique", "GUI-log";
     base_url => "Default New Request URL:", "URL par défaut des nouvelles requêtes\u{a0}:", "Standard-URL for nye anmodninger:";
     sending => "Sending…", "Envoi en cours…", "Sender…";
     // Shown beside the spinner while Hurl is retrying a request (`[Options]

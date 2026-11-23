@@ -3385,6 +3385,7 @@ dependencies = [
  "hurl",
  "hurl_core",
  "image",
+ "libc",
  "md-5",
  "nom",
  "quick-xml",
@@ -3397,9 +3398,11 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2 0.10.9",
+ "tempfile",
  "tui-panel-select",
  "tui-rgb-picker",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

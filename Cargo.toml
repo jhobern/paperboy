@@ -48,6 +48,9 @@ gui = [
     "dep:egui_extras",
     "dep:egui-phosphor",
     "dep:rfd",
+    "dep:tempfile",
+    "dep:libc",
+    "dep:windows-sys",
 ]
 
 
@@ -157,6 +160,14 @@ rfd = { version = "0.17", default-features = false, optional = true, features = 
 # `windows-sys` on Windows, all of which this tree already builds, and it is
 # the one piece of this that cannot be written portably by hand.
 ctrlc = "3.5.2"
+
+tempfile = { version = "3", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"], optional = true }
 
 [dev-dependencies]
 # Used by the JUnit writer's tests only, to parse what it produces with a real

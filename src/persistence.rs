@@ -699,7 +699,7 @@ impl Default for PersistedState {
 
 /// Location of the saved state file. Honours `PAPERBOY_STATE_DIR` (used by
 /// tests), else falls back to the platform config directory.
-fn state_path() -> Option<PathBuf> {
+pub(crate) fn state_path() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("PAPERBOY_STATE_DIR") {
         return Some(PathBuf::from(dir).join("state.json"));
     }
