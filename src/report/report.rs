@@ -103,7 +103,9 @@ impl Report {
     /// Parse the current source into a [`ReportFlow`] (used for validation,
     /// dry-run expansion, and running). Errors are surfaced to the user.
     pub fn flow(&self) -> Result<ReportFlow, ParseError> {
-        parse_flow(&self.text)
+        let mut flow = parse_flow(&self.text)?;
+        flow.source_path = self.path.clone();
+        Ok(flow)
     }
 
     /// The bound collection reference from the header `collection:` directive, if
@@ -244,6 +246,18 @@ mod tests {
     fn from_text_falls_back_when_no_name_directive() {
         let r = Report::from_text("fallback", "# collection: c.hurl\nREQUEST x\n");
         assert_eq!(r.name, "fallback");
+    }
+
+    #[test]
+    fn flow_provenance_does_not_change_text_or_ast_equality() {
+        let mut report = Report::from_text("cache", "CACHE c\nPERSIST(id)\nid=ok\nEND\n");
+        let unsaved = report.flow().unwrap();
+        assert!(unsaved.source_path.is_none());
+        report.path = Some(std::path::PathBuf::from("saved.trail"));
+        let saved = report.flow().unwrap();
+        assert_eq!(saved.source_path, report.path);
+        assert_eq!(saved, unsaved);
+        assert_eq!(saved.to_text(), unsaved.to_text());
     }
 
     #[test]

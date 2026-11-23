@@ -926,6 +926,12 @@ incremental output for cookie continuity.
 
 `-r report.trail` runs a PaperTrail report and exits.
 
+Reports can reuse uploaded document sessions or other prepared resources across
+runs with `CACHE` / `PERSIST`, and repair expired entries with
+`CACHE REFRESH` inside bounded `RECOVER RETRY(1)` blocks. See
+[Persistent preparation caches](docs/caching.md) for syntax, environment/file
+isolation, response-based recovery, and private storage configuration.
+
 ```sh
 paperboy -r report.trail                                  # collection from the report's headers
 paperboy -c api.hurl -r report.trail -o out.csv           # or given explicitly; - is stdout

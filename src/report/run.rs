@@ -35,10 +35,10 @@
 //! practical report cases (`status`, `header`, `body`, `jsonpath`, `regex`);
 //! richer queries are a documented follow-up.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::environment::substitute;
 use crate::hurl::HurlEntry;
@@ -51,6 +51,10 @@ use super::flow::{
 };
 use super::model::{ReportResult, ReportRow, RowRole, Trend, Verdict};
 use super::producers::{self, ProducerItem};
+
+#[cfg(test)]
+#[path = "cache_tests.rs"]
+mod cache_tests;
 
 /// Engine defaults for the `PRELUDE_*` settings (overridable per flow/scope by a
 /// `PRELUDE_*=…` assignment).
@@ -89,6 +93,10 @@ pub trait EntryRunner: Sync {
     /// the same root that will be used when the request is actually sent.
     fn input_root(&self) -> Option<&std::path::Path> {
         None
+    }
+
+    fn cancelled(&self) -> bool {
+        false
     }
 }
 
@@ -401,7 +409,8 @@ fn planned_columns(flow: &ReportFlow, ctx: &RunContext) -> std::collections::Has
                 },
                 FlowNode::ForEach { body, .. }
                 | FlowNode::ForEnvs { body, .. }
-                | FlowNode::Graph { body, .. } => walk(body, ctx, w),
+                | FlowNode::Graph { body, .. }
+                | FlowNode::Cache { body, .. } => walk(body, ctx, w),
                 FlowNode::Branch {
                     body, alternative, ..
                 } => {
@@ -585,6 +594,8 @@ pub fn run_flow_raw_selected(
         };
     }
     let mut ex = Exec::new(ctx);
+    ex.source_path = flow.source_path.clone();
+    ex.recovery_refs = Arc::new(template_refs(&flow.to_text()));
     ex.selection = selection.cloned().map(std::sync::Arc::new);
     // Only `baseline_show` is wanted here, and it is a list of field names: no
     // role target is read, so there is nothing for the run's answers to correct
@@ -1021,6 +1032,72 @@ pub fn resolve_images(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunCon
     result.errors.extend(resolver.notes);
 }
 
+#[derive(Clone, Default)]
+struct Failure {
+    message: String,
+    status: Option<u16>,
+    headers: Vec<(String, String)>,
+    body: Option<serde_json::Value>,
+}
+
+impl Failure {
+    fn response(eo: &EntryOutcome) -> Self {
+        Self {
+            message: eo.error.clone().unwrap_or_default(),
+            status: (eo.status != 0).then_some(eo.status),
+            headers: eo.headers.clone(),
+            body: serde_json::from_str(&eo.raw_body).ok(),
+        }
+    }
+
+    fn field(&self, field: &str) -> Option<String> {
+        match field {
+            "message" => Some(self.message.clone()),
+            "http_status" => Some(self.status.map(|s| s.to_string()).unwrap_or_default()),
+            _ => {
+                if let Some(header) = field.strip_prefix("headers.") {
+                    return Some(
+                        self.headers
+                            .iter()
+                            .filter(|(k, _)| k.eq_ignore_ascii_case(header))
+                            .map(|(_, v)| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
+                let path = field.strip_prefix("body.")?;
+                let mut value = self.body.as_ref();
+                for part in path.split('.') {
+                    value = value.and_then(|v| match v {
+                        serde_json::Value::Array(items) => {
+                            part.parse::<usize>().ok().and_then(|i| items.get(i))
+                        }
+                        _ => v.get(part),
+                    });
+                }
+                Some(match value {
+                    None | Some(serde_json::Value::Null) => String::new(),
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(v) => v.to_string(),
+                })
+            }
+        }
+    }
+}
+
+type SharedCache = Arc<Mutex<Option<super::cache::Entry>>>;
+type CachePool = Arc<Mutex<HashMap<PathBuf, SharedCache>>>;
+
+#[derive(Clone)]
+struct CacheBinding {
+    definition: FlowNode,
+    path: PathBuf,
+    files: Vec<(PathBuf, String)>,
+    scopes: Vec<HashMap<String, String>>,
+    state: SharedCache,
+    observed: Option<String>,
+}
+
 /// Mutable interpreter state threaded through the walk.
 struct Exec<'a> {
     ctx: &'a RunContext<'a>,
@@ -1156,6 +1233,13 @@ struct Exec<'a> {
     /// must not be inherited a second time by whatever the block does next —
     /// see [`to_state`](Self::to_state).
     borrowed_errors: Vec<(usize, usize)>,
+    source_path: Option<PathBuf>,
+    cache_root: Option<PathBuf>,
+    cache_pool: CachePool,
+    cache_bindings: HashMap<String, CacheBinding>,
+    last_failure: Failure,
+    recoveries: Vec<(String, Failure)>,
+    recovery_refs: Arc<Vec<String>>,
 }
 
 /// A cloneable snapshot of an [`Exec`]'s scope/capture/target state (no output
@@ -1165,6 +1249,13 @@ struct Exec<'a> {
 /// its captures don't leak to the continuation).
 #[derive(Clone)]
 struct ExecState {
+    source_path: Option<PathBuf>,
+    cache_root: Option<PathBuf>,
+    cache_pool: CachePool,
+    cache_bindings: HashMap<String, CacheBinding>,
+    last_failure: Failure,
+    recoveries: Vec<(String, Failure)>,
+    recovery_refs: Arc<Vec<String>>,
     selection: Option<std::sync::Arc<RowSelection>>,
     scopes: Vec<HashMap<String, String>>,
     lists: HashMap<String, Producer>,
@@ -1747,6 +1838,13 @@ impl<'a> Exec<'a> {
             inherited_errors: Vec::new(),
             inherited_error_origins: Vec::new(),
             borrowed_errors: Vec::new(),
+            source_path: None,
+            cache_root: None,
+            cache_pool: Arc::new(Mutex::new(HashMap::new())),
+            cache_bindings: HashMap::new(),
+            last_failure: Failure::default(),
+            recoveries: Vec::new(),
+            recovery_refs: Arc::new(Vec::new()),
         }
     }
 
@@ -1755,6 +1853,13 @@ impl<'a> Exec<'a> {
     /// and to isolate each iteration's variable/capture scope.
     fn to_state(&self) -> ExecState {
         ExecState {
+            source_path: self.source_path.clone(),
+            cache_root: self.cache_root.clone(),
+            cache_pool: self.cache_pool.clone(),
+            cache_bindings: self.cache_bindings.clone(),
+            last_failure: self.last_failure.clone(),
+            recoveries: self.recoveries.clone(),
+            recovery_refs: self.recovery_refs.clone(),
             selection: self.selection.clone(),
             scopes: self.scopes.clone(),
             lists: self.lists.clone(),
@@ -1824,6 +1929,13 @@ impl<'a> Exec<'a> {
     fn from_state(ctx: &'a RunContext<'a>, state: ExecState) -> Self {
         Exec {
             ctx,
+            source_path: state.source_path,
+            cache_root: state.cache_root,
+            cache_pool: state.cache_pool,
+            cache_bindings: state.cache_bindings,
+            last_failure: state.last_failure,
+            recoveries: state.recoveries,
+            recovery_refs: state.recovery_refs,
             interrupted: false,
             unfinished_rows: Vec::new(),
             selection: state.selection,
@@ -1931,6 +2043,25 @@ impl<'a> Exec<'a> {
         for (k, v) in &self.captures {
             m.insert(k.clone(), v.clone());
         }
+        for (name, binding) in &self.cache_bindings {
+            let FlowNode::Cache { persist, .. } = &binding.definition else {
+                continue;
+            };
+            let state = binding.state.lock().expect("cache state poisoned");
+            for key in persist {
+                if self.capture_owner.get(key) == Some(name) {
+                    if let Some(v) = state
+                        .as_ref()
+                        .and_then(|e| e.values.as_ref())
+                        .and_then(|v| v.get(key))
+                    {
+                        m.insert(key.clone(), v.clone());
+                    } else {
+                        m.remove(key);
+                    }
+                }
+            }
+        }
         m
     }
 
@@ -1985,6 +2116,34 @@ impl<'a> Exec<'a> {
         for (step, caps) in &self.step_captures {
             for (k, v) in caps.iter() {
                 m.insert(format!("{step}.{k}"), v.clone());
+            }
+        }
+        for (name, binding) in &self.cache_bindings {
+            let state = binding.state.lock().expect("cache state poisoned");
+            if let FlowNode::Cache { persist, .. } = &binding.definition {
+                for key in persist {
+                    let qualified = format!("{name}.{key}");
+                    if let Some(value) = state
+                        .as_ref()
+                        .and_then(|e| e.values.as_ref())
+                        .and_then(|v| v.get(key))
+                    {
+                        m.insert(qualified, value.clone());
+                    } else {
+                        m.remove(&qualified);
+                    }
+                }
+            }
+        }
+        for (name, failure) in &self.recoveries {
+            m.retain(|k, _| !k.starts_with(&format!("{name}.")));
+            m.insert(name.clone(), failure.message.clone());
+            for key in self.recovery_refs.iter() {
+                if let Some(field) = key.strip_prefix(&format!("{name}."))
+                    && let Some(value) = failure.field(field)
+                {
+                    m.insert(key.clone(), value);
+                }
             }
         }
         m
@@ -2073,6 +2232,11 @@ impl<'a> Exec<'a> {
 
     /// Look up a single variable across the full precedence stack.
     fn lookup(&self, key: &str) -> Option<String> {
+        if self.cache_bindings.values().any(|b| {
+            matches!(&b.definition, FlowNode::Cache { persist, .. } if persist.iter().any(|n| n == key))
+        }) || key.contains('.') {
+            return self.vars_for_source().get(key).cloned();
+        }
         if let Some((step, var)) = key.split_once('.')
             && let Some(v) = self.step_captures.get(step).and_then(|c| c.get(var))
         {
@@ -2259,6 +2423,13 @@ impl<'a> Exec<'a> {
                     self.run_graph(body, parallel.as_ref(), &mut own)
                 }
                 FlowNode::Cleanup { .. } => cleanups.push(node),
+                FlowNode::Cache { .. } | FlowNode::CacheOp { .. } => {
+                    let mark = self.errors.len();
+                    self.exec_cache(node);
+                    if self.errors.len() != mark {
+                        break;
+                    }
+                }
                 FlowNode::Branch { .. } => self.exec_branch(node, &mut own, None),
                 FlowNode::Rethrow if self.ctx.runner.dependency_probe().is_some() => {}
                 FlowNode::Rethrow => self
@@ -2311,6 +2482,380 @@ impl<'a> Exec<'a> {
         }
     }
 
+    fn stopped(&self) -> bool {
+        self.ctx.cancel.is_some_and(Cancel::stopped) || self.ctx.runner.cancelled()
+    }
+
+    fn cache_error(&mut self, name: &str, error: &str) {
+        self.errors.push(crate::i18n::fill(
+            self.ctx.strings.cache_error,
+            &[name, error],
+        ));
+        if self.stopped() {
+            self.interrupted = true;
+        }
+    }
+
+    fn cache_text(&self, text: &str) -> Result<String, String> {
+        let vars = self.request_vars(true);
+        for key in template_refs(text) {
+            if !vars.contains_key(&key) {
+                return Err(format!("undefined cache input '{key}'"));
+            }
+        }
+        let result = substitute(text, &vars);
+        if result.contains("{{") {
+            return Err("unresolved cache input".into());
+        }
+        Ok(result)
+    }
+
+    fn cache_binding(&self, node: &FlowNode) -> Result<CacheBinding, String> {
+        let FlowNode::Cache {
+            name,
+            namespace,
+            keys,
+            files,
+            persist,
+            body,
+        } = node
+        else {
+            return Err("expected cache declaration".into());
+        };
+        let scope = if let Some(namespace) = namespace {
+            format!("namespace:{}", self.cache_text(namespace)?)
+        } else {
+            let path = self
+                .source_path
+                .as_ref()
+                .ok_or("unsaved trails require a cache NAMESPACE")?;
+            format!(
+                "script:{}",
+                path.canonicalize().map_err(|e| e.to_string())?.display()
+            )
+        };
+        let mut environment: BTreeMap<_, _> = self.ctx.base_vars.clone().into_iter().collect();
+        if let Some(target) = &self.target_env {
+            environment.extend(target.clone());
+        }
+        let container = super::cache::digest(
+            &serde_json::to_vec(&(scope, environment)).map_err(|e| e.to_string())?,
+        );
+        let keys = keys
+            .iter()
+            .map(|s| self.cache_text(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        let files = files
+            .iter()
+            .map(|s| {
+                let raw = PathBuf::from(self.cache_text(s)?);
+                let path = if raw.is_absolute() {
+                    raw
+                } else {
+                    self.ctx
+                        .root
+                        .clone()
+                        .unwrap_or(std::env::current_dir().map_err(|e| e.to_string())?)
+                        .join(raw)
+                };
+                let hash = super::cache::file_digest(&path)?;
+                Ok((path, hash))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        fn request_sources(
+            nodes: &[FlowNode],
+            ctx: &RunContext,
+            out: &mut Vec<String>,
+        ) -> Result<(), String> {
+            for node in nodes {
+                match node {
+                    FlowNode::Request { name, .. } => {
+                        out.push(
+                            resolve_qualified(ctx.entries, ctx.helpers, name)
+                                .ok_or_else(|| format!("unresolved preparation request '{name}'"))?
+                                .to_hurl(),
+                        );
+                    }
+                    FlowNode::Branch {
+                        body, alternative, ..
+                    } => {
+                        request_sources(body, ctx, out)?;
+                        request_sources(alternative, ctx, out)?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        let mut requests = Vec::new();
+        request_sources(body, self.ctx, &mut requests)?;
+        let preparation = ReportFlow {
+            nodes: body.clone(),
+            ..Default::default()
+        }
+        .to_text();
+        let hashes: Vec<_> = files.iter().map(|(_, hash)| hash).collect();
+        let entry = super::cache::digest(
+            &serde_json::to_vec(&(name, preparation, requests, persist, keys, hashes))
+                .map_err(|e| e.to_string())?,
+        );
+        let root = match &self.cache_root {
+            Some(root) => root.clone(),
+            None => super::cache::root()?,
+        };
+        let path = root.join(container).join(format!("{entry}.json"));
+        let state = self
+            .cache_pool
+            .lock()
+            .expect("cache pool poisoned")
+            .entry(path.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone();
+        Ok(CacheBinding {
+            definition: node.clone(),
+            path,
+            files,
+            scopes: self.scopes.clone(),
+            state,
+            observed: None,
+        })
+    }
+
+    fn exec_cache(&mut self, node: &FlowNode) {
+        if self.ctx.runner.offline() {
+            // Dependency discovery visits preparation requests; ordinary
+            // projection needs no outputs from a cache and must not read it.
+            if self.ctx.runner.dependency_probe().is_some()
+                && let FlowNode::Cache { body, .. } = node
+            {
+                let mut probe = Self::from_state(self.ctx, self.to_state());
+                probe.exec_inline(body, &mut HashMap::new(), None);
+                self.errors.extend(probe.errors);
+            }
+            return;
+        }
+        let (name, op) = match node {
+            FlowNode::Cache { name, .. } => (name, None),
+            FlowNode::CacheOp { name, refresh } => (name, Some(*refresh)),
+            _ => return,
+        };
+        self.last_failure = Failure::default();
+        let binding = if op.is_none() {
+            self.cache_binding(node)
+        } else {
+            self.cache_bindings
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("cache '{name}' has not been evaluated in this scope"))
+        };
+        let mut binding = match binding {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.cache_error(name, &error);
+                return;
+            }
+        };
+        let result = self.update_cache(name, &mut binding, op);
+        self.cache_bindings.insert(name.clone(), binding);
+        if let Err(error) = result {
+            self.cache_error(name, &error);
+        }
+    }
+
+    fn update_cache(
+        &mut self,
+        name: &str,
+        binding: &mut CacheBinding,
+        op: Option<bool>,
+    ) -> Result<(), String> {
+        let FlowNode::Cache { persist, body, .. } = &binding.definition else {
+            return Err("invalid cache binding".into());
+        };
+        for (file, expected) in &binding.files {
+            if &super::cache::file_digest(file)? != expected {
+                return Err(format!(
+                    "cache input {} changed; restart the run",
+                    file.display()
+                ));
+            }
+        }
+        let locked = super::cache::LockedEntry::acquire(&binding.path, || self.stopped())?;
+        let existing = locked.read(persist)?;
+        let hit = op.is_none() && existing.as_ref().is_some_and(|e| e.values.is_some());
+        let replacement = existing.as_ref().is_some_and(|e| {
+            e.values.is_some()
+                && binding
+                    .observed
+                    .as_ref()
+                    .is_some_and(|old| old != &e.generation)
+        });
+        if op == Some(false) {
+            // A stale worker must not invalidate a newer published entry.
+            let next = if replacement {
+                existing.unwrap()
+            } else {
+                let next = super::cache::Entry::new(None);
+                locked.write(&next)?;
+                next
+            };
+            *binding.state.lock().expect("cache state poisoned") = Some(next);
+            for key in persist {
+                if self
+                    .capture_owner
+                    .get(key)
+                    .is_none_or(|owner| owner == name)
+                {
+                    self.captures.remove(key);
+                    self.capture_owner.insert(key.clone(), name.to_string());
+                }
+            }
+            self.warnings.push(crate::i18n::fill(
+                self.ctx.strings.cache_event,
+                &[
+                    name,
+                    if replacement {
+                        self.ctx.strings.cache_hit
+                    } else {
+                        self.ctx.strings.cache_invalidated
+                    },
+                ],
+            ));
+            return Ok(());
+        }
+        let entry = if (op.is_none() || replacement)
+            && existing.as_ref().is_some_and(|e| e.values.is_some())
+        {
+            existing.unwrap()
+        } else {
+            let invalid = super::cache::Entry::new(None);
+            locked.write(&invalid)?;
+            *binding.state.lock().expect("cache state poisoned") = Some(invalid);
+            for key in persist {
+                if self
+                    .capture_owner
+                    .get(key)
+                    .is_none_or(|owner| owner == name)
+                {
+                    self.captures.remove(key);
+                    self.capture_owner.insert(key.clone(), name.to_string());
+                }
+            }
+            let mut preparation = Self::from_state(self.ctx, self.to_state());
+            preparation.scopes = binding.scopes.clone();
+            preparation.cache_bindings.remove(name);
+            preparation.inherited_errors.clear();
+            preparation.inherited_error_origins.clear();
+            for key in persist {
+                preparation.captures.remove(key);
+                preparation.capture_owner.remove(key);
+            }
+            let mut prepared = HashMap::new();
+            preparation.exec_inline(body, &mut prepared, None);
+            if preparation.stopped() || preparation.interrupted {
+                self.interrupted = true;
+                return Err(self.ctx.strings.cache_interrupted.into());
+            }
+            if !preparation.errors.is_empty() {
+                self.last_failure = preparation.last_failure;
+                return Err(preparation.errors.join("\n"));
+            }
+            let mut values = BTreeMap::new();
+            for key in persist {
+                let value = preparation
+                    .captures
+                    .get(key)
+                    .filter(|v| !v.trim().is_empty() && !v.contains("{{"))
+                    .ok_or_else(|| {
+                        format!("preparation did not produce a valid '{key}' capture")
+                    })?;
+                if preparation
+                    .capture_owner
+                    .get(key)
+                    .and_then(|owner| preparation.step_captures.get(owner))
+                    .is_none_or(|values| values.is_generated(key))
+                {
+                    return Err(format!(
+                        "preparation did not capture '{key}' from a response"
+                    ));
+                }
+                values.insert(key.clone(), value.clone());
+            }
+            for (file, expected) in &binding.files {
+                if &super::cache::file_digest(file)? != expected {
+                    return Err(format!(
+                        "cache input {} changed during preparation",
+                        file.display()
+                    ));
+                }
+            }
+            let entry = super::cache::Entry::new(Some(values));
+            locked.write(&entry)?;
+            self.warnings.extend(preparation.warnings);
+            entry
+        };
+        let values: Vec<_> = entry
+            .values
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        binding.observed = Some(entry.generation.clone());
+        *binding.state.lock().expect("cache state poisoned") = Some(entry);
+        self.record_captures(name, &values);
+        self.warnings.push(crate::i18n::fill(
+            self.ctx.strings.cache_event,
+            &[
+                name,
+                if op == Some(true) {
+                    self.ctx.strings.cache_refreshed
+                } else if hit {
+                    self.ctx.strings.cache_hit
+                } else {
+                    self.ctx.strings.cache_prepared
+                },
+            ],
+        ));
+        Ok(())
+    }
+
+    fn send_vars(&mut self, request: &HurlEntry) -> Result<HashMap<String, String>, String> {
+        let vars = self.request_vars(false);
+        let required = template_refs(&request.to_hurl());
+        for (name, binding) in &mut self.cache_bindings {
+            let state = binding.state.lock().expect("cache state poisoned");
+            let FlowNode::Cache { persist, .. } = &binding.definition else {
+                continue;
+            };
+            if persist
+                .iter()
+                .any(|k| self.capture_owner.get(k) == Some(name))
+            {
+                let Some(entry) = state.as_ref().filter(|e| e.values.is_some()) else {
+                    if persist
+                        .iter()
+                        .any(|k| self.capture_owner.get(k) == Some(name) && required.contains(k))
+                    {
+                        return Err(format!(
+                            "cache '{name}' is invalid; refresh it before sending requests"
+                        ));
+                    }
+                    continue;
+                };
+                if entry
+                    .values
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .all(|(k, v)| vars.get(k) == Some(v))
+                {
+                    binding.observed = Some(entry.generation.clone());
+                }
+            }
+        }
+        Ok(vars)
+    }
+
     fn exec_branch(
         &mut self,
         node: &FlowNode,
@@ -2335,6 +2880,8 @@ impl<'a> Exec<'a> {
                     probe.exec_block(arm);
                     self.errors.extend(probe.errors);
                 }
+            } else if matches!(kind, BranchKind::Try { retries, .. } if *retries > 0) {
+                self.exec_inline(body, own, recovering);
             }
             return;
         }
@@ -2345,49 +2892,79 @@ impl<'a> Exec<'a> {
                 }
                 Err(error) => self.errors.push(error),
             },
-            BranchKind::Try { error_var } => {
+            BranchKind::Try { error_var, retries } => {
+                let initial = self.to_state();
+                let mut remaining = *retries;
                 let mark = self.errors.len();
                 let skip_mark = self.skipped.len();
                 let previous_cells = own.clone();
-                self.exec_inline(body, own, recovering);
-                if self.errors.len() == mark || self.ctx.cancel.is_some_and(Cancel::stopped) {
-                    return;
-                }
-                let caught = self.errors.split_off(mark);
-                let caught_skips = self.skipped.split_off(skip_mark);
-                *own = previous_cells;
-                let previous = self
-                    .scopes
-                    .last_mut()
-                    .unwrap()
-                    .insert(error_var.clone(), caught.join("\n"));
-                let previous_capture = self.captures.insert(error_var.clone(), caught.join("\n"));
-                self.exec_inline(alternative, own, Some(&caught));
-                if let Some(value) = previous_capture {
-                    self.captures.insert(error_var.clone(), value);
-                } else {
-                    self.captures.remove(error_var);
-                }
-                let frame = self.scopes.last_mut().unwrap();
-                if let Some(value) = previous {
-                    frame.insert(error_var.clone(), value);
-                } else {
-                    frame.remove(error_var);
-                }
-                if self.errors.len() == mark && !self.ctx.cancel.is_some_and(Cancel::stopped) {
-                    self.warnings.extend(
-                        caught
-                            .iter()
-                            .map(|e| crate::i18n::fill(self.ctx.strings.run_recovered, &[e])),
-                    );
-                } else {
-                    // Failed recovery retains the original cause as well as its own error.
-                    for error in caught {
-                        if !self.errors[mark..].contains(&error) {
-                            self.errors.push(error);
-                        }
+                let columns = (
+                    self.column_order.clone(),
+                    self.timing_columns.clone(),
+                    self.duration_columns.clone(),
+                    self.column_sources.clone(),
+                );
+                loop {
+                    self.last_failure = Failure::default();
+                    self.exec_inline(body, own, recovering);
+                    if self.errors.len() == mark || self.stopped() {
+                        return;
                     }
-                    self.skipped.extend(caught_skips);
+                    if *retries > 0 && remaining == 0 {
+                        return;
+                    }
+                    let caught = self.errors.split_off(mark);
+                    let caught_skips = self.skipped.split_off(skip_mark);
+                    let failed_state = self.to_state();
+                    *own = previous_cells.clone();
+                    let previous = self
+                        .scopes
+                        .last_mut()
+                        .unwrap()
+                        .insert(error_var.clone(), caught.join("\n"));
+                    let previous_capture =
+                        self.captures.insert(error_var.clone(), caught.join("\n"));
+                    let mut failure = self.last_failure.clone();
+                    failure.message = caught.join("\n");
+                    self.recoveries.push((error_var.clone(), failure));
+                    self.exec_inline(alternative, own, Some(&caught));
+                    self.recoveries.pop();
+                    if let Some(value) = previous_capture {
+                        self.captures.insert(error_var.clone(), value);
+                    } else {
+                        self.captures.remove(error_var);
+                    }
+                    let frame = self.scopes.last_mut().unwrap();
+                    if let Some(value) = previous {
+                        frame.insert(error_var.clone(), value);
+                    } else {
+                        frame.remove(error_var);
+                    }
+                    if self.errors.len() == mark && !self.stopped() {
+                        self.warnings.extend(
+                            caught
+                                .iter()
+                                .map(|e| crate::i18n::fill(self.ctx.strings.run_recovered, &[e])),
+                        );
+                        if *retries == 0 {
+                            return;
+                        }
+                        remaining -= 1;
+                        self.restore_retry_state(&initial, &failed_state);
+                        *own = previous_cells.clone();
+                        self.column_order = columns.0.clone();
+                        self.timing_columns = columns.1.clone();
+                        self.duration_columns = columns.2.clone();
+                        self.column_sources = columns.3.clone();
+                    } else {
+                        for error in caught {
+                            if !self.errors[mark..].contains(&error) {
+                                self.errors.push(error);
+                            }
+                        }
+                        self.skipped.extend(caught_skips);
+                        return;
+                    }
                 }
             }
         }
@@ -2402,7 +2979,7 @@ impl<'a> Exec<'a> {
         let mark = self.errors.len();
         let mut cleanups = Vec::new();
         for node in nodes {
-            if self.errors.len() > mark || self.ctx.cancel.is_some_and(Cancel::stopped) {
+            if self.errors.len() > mark || self.stopped() {
                 break;
             }
             match node {
@@ -2422,6 +2999,7 @@ impl<'a> Exec<'a> {
                     }
                 }
                 FlowNode::Cleanup { .. } => cleanups.push(node),
+                FlowNode::Cache { .. } | FlowNode::CacheOp { .. } => self.exec_cache(node),
                 FlowNode::Branch { .. } => self.exec_branch(node, own, recovering),
                 FlowNode::Rethrow => match recovering {
                     Some(errors) => self.errors.extend_from_slice(errors),
@@ -2432,10 +3010,62 @@ impl<'a> Exec<'a> {
                 _ => self.errors.push(self.ctx.strings.run_branch_shape.into()),
             }
         }
+        let failure = (self.errors.len() > mark).then(|| self.last_failure.clone());
         self.run_cleanups(&cleanups);
-        if self.ctx.cancel.is_some_and(Cancel::stopped) {
+        if let Some(failure) = failure {
+            self.last_failure = failure;
+        }
+        if self.stopped() {
             self.interrupted = true;
         }
+    }
+
+    fn restore_retry_state(&mut self, initial: &ExecState, failed: &ExecState) {
+        fn restore<T: Clone + PartialEq>(
+            current: &mut HashMap<String, T>,
+            initial: &HashMap<String, T>,
+            failed: &HashMap<String, T>,
+        ) {
+            let mut result = initial.clone();
+            for (key, value) in current.iter() {
+                if failed.get(key) != Some(value) {
+                    result.insert(key.clone(), value.clone());
+                }
+            }
+            for key in failed.keys() {
+                if !current.contains_key(key) {
+                    result.remove(key);
+                }
+            }
+            *current = result;
+        }
+        restore(&mut self.captures, &initial.captures, &failed.captures);
+        restore(
+            &mut self.capture_owner,
+            &initial.capture_owner,
+            &failed.capture_owner,
+        );
+        restore(
+            &mut self.step_captures,
+            &initial.step_captures,
+            &failed.step_captures,
+        );
+        restore(&mut self.step_ok, &initial.step_ok, &failed.step_ok);
+        restore(
+            &mut self.step_request,
+            &initial.step_request,
+            &failed.step_request,
+        );
+        for ((current, initial), failed) in self
+            .scopes
+            .iter_mut()
+            .zip(&initial.scopes)
+            .zip(&failed.scopes)
+        {
+            restore(current, initial, failed);
+        }
+        self.step_order
+            .retain(|s| initial.step_order.contains(s) || !failed.step_order.contains(s));
     }
 
     /// Run a block's `CLEANUP` statements, once the block has finished.
@@ -2893,6 +3523,7 @@ impl<'a> Exec<'a> {
         alias: Option<&str>,
         using: &[UsingItem],
     ) -> Option<EntryOutcome> {
+        self.last_failure = Failure::default();
         let step = alias.unwrap_or_else(|| leaf(name)).to_string();
         let base = match resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
             Some(e) => e.clone(),
@@ -2911,7 +3542,15 @@ impl<'a> Exec<'a> {
                 return None;
             }
         };
-        let out = self.ctx.runner.run(&base, &self.request_vars(false));
+        let vars = match self.send_vars(&base) {
+            Ok(vars) => vars,
+            Err(error) => {
+                self.errors.push(error);
+                self.note_step(&step, name, false);
+                return None;
+            }
+        };
+        let out = self.ctx.runner.run(&base, &vars);
         self.record_generated(&step, &out.generated);
         if let Some(err) = &out.error {
             self.errors.push(format!("{name}: {err}"));
@@ -2922,6 +3561,15 @@ impl<'a> Exec<'a> {
         let eo = surviving.into_iter().nth(representative);
         match &eo {
             Some(eo) => {
+                if !eo.ok || !successful {
+                    self.last_failure = Failure::response(eo);
+                    if successful {
+                        self.errors.push(format!(
+                            "{name}: {}",
+                            eo.error.as_deref().unwrap_or("request failed")
+                        ));
+                    }
+                }
                 self.record_captures(&step, &eo.captures);
                 self.note_step(&step, name, eo.ok && successful);
             }
@@ -3064,6 +3712,7 @@ impl<'a> Exec<'a> {
         hide: &[String],
         with: &[WithItem],
     ) -> Vec<(String, String)> {
+        self.last_failure = Failure::default();
         let alias = alias
             .map(str::to_string)
             .unwrap_or_else(|| leaf(name).to_string());
@@ -3095,7 +3744,15 @@ impl<'a> Exec<'a> {
                 return cells;
             }
         };
-        let out = self.ctx.runner.run(&base, &self.request_vars(false));
+        let vars = match self.send_vars(&base) {
+            Ok(vars) => vars,
+            Err(error) => {
+                self.errors.push(error.clone());
+                self.note_step(&alias, name, false);
+                return vec![(format!("{alias}.Error"), error)];
+            }
+        };
+        let out = self.ctx.runner.run(&base, &vars);
         self.record_generated(&alias, &out.generated);
         // The run's verdict, decided over the *surviving* attempts only: with
         // `[Options] retry`, a poll that answered twice and then succeeded is
@@ -3160,6 +3817,7 @@ impl<'a> Exec<'a> {
         // so which spelling was used decided whether a broken API failed the
         // run, which is indefensible either way round.
         if !ok {
+            self.last_failure = Failure::response(&eo);
             let err = surviving_error
                 .clone()
                 .or_else(|| eo.error.clone())

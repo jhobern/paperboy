@@ -15,6 +15,8 @@ use super::model::StatKind;
 /// the interpreter executes.
 #[derive(Debug, Clone, Default, Eq)]
 pub struct ReportFlow {
+    /// Script identity for persistent preparation; provenance, not AST content.
+    pub source_path: Option<std::path::PathBuf>,
     pub header: Header,
     pub nodes: Vec<FlowNode>,
     /// The verbatim Hurl after a `REQUESTS` line, when the flow embeds its own
@@ -209,6 +211,18 @@ impl Header {
 /// One statement in a flow body (or loop body).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlowNode {
+    Cache {
+        name: String,
+        namespace: Option<String>,
+        keys: Vec<String>,
+        files: Vec<String>,
+        persist: Vec<String>,
+        body: Vec<FlowNode>,
+    },
+    CacheOp {
+        name: String,
+        refresh: bool,
+    },
     /// Row-local control flow. Branches share the enclosing scope and row.
     Branch {
         kind: BranchKind,
@@ -347,7 +361,7 @@ pub enum FlowNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BranchKind {
     If(Condition),
-    Try { error_var: String },
+    Try { error_var: String, retries: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1160,6 +1174,7 @@ impl ReportFlow {
                     FlowNode::ForEach { body, .. }
                     | FlowNode::ForEnvs { body, .. }
                     | FlowNode::Graph { body, .. } => walk(body, conditional, out, requests),
+                    FlowNode::Cache { body, .. } => walk(body, conditional, out, requests),
                     _ => {}
                 }
             }
@@ -1334,7 +1349,9 @@ pub fn collect_column_meta(nodes: &[FlowNode], out: &mut FlowColumnMeta) {
             }
             // A region is a scheduling device, not a scope: metadata written
             // inside one belongs to the enclosing block's row like any other.
-            FlowNode::ForEach { body, .. } | FlowNode::Graph { body, .. } => {
+            FlowNode::ForEach { body, .. }
+            | FlowNode::Graph { body, .. }
+            | FlowNode::Cache { body, .. } => {
                 collect_column_meta(body, out);
             }
             FlowNode::Branch {
@@ -1357,6 +1374,45 @@ fn indent(out: &mut String, depth: usize) {
 fn write_node(out: &mut String, node: &FlowNode, depth: usize) {
     indent(out, depth);
     match node {
+        FlowNode::Cache {
+            name,
+            namespace,
+            keys,
+            files,
+            persist,
+            body,
+        } => {
+            let _ = writeln!(out, "CACHE {name}");
+            if let Some(namespace) = namespace {
+                indent(out, depth + 1);
+                let _ = writeln!(out, "NAMESPACE {}", quote(namespace));
+            }
+            for (keyword, values) in [("KEY", keys), ("FILES", files)] {
+                if !values.is_empty() {
+                    indent(out, depth + 1);
+                    let values = values
+                        .iter()
+                        .map(|v| quote(v))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = writeln!(out, "{keyword} ({values})");
+                }
+            }
+            indent(out, depth + 1);
+            let _ = writeln!(out, "PERSIST ({})", persist.join(", "));
+            for node in body {
+                write_node(out, node, depth + 1);
+            }
+            indent(out, depth);
+            out.push_str("END\n");
+        }
+        FlowNode::CacheOp { name, refresh } => {
+            let _ = writeln!(
+                out,
+                "CACHE {} {name}",
+                if *refresh { "REFRESH" } else { "INVALIDATE" }
+            );
+        }
         FlowNode::Rethrow => out.push_str("RETHROW\n"),
         FlowNode::Branch {
             kind,
@@ -1376,8 +1432,12 @@ fn write_node(out: &mut String, node: &FlowNode, depth: usize) {
                 indent(out, depth);
                 match kind {
                     BranchKind::If(_) => out.push_str("ELSE\n"),
-                    BranchKind::Try { error_var } => {
-                        let _ = writeln!(out, "RECOVER {error_var}");
+                    BranchKind::Try { error_var, retries } => {
+                        if *retries == 0 {
+                            let _ = writeln!(out, "RECOVER {error_var}");
+                        } else {
+                            let _ = writeln!(out, "RECOVER RETRY({retries}) {error_var}");
+                        }
                     }
                 }
                 for n in alternative {
@@ -1812,9 +1872,20 @@ impl FlowNode {
     /// a `REPORT REQUEST … WITH …` is summarised with a trailing `WITH …`.
     pub fn label(&self) -> String {
         match self {
+            FlowNode::Cache { name, .. } => format!("CACHE {name}"),
+            FlowNode::CacheOp { name, refresh } => format!(
+                "CACHE {} {name}",
+                if *refresh { "REFRESH" } else { "INVALIDATE" }
+            ),
             FlowNode::Branch { kind, .. } => match kind {
                 BranchKind::If(c) => format!("IF {}", c.text()),
-                BranchKind::Try { error_var } => format!("TRY / RECOVER {error_var}"),
+                BranchKind::Try { error_var, retries } => {
+                    if *retries == 0 {
+                        format!("TRY / RECOVER {error_var}")
+                    } else {
+                        format!("TRY / RECOVER RETRY({retries}) {error_var}")
+                    }
+                }
             },
             FlowNode::Rethrow => "RETHROW".into(),
             FlowNode::Assign { key, value } => format!("{key} = {value}"),
@@ -1894,6 +1965,17 @@ impl FlowNode {
     /// (request nodes are edited via the request picker, not this line form).
     pub fn header_line(&self) -> String {
         match self {
+            FlowNode::Cache { .. } => {
+                let mut node = self.clone();
+                node.body_mut().unwrap().clear();
+                let mut text = String::new();
+                write_node(&mut text, &node, 0);
+                text.trim_end_matches("END\n")
+                    .lines()
+                    .map(str::trim)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
             FlowNode::Report(ReportStmt::Request {
                 name,
                 alias,
@@ -1949,6 +2031,7 @@ impl FlowNode {
     /// The loop body of a `FOR …` node (mutable), or `None` for a leaf node.
     pub fn body_mut(&mut self) -> Option<&mut Vec<FlowNode>> {
         match self {
+            FlowNode::Cache { body, .. } => Some(body),
             FlowNode::ForEach { body, .. }
             | FlowNode::ForEnvs { body, .. }
             | FlowNode::Graph { body, .. } => Some(body),

@@ -540,6 +540,10 @@ fn scope_captures(
                     out.insert(p.name.clone());
                     continue;
                 }
+                FlowNode::Cache { persist, .. } => {
+                    out.extend(persist.iter().cloned());
+                    continue;
+                }
                 FlowNode::Cleanup { name, .. } => cleanups.then_some(name.as_str()),
                 FlowNode::Branch {
                     body, alternative, ..
@@ -685,6 +689,7 @@ fn count_cleanups(nodes: &[FlowNode]) -> usize {
             FlowNode::ForEach { body, .. }
             | FlowNode::ForEnvs { body, .. }
             | FlowNode::Graph { body, .. } => count_cleanups(body),
+            FlowNode::Cache { body, .. } => count_cleanups(body),
             FlowNode::Branch {
                 body, alternative, ..
             } => count_cleanups(body) + count_cleanups(alternative),
@@ -784,7 +789,7 @@ fn retain_cleanups(
                     .visible_strictly_before(here_ord)
                     .positionless();
                 retain_cleanups(body, &body_visible, entries, helpers, &body_dropped, keep);
-                if let super::flow::BranchKind::Try { error_var } = kind {
+                if let super::flow::BranchKind::Try { error_var, .. } = kind {
                     body_visible.extend(scope_captures(body, entries, helpers, false));
                     body_visible.insert(error_var.clone());
                 }
@@ -1005,6 +1010,7 @@ fn scan_strands(nodes: &[FlowNode], dropped_names: &DroppedNames, out: &mut Vec<
             FlowNode::ForEach { body, .. }
             | FlowNode::ForEnvs { body, .. }
             | FlowNode::Graph { body, .. } => scan_strands(body, dropped_names, out),
+            FlowNode::Cache { body, .. } => scan_strands(body, dropped_names, out),
             FlowNode::Branch {
                 body, alternative, ..
             } => {

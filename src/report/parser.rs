@@ -7,7 +7,7 @@ use nom::{
     character::complete::{char, multispace0, multispace1, not_line_ending, satisfy},
     combinator::{eof, map, opt, peek, recognize, value, verify},
     multi::{many0, separated_list0, separated_list1},
-    sequence::{delimited, pair, preceded, separated_pair, tuple},
+    sequence::{delimited, pair, preceded, separated_pair, terminated, tuple},
 };
 
 use crate::report::flow::{
@@ -72,6 +72,13 @@ for-each     := [ parallel ] 'FOR' pattern 'IN' producer statement* 'END'
 for-envs     := [ parallel ] 'FOR' IDENT 'IN' 'ENVS' env-clause statement* 'END'
 graph        := [ parallel ] 'GRAPH' [ IDENT ] graph-stmt* 'END'
 graph-stmt   := request | report               # enforced by validation, not here
+cache        := 'CACHE' IDENT cache-header* statement* 'END'
+cache-header := 'NAMESPACE' string | 'KEY' '(' name-list ')'
+              | 'FILES' '(' name-list ')' | 'PERSIST' '(' IDENT (',' IDENT)* ')'
+                                                       # PERSIST is required
+cache-op     := 'CACHE' ('REFRESH' | 'INVALIDATE') IDENT
+try          := 'TRY' statement* 'RECOVER' [ 'RETRY' '(' UINT ')' ] IDENT statement* 'END'
+                                                       # RETRY count must be positive
 parallel     := 'PARALLEL' [ '(' UINT ')' ]            # concurrent iterations
 end          := 'END'                                  # closes the nearest FOR
 
@@ -320,6 +327,7 @@ fn header_line(i: &str) -> IResult<'_, HeaderLine> {
 
 fn node(i: &str) -> IResult<'_, FlowNode> {
     alt((
+        cache_stmt,
         for_stmt,
         graph_stmt,
         list_decl,
@@ -388,9 +396,21 @@ fn branch_stmt(i: &str) -> IResult<'_, FlowNode> {
     let (i, body) = many0(preceded(multispace0, node_or_comment))(i)?;
     let (i, kind, alternative) = if is_try {
         let (i, _) = kw("RECOVER")(i)?;
+        let (i, retries) = if let Ok((rest, _)) = pair(kw("RETRY"), same_line_char('('))(i) {
+            let (rest, count) = terminated(
+                preceded(multispace0, nom::character::complete::u32),
+                sym(')'),
+            )(rest)?;
+            if count == 0 {
+                return Err(perr(rest));
+            }
+            (rest, count)
+        } else {
+            (i, 0)
+        };
         let (i, error_var) = same_line_ident(i)?;
         let (i, alternative) = many0(preceded(multispace0, node_or_comment))(i)?;
-        (i, BranchKind::Try { error_var }, alternative)
+        (i, BranchKind::Try { error_var, retries }, alternative)
     } else {
         let (i, alternative) = opt(preceded(
             kw("ELSE"),
@@ -409,6 +429,74 @@ fn branch_stmt(i: &str) -> IResult<'_, FlowNode> {
             kind,
             body,
             alternative,
+        },
+    ))
+}
+
+fn cache_stmt(i: &str) -> IResult<'_, FlowNode> {
+    let (i, _) = kw("CACHE")(i)?;
+    if let Ok((rest, refresh)) =
+        alt((value(true, kw("REFRESH")), value(false, kw("INVALIDATE"))))(i)
+    {
+        let (rest, name) = same_line_ident(rest)?;
+        return Ok((rest, FlowNode::CacheOp { name, refresh }));
+    }
+    let (mut i, name) = same_line_ident(i)?;
+    let mut namespace = None;
+    let mut keys = None;
+    let mut files = None;
+    let mut persist = None;
+    let mut comments = Vec::new();
+    loop {
+        if let Ok((rest, comment)) = preceded(multispace0, comment_node)(i) {
+            comments.push(comment);
+            i = rest;
+            continue;
+        }
+        if let Ok((rest, ())) = kw("NAMESPACE")(i) {
+            if namespace.is_some() {
+                return Err(perr(i));
+            }
+            let (rest, value) = preceded(multispace0, string_lit)(rest)?;
+            namespace = Some(value);
+            i = rest;
+        } else if let Ok((rest, ())) = kw("KEY")(i) {
+            if keys.is_some() {
+                return Err(perr(i));
+            }
+            let (rest, values) = paren_list1(str_or_word)(rest)?;
+            keys = Some(values);
+            i = rest;
+        } else if let Ok((rest, ())) = kw("FILES")(i) {
+            if files.is_some() {
+                return Err(perr(i));
+            }
+            let (rest, values) = paren_list1(str_or_word)(rest)?;
+            files = Some(values);
+            i = rest;
+        } else if let Ok((rest, ())) = kw("PERSIST")(i) {
+            if persist.is_some() {
+                return Err(perr(i));
+            }
+            let (rest, values) = paren_list1(ident)(rest)?;
+            persist = Some(values);
+            i = rest;
+        } else {
+            break;
+        }
+    }
+    let persist = persist.ok_or_else(|| perr(i))?;
+    let (i, body) = block_body(i)?;
+    comments.extend(body);
+    Ok((
+        i,
+        FlowNode::Cache {
+            name,
+            namespace,
+            keys: keys.unwrap_or_default(),
+            files: files.unwrap_or_default(),
+            persist,
+            body: comments,
         },
     ))
 }
@@ -1350,6 +1438,7 @@ fn report_flow(i: &str) -> IResult<'_, ReportFlow> {
     Ok((
         i,
         ReportFlow {
+            source_path: None,
             header,
             nodes,
             requests: None,
@@ -1459,6 +1548,8 @@ pub fn opens_block(line: &str) -> bool {
         || with_block_head(line).is_ok()
         || kw("IF")(line).is_ok()
         || kw("TRY")(line).is_ok()
+        || kw("CACHE")(line)
+            .is_ok_and(|(rest, ())| kw("REFRESH")(rest).is_err() && kw("INVALIDATE")(rest).is_err())
 }
 
 /// The opener line of a `REPORT REQUEST … WITH … END` block: the statement head
@@ -1481,6 +1572,57 @@ fn with_block_head(i: &str) -> IResult<'_, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_and_retry_round_trip_preserves_metadata_and_comments() {
+        let src = "CACHE session\n# header note\nFILES (\"{{FILE}}\", \"other.pdf\")\nPERSIST (id, token)\nKEY (\"{{account}}\")\nNAMESPACE \"shared\\\\scope\"\nREQUEST create\nIF \"a\" == \"b\"\nid=ok\nELSE\nid=fallback\nEND\nEND\nTRY\nREPORT REQUEST check\nRECOVER RETRY(2) failure\nCACHE REFRESH session\nEND\nCACHE INVALIDATE session\n";
+        let flow = parse_flow(src).unwrap();
+        assert_eq!(parse_flow(&flow.to_text()).unwrap(), flow);
+        assert!(flow.to_text().contains("# header note"));
+        assert!(matches!(
+            &flow.nodes[1],
+            FlowNode::Branch {
+                kind: BranchKind::Try { retries: 2, .. },
+                ..
+            }
+        ));
+        let simple = parse_flow("CACHE auth\nPERSIST (token)\ntoken=ok\nEND\n").unwrap();
+        assert_eq!(parse_flow(&simple.to_text()).unwrap(), simple);
+        assert!(opens_block("cache auth"));
+        assert!(!opens_block("CACHE REFRESH auth"));
+        assert!(!opens_block("CACHE INVALIDATE auth"));
+    }
+
+    #[test]
+    fn cache_and_retry_reject_malformed_headers_and_counts() {
+        for bad in [
+            "CACHE c\nREQUEST setup\nEND",
+            "CACHE c\nPERSIST ()\nEND",
+            "CACHE c\nPERSIST (bad.name)\nEND",
+            "CACHE c\nPERSIST (id)\nPERSIST (id)\nEND",
+            "CACHE c\nPERSIST (id)\nKEY (\"a\")\nKEY (\"b\")\nEND",
+            "CACHE c\nPERSIST (id)\nREQUEST setup\nFILES (\"late\")\nEND",
+            "CACHE c\nNAMESPACE unquoted\nPERSIST (id)\nEND",
+            "CACHE REFRESH",
+            "TRY\nREQUEST check\nRECOVER RETRY(0) failure\nEND",
+            "TRY\nREQUEST check\nRECOVER RETRY(-1) failure\nEND",
+            "TRY\nREQUEST check\nRECOVER RETRY(1.5) failure\nEND",
+            "TRY\nREQUEST check\nRECOVER RETRY(4294967296) failure\nEND",
+            "TRY\nREQUEST check\nRECOVER RETRY() failure\nEND",
+            "RETRY(1)",
+        ] {
+            assert!(parse_flow(bad).is_err(), "{bad}");
+        }
+        let plain = parse_flow("TRY\nREQUEST check\nRECOVER failure\nRETHROW\nEND").unwrap();
+        assert!(matches!(
+            &plain.nodes[0],
+            FlowNode::Branch {
+                kind: BranchKind::Try { retries: 0, .. },
+                ..
+            }
+        ));
+        assert!(parse_flow("TRY\nREQUEST check\nRECOVER RETRY\nRETHROW\nEND").is_ok());
+    }
 
     #[test]
     fn conditional_recovery_round_trips_and_rejects_malformed_blocks() {

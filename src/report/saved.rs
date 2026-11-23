@@ -897,7 +897,7 @@ fn dynamic_names(flow: &ReportFlow, ctx: &RunContext) -> HashSet<String> {
                     alternative,
                     kind,
                 } => {
-                    if let super::flow::BranchKind::Try { error_var } = kind {
+                    if let super::flow::BranchKind::Try { error_var, .. } = kind {
                         out.insert(error_var.clone());
                     }
                     branch_assignments(body, true, out);
@@ -906,6 +906,10 @@ fn dynamic_names(flow: &ReportFlow, ctx: &RunContext) -> HashSet<String> {
                 FlowNode::ForEach { body, .. }
                 | FlowNode::ForEnvs { body, .. }
                 | FlowNode::Graph { body, .. } => branch_assignments(body, inside, out),
+                FlowNode::Cache { body, persist, .. } => {
+                    out.extend(persist.iter().cloned());
+                    branch_assignments(body, true, out);
+                }
                 _ => {}
             }
         }
@@ -961,11 +965,12 @@ fn validate_supported(
                 FlowNode::ForEach{body,..}|FlowNode::ForEnvs{body,..}|FlowNode::Graph{body,..} => walk(body,captured)?,
                 // Keep saved row identity and source discovery independent of
                 // live conditions. Report the final result after the branch.
-                FlowNode::Branch { body, alternative, .. } => {
+                FlowNode::Branch { body, alternative, kind } => {
                     if has_loop {
                         return Err("native state requires IF/TRY in leaf blocks so interrupted diagnostics belong to an execution".into());
                     }
-                    if graph_reports(body) || graph_reports(alternative) {
+                    let retry = matches!(kind, super::flow::BranchKind::Try { retries, .. } if *retries > 0);
+                    if graph_reports(alternative) || (graph_reports(body) && !retry) {
                         return Err("native state requires REPORT outside IF/TRY; branch on requests, then report the final result".into());
                     }
                     walk(body, captured)?;
@@ -1042,9 +1047,9 @@ fn validate_supported(
                 body, alternative, ..
             } => env_binding(body, name) || env_binding(alternative, name),
             FlowNode::ForEnvs { var, body, .. } => var == name || env_binding(body, name),
-            FlowNode::ForEach { body, .. } | FlowNode::Graph { body, .. } => {
-                env_binding(body, name)
-            }
+            FlowNode::ForEach { body, .. }
+            | FlowNode::Graph { body, .. }
+            | FlowNode::Cache { body, .. } => env_binding(body, name),
             _ => false,
         })
     }
@@ -1062,6 +1067,17 @@ fn validate_supported(
                 FlowNode::Request { name, using, .. }
                 | FlowNode::Cleanup { name, using, .. }
                 | FlowNode::Report(ReportStmt::Request { name, using, .. }) => Some((name, using)),
+                FlowNode::Cache { files, body, .. } => {
+                    if files.iter().any(|file| {
+                        references(file)
+                            .iter()
+                            .any(|r| r.rsplit('.').next() == Some(name))
+                    }) {
+                        return Err(format!("binding '{name}' changes a cache input file"));
+                    }
+                    validate_using(body, ctx, name)?;
+                    None
+                }
                 FlowNode::ForEach { body, .. }
                 | FlowNode::ForEnvs { body, .. }
                 | FlowNode::Graph { body, .. } => {
@@ -1186,9 +1202,9 @@ fn input_hashes(
                     producers(body, out);
                 }
                 FlowNode::ListDecl { producer, .. } => out.push(producer),
-                FlowNode::ForEnvs { body, .. } | FlowNode::Graph { body, .. } => {
-                    producers(body, out)
-                }
+                FlowNode::ForEnvs { body, .. }
+                | FlowNode::Graph { body, .. }
+                | FlowNode::Cache { body, .. } => producers(body, out),
                 _ => {}
             }
         }
@@ -1220,6 +1236,27 @@ fn input_hashes(
     for p in ps {
         paths(p, &mut templates)
     }
+    fn cache_files(nodes: &[FlowNode], out: &mut Vec<(String, Source)>) {
+        for node in nodes {
+            match node {
+                FlowNode::Cache { files, body, .. } => {
+                    out.extend(files.iter().cloned().map(|path| (path, Source::Manifest)));
+                    cache_files(body, out);
+                }
+                FlowNode::Branch {
+                    body, alternative, ..
+                } => {
+                    cache_files(body, out);
+                    cache_files(alternative, out);
+                }
+                FlowNode::ForEach { body, .. }
+                | FlowNode::ForEnvs { body, .. }
+                | FlowNode::Graph { body, .. } => cache_files(body, out),
+                _ => {}
+            }
+        }
+    }
+    cache_files(&flow.nodes, &mut templates);
     let mut files = HashSet::new();
     let mut visited = HashSet::new();
     let image_columns: Vec<_> = shape
@@ -1352,9 +1389,9 @@ fn input_hashes(
                     names.push(var.clone());
                     env_vars(body, names);
                 }
-                FlowNode::ForEach { body, .. } | FlowNode::Graph { body, .. } => {
-                    env_vars(body, names)
-                }
+                FlowNode::ForEach { body, .. }
+                | FlowNode::Graph { body, .. }
+                | FlowNode::Cache { body, .. } => env_vars(body, names),
                 _ => {}
             }
         }
@@ -2464,6 +2501,71 @@ mod tests {
             )).unwrap();
             assert!(validate_supported(&bad, &ctx, "case_id", &[]).is_err());
         }
+    }
+
+    #[test]
+    fn saved_cache_retry_report_leaf_has_stable_offline_discovery() {
+        let entries = entries();
+        let ctx = context(&entries, &DryRunner);
+        let flow = super::super::parser::parse_flow(
+            "FOR case_id IN [\"a\", \"b\"]\nCACHE session\nPERSIST(session_id)\nREQUEST setup\nEND\nTRY\nREPORT REQUEST check\nRECOVER RETRY(1) failure\nCACHE REFRESH session\nEND\nEND\n",
+        ).unwrap();
+        validate_supported(&flow, &ctx, "case_id", &[]).unwrap();
+        let shape = run_flow_raw(&flow, &ctx);
+        assert_eq!(shape.rows.len(), 2);
+        let state = State::create(&flow, &ctx, &shape, &options()).unwrap();
+        assert_eq!(state.rows.len(), 2);
+        for protected in [
+            "TRY\nREPORT REQUEST check\nRECOVER failure\nEND",
+            "TRY\nREPORT REQUEST check\nRECOVER RETRY(1) failure\nREPORT case_id\nEND",
+            "TRY\nIF \"a\" == \"b\"\nREPORT REQUEST check\nEND\nRECOVER RETRY(1) failure\nEND",
+        ] {
+            let bad = super::super::parser::parse_flow(&format!(
+                "FOR case_id IN [\"a\"]\n{protected}\nEND"
+            ))
+            .unwrap();
+            assert!(
+                validate_supported(&bad, &ctx, "case_id", &[]).is_err(),
+                "{protected}"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_cache_assignments_cannot_define_case_identity() {
+        let entries = entries();
+        let ctx = context(&entries, &DryRunner);
+        let flow = super::super::parser::parse_flow(
+            "CACHE c\nPERSIST(case_id)\ncase_id=dynamic\nEND\nTRY\nREPORT REQUEST check\nRECOVER RETRY(1) failure\nEND",
+        ).unwrap();
+        assert!(
+            validate_supported(&flow, &ctx, "case_id", &[])
+                .unwrap_err()
+                .contains("case key")
+        );
+    }
+
+    #[test]
+    fn saved_cache_files_are_fingerprinted_without_uploads_or_persistence() {
+        let entries = entries();
+        let mut ctx = context(&entries, &DryRunner);
+        ctx.root = Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let flow = super::super::parser::parse_flow(
+            "DOC=Cargo.toml\nFOR case_id IN [\"a\"]\nCACHE c\nFILES(\"{{DOC}}\")\nPERSIST(session_id)\nREQUEST setup\nEND\nREPORT REQUEST check\nEND",
+        ).unwrap();
+        let shape = run_flow_raw(&flow, &ctx);
+        let hashes = input_hashes(&flow, &ctx, &shape).unwrap();
+        let expected = hash(&std::fs::read(ctx.root.as_ref().unwrap().join("Cargo.toml")).unwrap());
+        assert!(
+            hashes
+                .iter()
+                .any(|(path, digest)| path.ends_with("Cargo.toml") && digest == &expected)
+        );
+        assert!(
+            validate_supported(&flow, &ctx, "case_id", &["DOC".into()])
+                .unwrap_err()
+                .contains("cache input file")
+        );
     }
 
     #[test]

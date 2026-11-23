@@ -83,6 +83,13 @@ const KEYWORDS: &[&str] = &[
     "TRY",
     "RECOVER",
     "RETHROW",
+    "RETRY",
+    "CACHE",
+    "REFRESH",
+    "INVALIDATE",
+    "NAMESPACE",
+    "KEY",
+    "PERSIST",
     "AS",
     "RESPONSE",
     "RAW",
@@ -462,6 +469,24 @@ mod tests {
 
     fn ctx() -> HlCtx {
         HlCtx::default()
+    }
+
+    #[test]
+    fn cache_and_retry_keywords_preserve_strings_and_interpolation() {
+        let theme = th();
+        for line in [
+            "CACHE REFRESH session",
+            "CACHE INVALIDATE session",
+            "RECOVER RETRY(2) failure",
+            "NAMESPACE \"CACHE\" KEY(\"{{account}}\") PERSIST(session_id)",
+        ] {
+            let spans = highlight_line(line, &ctx(), &theme);
+            assert_tiles(line, &spans);
+            assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+            if let Some(value) = spans.iter().find(|s| s.content == "{{account}}") {
+                assert_eq!(value.style.fg, Some(theme.subst));
+            }
+        }
     }
 
     /// The spans a line is broken into must tile it exactly (their character

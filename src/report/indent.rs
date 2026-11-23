@@ -27,7 +27,7 @@ pub fn leading_ws(line: &str) -> String {
 /// line opens a block.
 pub fn indent_for_new_line(current_line: &str) -> String {
     let mut indent = leading_ws(current_line);
-    if opens_block(current_line) {
+    if opens_block(current_line) || is_branch_line(current_line) {
         indent.push_str(INDENT_UNIT);
     }
     indent
@@ -37,6 +37,14 @@ pub fn indent_for_new_line(current_line: &str) -> String {
 /// surrounding whitespace).
 pub fn is_end_line(line: &str) -> bool {
     line.trim().eq_ignore_ascii_case("END")
+}
+
+fn is_branch_line(line: &str) -> bool {
+    let line = line.trim().to_ascii_uppercase();
+    line == "ELSE"
+        || line == "RECOVER"
+        || line.starts_with("RECOVER ")
+        || line.starts_with("RECOVER\t")
 }
 
 /// The indentation an `END` should take, given every line *above* it in source
@@ -103,7 +111,7 @@ pub fn reformat(src: &str) -> Result<Option<String>, ReformatError> {
             continue;
         }
         // `END` closes the block it sits in, so it dedents *before* it is placed.
-        if is_end_line(body) {
+        if is_end_line(body) || is_branch_line(body) {
             depth = depth.saturating_sub(1);
         }
         for _ in 0..depth {
@@ -111,7 +119,7 @@ pub fn reformat(src: &str) -> Result<Option<String>, ReformatError> {
         }
         out.push_str(body);
         out.push('\n');
-        if opens_block(body) {
+        if opens_block(body) || is_branch_line(body) {
             depth += 1;
         }
     }
@@ -134,6 +142,19 @@ pub fn reformat(src: &str) -> Result<Option<String>, ReformatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_and_retry_indentation_keeps_operations_as_leaves() {
+        let src = "CACHE c\nPERSIST(id)\nid=ok\nEND\nTRY\nREPORT id\nRECOVER RETRY(1) failure\nCACHE REFRESH c\nEND\nCACHE INVALIDATE c\n";
+        let formatted = reformat(src).ok().flatten().unwrap();
+        assert_eq!(
+            formatted,
+            "CACHE c\n    PERSIST(id)\n    id=ok\nEND\nTRY\n    REPORT id\nRECOVER RETRY(1) failure\n    CACHE REFRESH c\nEND\nCACHE INVALIDATE c\n"
+        );
+        assert_eq!(indent_for_new_line("CACHE c"), INDENT_UNIT);
+        assert_eq!(indent_for_new_line("CACHE REFRESH c"), "");
+        assert_eq!(indent_for_new_line("RECOVER RETRY(1) failure"), INDENT_UNIT);
+    }
 
     #[test]
     fn leading_ws_takes_only_the_prefix() {
