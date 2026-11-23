@@ -713,6 +713,8 @@ strings! {
     report_bound_prefix => "Bound collection:", "Collection liée :", "Bundet samling:";
     report_env_prefix => "Environment:", "Environnement :", "Miljø:";
     report_env_not_loaded => "(not loaded)", "(non chargé)", "(ikke indlæst)";
+    report_load_environment => "Load environment '{}'", "Charger l'environnement « {} »", "Indlæs miljøet '{}'";
+    report_environment_available => "Available environment files (load only the sources you trust):", "Fichiers d'environnement disponibles (ne chargez que les sources de confiance) :", "Tilgængelige miljøfiler (indlæs kun kilder, du stoler på):";
     report_base_dir_prefix => "Files resolve under:", "Les fichiers se résolvent sous :", "Filer opløses under:";
     report_base_dir_unsaved => "(save the report to anchor relative paths)", "(enregistrez le rapport pour ancrer les chemins relatifs)", "(gem rapporten for at forankre relative stier)";
     report_unbound => "No collection bound — edit the report's '# collection:' header to bind one.", "Aucune collection liée — modifiez l'en-tête « # collection: » du rapport pour en lier une.", "Ingen samling bundet — rediger rapportens « # collection: »-header for at binde en.";

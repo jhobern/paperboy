@@ -12,6 +12,9 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- GUI reports offer to load missing environments found in open workspaces or
+  beside the report, with explicit source-path selection in diagnostics and run
+  settings. No environment is loaded until the user chooses it.
 - Persistent PaperTrail preparation caches with explicit `PERSIST` outputs,
   content-aware `FILES` and `KEY` identities, automatic environment isolation,
   optional cross-script namespaces, and current-entry refresh/invalidation.
