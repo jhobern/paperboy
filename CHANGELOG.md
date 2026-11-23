@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.9.0] - 2026-11-23
+
+### Added
+
+- Persistent PaperTrail preparation caches with explicit `PERSIST` outputs,
+  content-aware `FILES` and `KEY` identities, automatic environment isolation,
+  optional cross-script namespaces, and current-entry refresh/invalidation.
+- Bounded `RECOVER RETRY(n)` with response status, header, and JSON-body failure
+  inspection. Successful recovery repeats the protected block without duplicated
+  reporting, while exhausted retries and failed repairs remain errors.
+- Private cache storage configurable through `PAPERBOY_CACHE_DIR`, atomic
+  publication, and per-entry coordination for parallel workers and processes.
+
+### Changed
+
+- `paperboy --gui` now releases the terminal after GUI initialization, while
+  reporting startup failures and keeping later diagnostics in `gui.log` beside
+  the saved session. `--gui --foreground` retains the attached behavior for
+  debugging. Terminal UI and headless runs are unchanged.
+
 ## [0.8.2] - 2026-11-20
 
 ### Fixed

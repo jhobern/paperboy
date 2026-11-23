@@ -93,6 +93,13 @@ The `gui` feature is opt-in because eframe/winit/wgpu roughly double the
 dependency tree. Both builds share the same state file, so you lose nothing by
 switching. Running `--gui` without it prints the command to install one with it.
 
+`paperboy --gui` launches in a separate process and releases the terminal after
+GUI initialization. Startup failures still return a nonzero exit status and
+print their diagnostics. Use `paperboy --gui --foreground` to keep it attached
+for debugging, with logs and the GUI's eventual exit status in the terminal.
+Detached runs append diagnostics to `gui.log` beside `state.json` (normally
+`~/.config/paperboy/`; honours `PAPERBOY_STATE_DIR` and `XDG_CONFIG_HOME`).
+
 `--no-default-features` turns the terminal UI off and leaves the headless
 runner, which is the shape wanted for CI images and Docker containers: it drops
 40 dependencies and about a third of PaperBoy's own source, none of which a
@@ -918,6 +925,12 @@ incremental output for cookie continuity.
 ### Reports
 
 `-r report.trail` runs a PaperTrail report and exits.
+
+Reports can reuse uploaded document sessions or other prepared resources across
+runs with `CACHE` / `PERSIST`, and repair expired entries with
+`CACHE REFRESH` inside bounded `RECOVER RETRY(1)` blocks. See
+[Persistent preparation caches](docs/caching.md) for syntax, environment/file
+isolation, response-based recovery, and private storage configuration.
 
 ```sh
 paperboy -r report.trail                                  # collection from the report's headers

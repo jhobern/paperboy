@@ -421,6 +421,7 @@ fn loop_body(node: &FlowNode) -> Option<&Vec<FlowNode>> {
     match node {
         FlowNode::ForEach { body, .. }
         | FlowNode::ForEnvs { body, .. }
+        | FlowNode::Cache { body, .. }
         | FlowNode::Graph { body, .. } => Some(body),
         _ => None,
     }
@@ -928,6 +929,11 @@ pub(crate) fn vars_in_scope(
         for node in nodes.iter().take(*index) {
             match node {
                 FlowNode::Assign { key, .. } => push(key, &mut out),
+                FlowNode::Cache { persist, .. } => {
+                    for name in persist {
+                        push(name, &mut out);
+                    }
+                }
                 FlowNode::Request { name, .. }
                 | FlowNode::Report(ReportStmt::Request { name, .. }) => {
                     if let Some(entry) = crate::report::run::resolve_title(entries, name) {
@@ -965,6 +971,7 @@ pub(crate) fn vars_in_scope(
                 push(var, &mut out);
                 nodes = body;
             }
+            FlowNode::Cache { body, .. } | FlowNode::Graph { body, .. } => nodes = body,
             // The path claims to step into a loop but the node isn't one, so
             // there is nothing further to walk.
             _ => break,
@@ -1025,6 +1032,7 @@ pub(crate) fn reported_requests(body: &[FlowNode]) -> Vec<String> {
                 FlowNode::ForEnvs { body, .. }
                 | FlowNode::ForEach { body, .. }
                 | FlowNode::Graph { body, .. } => walk(body, out),
+                FlowNode::Cache { body, .. } => walk(body, out),
                 FlowNode::Branch {
                     body, alternative, ..
                 } => {
@@ -2447,6 +2455,40 @@ mod tests {
 
     fn always_ok(_: &str) -> bool {
         true
+    }
+
+    #[test]
+    fn cache_editor_preserves_metadata_and_preparation_on_header_edit() {
+        let mut f = flow(
+            "CACHE c\nNAMESPACE \"shared\"\nFILES(\"{{FILE}}\")\nPERSIST(id)\nREQUEST setup\nEND\nREPORT id\n",
+        );
+        let rows = flatten(&f, &always_ok);
+        assert_eq!(rows[1].kind, RowKind::LoopHead);
+        assert_eq!(rows[2].path, vec![0, 0]);
+        assert_eq!(rows[3].kind, RowKind::LoopEnd);
+        let text = f.nodes[0]
+            .header_line()
+            .replacen("CACHE c", "CACHE renamed", 1);
+        let replacement = parse_one_node(&text, true).unwrap();
+        assert!(replace_node(&mut f, &[0], replacement));
+        let FlowNode::Cache {
+            name,
+            namespace,
+            files,
+            persist,
+            body,
+            ..
+        } = &f.nodes[0]
+        else {
+            panic!("expected cache");
+        };
+        assert_eq!(name, "renamed");
+        assert_eq!(namespace.as_deref(), Some("shared"));
+        assert_eq!(files, &["{{FILE}}"]);
+        assert_eq!(persist, &["id"]);
+        assert_eq!(body.len(), 1);
+        assert!(vars_in_scope(&f, &[1], &[]).contains(&"id".to_string()));
+        assert_eq!(parse_flow(&f.to_text()).unwrap(), f);
     }
 
     #[test]

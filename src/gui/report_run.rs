@@ -348,6 +348,14 @@ struct CancellableRunner<R: EntryRunner> {
 }
 
 impl<R: EntryRunner> EntryRunner for CancellableRunner<R> {
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed) || self.inner.cancelled()
+    }
+
+    fn offline(&self) -> bool {
+        self.inner.offline()
+    }
+
     fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
         if self.cancel.load(Ordering::Relaxed) {
             return RunOutput {

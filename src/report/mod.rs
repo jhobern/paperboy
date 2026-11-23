@@ -14,6 +14,7 @@
 //! - [`validate`]: static checks over a flow (+ bound collection / loaded envs).
 
 pub mod baseline;
+pub mod cache;
 pub mod compare;
 pub mod context;
 pub mod detail;

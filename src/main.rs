@@ -305,6 +305,17 @@ struct Cli {
     #[arg(short = 'g', long)]
     gui: bool,
 
+    #[arg(
+        long,
+        requires = "gui",
+        conflicts_with_all = ["collection", "report", "postman_import"],
+        help = i18n::Strings::for_language(&i18n::Language::English).gui_foreground_help
+    )]
+    foreground: bool,
+
+    #[arg(long, hide = true, requires = "foreground")]
+    gui_ready_file: Option<std::path::PathBuf>,
+
     /// Import a Postman workspace over the Postman API and exit. With
     /// `--postman-workspace` it downloads that workspace's collections and
     /// environments into `-o`; without one it lists the workspaces the key can
@@ -488,7 +499,7 @@ fn main() {
 
     // Native GUI mode (`-g/--gui`): a graphical front-end over the same core.
     if cli.gui {
-        std::process::exit(run_gui());
+        std::process::exit(run_gui(cli.foreground, cli.gui_ready_file));
     }
 
     // Terminal UI (the default).
@@ -541,8 +552,8 @@ fn run_tui() -> i32 {
 /// the README gets told how to get it, rather than an unhelpful "unexpected
 /// argument" from the argument parser.
 #[cfg(feature = "gui")]
-fn run_gui() -> i32 {
-    if let Err(e) = gui::run() {
+fn run_gui(foreground: bool, ready_file: Option<std::path::PathBuf>) -> i32 {
+    if let Err(e) = gui::start(foreground, ready_file) {
         eprintln!("gui error: {e}");
         return 1;
     }
@@ -550,7 +561,7 @@ fn run_gui() -> i32 {
 }
 
 #[cfg(not(feature = "gui"))]
-fn run_gui() -> i32 {
+fn run_gui(_foreground: bool, _ready_file: Option<std::path::PathBuf>) -> i32 {
     eprintln!(
         "This build of PaperBoy has no GUI. Reinstall it with the `gui` feature:\n\
          \x20   cargo install paperboy --locked --features gui"
@@ -561,6 +572,39 @@ fn run_gui() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gui_detaches_unless_foreground_is_requested() {
+        let cli = Cli::try_parse_from(["paperboy", "--gui"]).unwrap();
+        assert!(cli.gui);
+        assert!(!cli.foreground);
+        assert!(cli.gui_ready_file.is_none());
+        let cli = Cli::try_parse_from(["paperboy", "--gui", "--foreground"]).unwrap();
+        assert!(cli.foreground);
+    }
+
+    #[test]
+    fn foreground_and_startup_handshake_require_gui_mode() {
+        for args in [
+            vec!["paperboy", "--foreground"],
+            vec!["paperboy", "--gui", "--gui-ready-file", "ready"],
+            vec!["paperboy", "--gui", "--foreground", "-c", "c.hurl"],
+            vec!["paperboy", "--gui", "--foreground", "-r", "r.trail"],
+            vec!["paperboy", "--gui", "--foreground", "--postman-import"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "paperboy",
+                "--gui",
+                "--foreground",
+                "--gui-ready-file",
+                "ready",
+            ])
+            .is_ok()
+        );
+    }
 
     /// `--fail-under` is the one argument that decides whether a deploy is
     /// blocked, so its parser is held to what a caller can plausibly type —

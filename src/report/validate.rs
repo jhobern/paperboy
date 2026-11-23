@@ -132,6 +132,7 @@ fn emits_a_column(nodes: &[FlowNode]) -> bool {
         FlowNode::ForEach { body, .. }
         | FlowNode::ForEnvs { body, .. }
         | FlowNode::Graph { body, .. } => emits_a_column(body),
+        FlowNode::Cache { body, .. } => emits_a_column(body),
         _ => false,
     })
 }
@@ -147,6 +148,13 @@ pub(crate) fn branch_truth_errors(flow: &ReportFlow, strings: &Strings) -> Vec<S
 pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let s = ctx.strings;
+    check_caches(
+        &flow.nodes,
+        &mut vec![HashSet::new()],
+        &mut vec![HashSet::new()],
+        s,
+        &mut diags,
+    );
     diags.extend(
         branch_truth_errors(flow, s)
             .into_iter()
@@ -179,6 +187,7 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
                 }
                 FlowNode::ForEach { body, .. }
                 | FlowNode::ForEnvs { body, .. }
+                | FlowNode::Cache { body, .. }
                 | FlowNode::Graph { body, .. } => check_rethrow(body, recovering, s, diags),
                 _ => {}
             }
@@ -259,6 +268,74 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
         }
         if images.contains_key(&header) {
             diags.push(Diagnostic::warning(fill(s.diag_truth_on_image, &[&header])));
+        }
+    }
+
+    fn check_caches(
+        nodes: &[FlowNode],
+        scopes: &mut Vec<HashSet<String>>,
+        declarations: &mut Vec<HashSet<String>>,
+        s: &Strings,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        fn preparation(nodes: &[FlowNode]) -> bool {
+            nodes.iter().all(|node| match node {
+                FlowNode::Comment(_)
+                | FlowNode::Assign { .. }
+                | FlowNode::Request { .. }
+                | FlowNode::Rethrow => true,
+                FlowNode::Branch {
+                    body, alternative, ..
+                } => preparation(body) && preparation(alternative),
+                _ => false,
+            })
+        }
+        for node in nodes {
+            match node {
+                FlowNode::Cache {
+                    name,
+                    persist,
+                    body,
+                    ..
+                } => {
+                    if !super::parser::is_ident(name)
+                        || persist.is_empty()
+                        || persist.iter().any(|n| !super::parser::is_ident(n))
+                        || persist.iter().collect::<HashSet<_>>().len() != persist.len()
+                    {
+                        diags.push(Diagnostic::error(fill(s.diag_cache_persist, &[name])));
+                    }
+                    scopes.last_mut().unwrap().insert(name.clone());
+                    if !declarations.last_mut().unwrap().insert(name.clone()) {
+                        diags.push(Diagnostic::error(fill(s.diag_cache_duplicate, &[name])));
+                    }
+                    if !preparation(body) {
+                        diags.push(Diagnostic::error(fill(s.diag_cache_shape, &[name])));
+                    }
+                }
+                FlowNode::CacheOp { name, .. } => {
+                    if !scopes.iter().rev().any(|scope| scope.contains(name)) {
+                        diags.push(Diagnostic::error(fill(s.diag_cache_unknown, &[name])));
+                    }
+                }
+                FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                    scopes.push(HashSet::new());
+                    declarations.push(HashSet::new());
+                    check_caches(body, scopes, declarations, s, diags);
+                    declarations.pop();
+                    scopes.pop();
+                }
+                FlowNode::Graph { body, .. } => check_caches(body, scopes, declarations, s, diags),
+                FlowNode::Branch {
+                    body, alternative, ..
+                } => {
+                    // A conditional declaration is not definitely evaluated after
+                    // the branch. Operations there require an enclosing binding.
+                    check_caches(body, &mut scopes.clone(), declarations, s, diags);
+                    check_caches(alternative, &mut scopes.clone(), declarations, s, diags);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -421,7 +498,10 @@ fn nested_params<'a>(nodes: &'a [FlowNode]) -> Vec<&'a super::flow::ParamDecl> {
                 out.extend(nested_params(alternative));
             }
             FlowNode::Param(p) => out.push(p),
-            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+            FlowNode::ForEach { body, .. }
+            | FlowNode::ForEnvs { body, .. }
+            | FlowNode::Cache { body, .. }
+            | FlowNode::Graph { body, .. } => {
                 out.extend(nested_params(body));
             }
             _ => {}
@@ -615,6 +695,8 @@ fn walk(
         match node {
             // Nothing to check in a comment.
             FlowNode::Comment(_) => {}
+            FlowNode::CacheOp { .. } => {}
+            FlowNode::Cache { body, .. } => walk(body, ctx, &mut scopes.clone(), diags),
             FlowNode::Assign { key, value } => {
                 check_prelude_setting(key, value, ctx, diags);
             }
@@ -1029,6 +1111,7 @@ fn collect_called(nodes: &[FlowNode], out: &mut Vec<String>) {
             FlowNode::ForEach { body, .. }
             | FlowNode::ForEnvs { body, .. }
             | FlowNode::Graph { body, .. } => collect_called(body, out),
+            FlowNode::Cache { body, .. } => collect_called(body, out),
             _ => {}
         }
     }
@@ -1163,6 +1246,7 @@ fn check_regions(nodes: &[FlowNode], ctx: &Context, in_region: bool, diags: &mut
     let s = ctx.strings;
     for node in nodes {
         match node {
+            FlowNode::Cache { body, .. } => check_regions(body, ctx, in_region, diags),
             FlowNode::Branch {
                 body, alternative, ..
             } => {
@@ -1261,6 +1345,8 @@ struct StepInfo {
     request: String,
     /// Whether the step is a `CLEANUP`.
     is_cleanup: bool,
+    recovery: bool,
+    exported: Option<HashSet<String>>,
 }
 
 /// The step name a use contributes, before validity is considered.
@@ -1319,6 +1405,18 @@ fn walk_step_names(
         // A loop body is a new lexical frame: names inside it are visible to
         // the body and to nothing outside it.
         match node {
+            FlowNode::Cache { body, persist, .. } => {
+                let mut inner = path.clone();
+                walk_step_names(body, ctx, &mut inner, false, diags);
+                for (dst, src) in path.iter_mut().zip(inner) {
+                    for (name, mut info) in src {
+                        if !dst.contains_key(&name) {
+                            info.exported = Some(persist.iter().cloned().collect());
+                            dst.insert(name, info);
+                        }
+                    }
+                }
+            }
             FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
                 path.push(HashMap::new());
                 walk_step_names(body, ctx, path, false, diags);
@@ -1336,7 +1434,27 @@ fn walk_step_names(
                 } else {
                     path.clone()
                 };
+                if let super::flow::BranchKind::Try { error_var, .. } = kind {
+                    second.last_mut().unwrap().insert(
+                        error_var.clone(),
+                        StepInfo {
+                            written: true,
+                            request: String::new(),
+                            is_cleanup: false,
+                            recovery: true,
+                            exported: None,
+                        },
+                    );
+                }
                 walk_step_names(alternative, ctx, &mut second, false, diags);
+                if let super::flow::BranchKind::Try { error_var, .. } = kind {
+                    for (dst, original) in second.iter_mut().zip(path.iter()) {
+                        dst.remove(error_var);
+                        if let Some(info) = original.get(error_var) {
+                            dst.insert(error_var.clone(), info.clone());
+                        }
+                    }
+                }
                 // Either arm may produce a qualified capture. Runtime checks
                 // still reject using an output from an arm that did not run.
                 for (dst, src) in path.iter_mut().zip(first.iter().zip(second.iter())) {
@@ -1509,6 +1627,17 @@ pub(super) fn interpolated_source(node: &FlowNode) -> Vec<&str> {
         }
     }
     match node {
+        FlowNode::Cache {
+            namespace,
+            keys,
+            files,
+            ..
+        } => namespace
+            .iter()
+            .chain(keys)
+            .chain(files)
+            .map(String::as_str)
+            .collect(),
         FlowNode::Branch {
             kind: super::flow::BranchKind::If(condition),
             ..
@@ -1630,6 +1759,37 @@ fn check_qualified_refs(
                 )));
                 continue;
             };
+            if info.recovery {
+                let valid = matches!(var, "message" | "http_status")
+                    || var.strip_prefix("headers.").is_some_and(|name| {
+                        !name.is_empty()
+                            && name.bytes().all(|c| {
+                                c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
+                            })
+                    })
+                    || var.strip_prefix("body.").is_some_and(|path| {
+                        path.split('.').all(|p| {
+                            !p.is_empty()
+                                && p.chars()
+                                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                        })
+                    });
+                if !valid {
+                    diags.push(Diagnostic::error(fill(s.diag_failure_selector, &[&key])));
+                }
+                continue;
+            }
+            if info
+                .exported
+                .as_ref()
+                .is_some_and(|names| !names.contains(var))
+            {
+                diags.push(Diagnostic::error(fill(
+                    s.diag_step_ref_no_capture,
+                    &[step, &info.request, var],
+                )));
+                continue;
+            }
             // Reading a capture is a dependency as surely as naming one, so
             // the rules that govern `DEPENDS` on a cleanup govern this too —
             // otherwise the same mistake written as a value slips through,
@@ -1721,6 +1881,8 @@ fn register_step(
                 written: use_.alias.is_some(),
                 request: use_.request.to_string(),
                 is_cleanup: use_.is_cleanup,
+                recovery: false,
+                exported: None,
             },
         );
     }
@@ -2165,6 +2327,11 @@ fn check_var_availability(
 ) {
     for node in nodes {
         match node {
+            FlowNode::Cache { body, persist, .. } => {
+                check_var_availability(body, ctx, &mut defined.clone(), diags);
+                defined.extend(persist.iter().cloned());
+            }
+            FlowNode::CacheOp { .. } => {}
             FlowNode::Branch {
                 kind,
                 body,
@@ -2173,7 +2340,7 @@ fn check_var_availability(
                 let mut first = defined.clone();
                 check_var_availability(body, ctx, &mut first, diags);
                 let mut second = defined.clone();
-                if let super::flow::BranchKind::Try { error_var } = kind {
+                if let super::flow::BranchKind::Try { error_var, .. } = kind {
                     second.extend(first.iter().cloned());
                     second.insert(error_var.clone());
                 }
@@ -2373,6 +2540,75 @@ mod tests {
             ..Default::default()
         };
         validate(&flow, &ctx)
+    }
+
+    #[test]
+    fn cache_validation_checks_lexical_bindings_and_preparation_recursively() {
+        for body in [
+            "CACHE REFRESH absent\nREPORT \"ok\" AS result",
+            "CACHE INVALIDATE c\nCACHE c\nPERSIST(id)\nid=ok\nEND\nREPORT id",
+            "CACHE c\nPERSIST(id)\nid=ok\nEND\nCACHE c\nPERSIST(id)\nid=ok\nEND\nREPORT id",
+            "IF \"a\" == \"b\"\nCACHE c\nPERSIST(id)\nid=ok\nEND\nEND\nCACHE c\nPERSIST(id)\nid=ok\nEND\nREPORT id",
+            "CACHE c\nPERSIST(id,id)\nid=ok\nEND\nREPORT id",
+            "GRAPH\nCACHE c\nPERSIST(id)\nid=ok\nEND\nEND\nREPORT id",
+            "FOR x IN [\"a\"]\nCACHE c\nPERSIST(id)\nid=ok\nEND\nEND\nCACHE REFRESH c\nREPORT x",
+        ] {
+            assert!(
+                !errors_for(&format!("# collection: c\n{body}")).is_empty(),
+                "{body}"
+            );
+        }
+        for forbidden in [
+            "REPORT id",
+            "CLEANUP destroy",
+            "PARAM id",
+            "LIST ids = [\"a\"]",
+            "FOR x IN [\"a\"]\nEND",
+            "GRAPH\nREQUEST setup\nEND",
+            "CACHE other\nPERSIST(other)\nother=ok\nEND",
+            "CACHE REFRESH c",
+            "IF \"x\" == \"x\"\nCLEANUP destroy\nEND",
+        ] {
+            let errors = errors_for(&format!(
+                "# collection: c\nCACHE c\nPERSIST(id)\n{forbidden}\nEND\nREPORT id"
+            ));
+            assert!(
+                errors.iter().any(|e| e.contains("preparation")),
+                "{forbidden}: {errors:?}"
+            );
+        }
+        let valid = "# collection: c\nCACHE c\nPERSIST(id)\nid=ok\nEND\nFOR x IN [\"a\"]\nCACHE REFRESH c\nREPORT id\nEND";
+        assert!(errors_for(valid).is_empty(), "{:?}", errors_for(valid));
+    }
+
+    #[test]
+    fn cache_exports_only_persisted_qualified_captures_and_accepts_failure_selectors() {
+        let entries = vec![
+            capturing_entry("setup", &["id", "private"]),
+            capturing_entry("check", &[]),
+        ];
+        let prefix = "# collection: c\nCACHE c\nPERSIST(id)\nREQUEST setup\nEND\n";
+        let valid = format!(
+            "{prefix}TRY\nREPORT REQUEST check\nRECOVER RETRY(1) failure\nIF \"{{{{failure.http_status}}}}\" == \"400\" AND \"{{{{failure.body.message}}}}\" == \"missing\"\nCACHE REFRESH c\nELSE\nnote={{{{failure.headers.X-Request-Id}}}}\nRETHROW\nEND\nEND\nid={{{{setup.id}}}}\n"
+        );
+        let errors: Vec<_> = diags_with_entries(&valid, &entries)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        for tail in [
+            "x={{setup.private}}\nREPORT id",
+            "TRY\nREQUEST check\nRECOVER RETRY(1) failure\nx={{failure.body.}}\nEND\nREPORT id",
+            "TRY\nREQUEST check\nRECOVER RETRY(1) failure\nx={{failure.status}}\nEND\nREPORT id",
+            "TRY\nREQUEST check\nRECOVER RETRY(1) failure\nEND\nx={{failure.message}}\nREPORT id",
+        ] {
+            assert!(
+                diags_with_entries(&format!("{prefix}{tail}"), &entries)
+                    .iter()
+                    .any(|d| d.severity == Severity::Error),
+                "{tail}"
+            );
+        }
     }
 
     /// Diagnostics for a flow with a `REQUESTS` section, with the title list

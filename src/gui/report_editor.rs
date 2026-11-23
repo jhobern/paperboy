@@ -2006,7 +2006,10 @@ fn build_node_chips(
     s: &crate::i18n::Strings,
 ) -> Vec<Chip> {
     match node {
-        FlowNode::Branch { .. } | FlowNode::Rethrow => vec![Chip::base(node.label(), th.accent)],
+        FlowNode::Branch { .. }
+        | FlowNode::Rethrow
+        | FlowNode::Cache { .. }
+        | FlowNode::CacheOp { .. } => vec![Chip::base(node.label(), th.accent)],
         // One chip holding the comment verbatim. It has no detachable parts —
         // a comment is text, not a statement with clauses — but it is a block
         // like any other, so it can be dragged, moved and deleted.

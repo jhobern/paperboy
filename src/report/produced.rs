@@ -31,7 +31,7 @@ pub enum Provenance {
 }
 
 /// One step's output: its values, each remembering how it came to be.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct Produced {
     values: HashMap<String, String>,
     /// The subset of `values` that a `[Gen]` row minted. Held as a set rather

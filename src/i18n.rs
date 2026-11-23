@@ -69,6 +69,10 @@ pub const APP_NAME: &str = "PaperBoy";
 
 strings! {
     app_heading => "PaperBoy", "PaperBoy", "PaperBoy";
+    gui_foreground_help => "Keep the GUI attached to this terminal (logs and exit status); requires --gui.", "Garder l'interface graphique attachée à ce terminal (journaux et code de sortie) ; nécessite --gui.", "Behold GUI'en tilknyttet denne terminal (log og afslutningskode); kræver --gui.";
+    gui_log_unavailable => "Cannot locate the GUI log directory; use --gui --foreground.", "Impossible de trouver le dossier des journaux ; utilisez --gui --foreground.", "Kan ikke finde GUI-logmappen; brug --gui --foreground.";
+    gui_launch_exited => "GUI exited before startup completed ({status}).", "L'interface graphique s'est arrêtée avant la fin du démarrage ({status}).", "GUI'en afsluttede før opstarten var færdig ({status}).";
+    gui_log_label => "GUI log", "Journal de l'interface graphique", "GUI-log";
     base_url => "Default New Request URL:", "URL par défaut des nouvelles requêtes\u{a0}:", "Standard-URL for nye anmodninger:";
     sending => "Sending…", "Envoi en cours…", "Sender…";
     // Shown beside the spinner while Hurl is retrying a request (`[Options]
@@ -1756,7 +1760,19 @@ strings! {
     diag_list_shadowed => "LIST '{}' hides an earlier list of the same name.", "LIST '{}' masque une liste antérieure du même nom.", "LIST '{}' skjuler en tidligere liste med samme navn.";
     run_conditional_undefined => "IF references undefined variable '{}'.", "IF référence la variable non définie « {} ».", "IF henviser til den udefinerede variabel '{}'.";
     run_rethrow_outside => "RETHROW requires an active RECOVER block.", "RETHROW nécessite un bloc RECOVER actif.", "RETHROW kræver en aktiv RECOVER-blok.";
-    run_branch_shape => "IF/TRY bodies must be row-local: requests, reports, assignments, CLEANUP, or nested IF/TRY.", "Les blocs IF/TRY doivent rester dans une ligne : requêtes, rapports, affectations, CLEANUP ou IF/TRY imbriqués.", "IF/TRY skal blive inden for én række: forespørgsler, rapporter, tildelinger, CLEANUP eller indlejret IF/TRY.";
+    run_branch_shape => "IF/TRY bodies must be row-local: requests, reports, assignments, CACHE, CLEANUP, or nested IF/TRY.", "Les blocs IF/TRY doivent rester dans une ligne : requêtes, rapports, affectations, CACHE, CLEANUP ou IF/TRY imbriqués.", "IF/TRY skal blive inden for én række: forespørgsler, rapporter, tildelinger, CACHE, CLEANUP eller indlejret IF/TRY.";
+    cache_error => "Cache {}: {}", "Cache {} : {}", "Cache {}: {}";
+    cache_event => "Cache {}: {}", "Cache {} : {}", "Cache {}: {}";
+    cache_hit => "hit", "réutilisé", "genbrugt";
+    cache_prepared => "prepared", "préparé", "forberedt";
+    cache_refreshed => "refreshed", "actualisé", "opdateret";
+    cache_invalidated => "invalidated", "invalidé", "ugyldiggjort";
+    cache_interrupted => "Cache operation interrupted.", "Opération de cache interrompue.", "Cachehandlingen blev afbrudt.";
+    diag_cache_duplicate => "Cache name '{}' is already declared in this scope.", "Le cache '{}' est déjà déclaré dans cette portée.", "Cachenavnet '{}' er allerede erklæret i dette område.";
+    diag_cache_unknown => "Cache '{}' must be declared and evaluated before this operation.", "Le cache '{}' doit être déclaré et évalué avant cette opération.", "Cache '{}' skal erklæres og evalueres før denne handling.";
+    diag_cache_shape => "Cache '{}' preparation permits only requests, assignments, IF/TRY and RETHROW.", "La préparation du cache '{}' autorise uniquement les requêtes, affectations, IF/TRY et RETHROW.", "Forberedelse af cache '{}' tillader kun forespørgsler, tildelinger, IF/TRY og RETHROW.";
+    diag_cache_persist => "Cache '{}' requires distinct PERSIST identifiers and a valid cache name.", "Le cache '{}' exige des identifiants PERSIST distincts et un nom de cache valide.", "Cache '{}' kræver forskellige PERSIST-identifikatorer og et gyldigt cachenavn.";
+    diag_failure_selector => "Invalid recovery selector '{{{}}}'. Use message, http_status, headers.<name> or body.<field>.", "Sélecteur de récupération '{{{}}}' invalide. Utilisez message, http_status, headers.<nom> ou body.<champ>.", "Ugyldig gendannelsesvælger '{{{}}}'. Brug message, http_status, headers.<navn> eller body.<felt>.";
     run_recovered => "Recovered: {}", "Erreur traitée : {}", "Håndteret fejl: {}";
     diag_image_max_edge_invalid => "PRELUDE_IMAGE_MAX_EDGE is '{}', which is not a whole number of pixels of at least {}; the built-in default is used instead.", "PRELUDE_IMAGE_MAX_EDGE vaut « {} », qui n'est pas un nombre entier de pixels d'au moins {} ; la valeur par défaut intégrée est utilisée à la place.", "PRELUDE_IMAGE_MAX_EDGE er '{}', hvilket ikke er et helt antal pixels på mindst {}; den indbyggede standardværdi bruges i stedet.";
     diag_image_quality_invalid => "PRELUDE_IMAGE_QUALITY is '{}', which is not a whole number between 1 and 100; the built-in default is used instead.", "PRELUDE_IMAGE_QUALITY vaut « {} », qui n'est pas un nombre entier entre 1 et 100 ; la valeur par défaut intégrée est utilisée à la place.", "PRELUDE_IMAGE_QUALITY er '{}', hvilket ikke er et helt tal mellem 1 og 100; den indbyggede standardværdi bruges i stedet.";
