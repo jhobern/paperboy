@@ -228,6 +228,7 @@ pub struct ReportEditor {
     /// The open run-settings dialog, and what pressing its primary button will
     /// do. `None` when it isn't showing.
     params_modal: Option<RunIntent>,
+    pending_environment_load: Option<std::path::PathBuf>,
     /// What the result on screen was actually run with, in the order the
     /// report declares. Kept beside the result rather than in it, because the
     /// question it answers — "what did *this* table come from?" — is only ever
@@ -390,6 +391,7 @@ impl ReportEditor {
             params_sig: String::new(),
             params_confirmed: false,
             params_modal: None,
+            pending_environment_load: None,
             pending_toolbar: None,
         };
         ed.reparse();
@@ -2908,6 +2910,10 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // The run settings dialog: the report's own questions, asked on the way to
     // a run rather than occupying a view of their own.
     show_param_modal(&mut ed, app, ui.ctx());
+    if let Some(path) = ed.pending_environment_load.take() {
+        load_report_environment(&mut ed, app, &path);
+        ui.ctx().request_repaint();
+    }
 
     // The node-configure wizard modal (opened by double-clicking a block on the
     // blocks view) floats above whichever view is showing.
@@ -3602,6 +3608,7 @@ fn show_param_modal(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context
         .iter()
         .map(|e| e.name.clone())
         .collect();
+    let offers = report_environment_offers(ed, app, &ed.param_values);
     // Nothing may be started while a value would send the run at a hole.
     let ready = rows.iter().all(|r| r.problem.is_none());
 
@@ -3609,6 +3616,7 @@ fn show_param_modal(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context
     // everything it borrowed.
     let mut set: Option<(String, String)> = None;
     let mut browse: Option<(String, bool)> = None;
+    let mut load = None;
     let mut leave: Option<Option<RunIntent>> = None;
 
     let modal = egui::Modal::new(egui::Id::new("pt_run_settings")).show(ctx, |ui| {
@@ -3649,6 +3657,7 @@ fn show_param_modal(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context
                     }
                     ui.add_space(6.0);
                 }
+                load = environment_load_buttons(ui, &offers, &s, th.dim);
             });
 
         ui.add_space(8.0);
@@ -3703,6 +3712,9 @@ fn show_param_modal(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context
     });
     if modal.should_close() {
         leave = Some(None);
+    }
+    if let Some(path) = load {
+        ed.pending_environment_load = Some(path);
     }
 
     if let Some((name, value)) = set {
@@ -11055,8 +11067,78 @@ fn palette_splitter(ed: &mut ReportEditor, ui: &mut egui::Ui, body_h: f32) {
         .vline(rect.center().x, y0..=y0 + h, egui::Stroke::new(2.0, colour));
 }
 
-fn diagnostics_panel(ed: &ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
+fn report_environment_offers(
+    ed: &ReportEditor,
+    app: &GuiApp,
+    values: &crate::report::params::ParamValues,
+) -> Vec<(String, std::path::PathBuf)> {
+    let Some(flow) = &ed.flow else {
+        return Vec::new();
+    };
+    let names = context::environment_names(flow, values);
+    let files: Vec<_> = app
+        .session
+        .collections
+        .iter()
+        .flat_map(|c| c.workspace_env_files())
+        .collect();
+    names
+        .into_iter()
+        .flat_map(|name| {
+            crate::env_panel::load_candidates(
+                &name,
+                &app.session.global_envs,
+                &files,
+                ed.report.path.as_deref(),
+            )
+            .into_iter()
+            .map(move |path| (name.clone(), path))
+        })
+        .collect()
+}
+
+fn environment_load_buttons(
+    ui: &mut egui::Ui,
+    candidates: &[(String, std::path::PathBuf)],
+    strings: &Strings,
+    path_color: Color32,
+) -> Option<std::path::PathBuf> {
+    let mut selected = None;
+    if !candidates.is_empty() {
+        ui.label(strings.report_environment_available);
+    }
+    for (name, path) in candidates {
+        ui.push_id(path, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let label = crate::i18n::fill(strings.report_load_environment, &[name]);
+                if ui.button(label).clicked() {
+                    selected = Some(path.clone());
+                }
+                ui.colored_label(path_color, path.display().to_string());
+            });
+        });
+    }
+    selected
+}
+
+fn load_report_environment(ed: &mut ReportEditor, app: &mut GuiApp, path: &std::path::Path) {
+    if let Some(existing) = app
+        .session
+        .global_envs
+        .iter()
+        .find(|e| crate::environment::is_same_source(e, Some(path), None))
+    {
+        app.reveal_env = Some(existing.id);
+    } else {
+        app.reveal_env = app.session.open_workspace_environment(path);
+    }
+    ed.diag_key = None;
+}
+
+fn diagnostics_panel(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
     let th = app.theme;
+    let offers = report_environment_offers(ed, app, &Default::default());
+    let mut load = None;
     ui.add_space(4.0);
     ui.label(
         RichText::new(app.strings.report_validation_heading)
@@ -11081,7 +11163,11 @@ fn diagnostics_panel(ed: &ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
                 };
                 ui.colored_label(colour, format!("{icon} {}", d.message));
             }
+            load = environment_load_buttons(ui, &offers, &app.strings, th.dim);
         });
+    if let Some(path) = load {
+        ed.pending_environment_load = Some(path);
+    }
 }
 
 /// Apply the collected block actions to the editor and session.
@@ -16480,6 +16566,84 @@ REPORT REQUEST x
         app.open_report_editor(ReportOrigin::Workspace, Report::from_text("Face", text));
         let ed = app.report_editor.take().expect("editor is open");
         (app, ed)
+    }
+
+    #[test]
+    fn environment_load_offer_waits_for_confirmation_and_keeps_source_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dev.vars");
+        std::fs::write(&path, "URL=http://localhost\n").unwrap();
+        let source = "# collection: c.hurl\nPARAM ENV TARGET = \"dev\"\nREPORT \"ok\" AS Status\n";
+        let (mut app, mut ed) = editor(source);
+        ed.report.path = Some(directory.path().join("report.trail"));
+        ed.seed_params(&app.session);
+        ed.params_modal = Some(RunIntent::Review);
+        let candidates = report_environment_offers(&ed, &app, &ed.param_values);
+        assert_eq!(
+            candidates,
+            vec![("dev".into(), path.canonicalize().unwrap())]
+        );
+        app.report_editor = Some(ed);
+        let ctx = egui::Context::default();
+        painted(&ctx, &mut app);
+        let shown = painted(&ctx, &mut app);
+        assert!(shown.contains("Load environment 'dev'"), "{shown}");
+        assert!(
+            app.session.global_envs.is_empty(),
+            "showing the offer must not load it"
+        );
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| super::ui(&mut app, ui));
+        let position = output
+            .shapes
+            .iter()
+            .rev()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text)
+                    if text.galley.text() == "Load environment 'dev'" =>
+                {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("load button is visible");
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| super::ui(&mut app, ui));
+        let mut ed = app.report_editor.take().unwrap();
+        assert_eq!(app.session.global_envs.len(), 1);
+        assert_eq!(app.session.global_envs[0].name, "dev");
+        assert_eq!(ed.report.text, source);
+        assert_eq!(ed.param_values["TARGET"], "dev");
+        assert!(report_environment_offers(&ed, &app, &ed.param_values).is_empty());
+        load_report_environment(&mut ed, &mut app, &path);
+        assert_eq!(app.session.global_envs.len(), 1);
+    }
+
+    #[test]
+    fn environment_load_offer_surfaces_read_failure_without_editing_the_script() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = "# collection: c.hurl\nPARAM ENV TARGET = \"dev\"\n";
+        let (mut app, mut ed) = editor(source);
+        load_report_environment(&mut ed, &mut app, &directory.path().join("missing.vars"));
+        assert!(matches!(app.session.status, Some(Status::Error(_))));
+        assert!(app.session.global_envs.is_empty());
+        assert_eq!(ed.report.text, source);
     }
 
     /// Every piece of text painted by one frame of the editor, in `ctx` — which

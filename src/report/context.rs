@@ -21,6 +21,68 @@ use crate::session::effective_env;
 use super::flow::ReportFlow;
 use super::validate::{self, Context, Diagnostic};
 
+/// Statically resolvable environment names a report can offer to load.
+/// Runtime-dependent loop/capture expressions are deliberately not guessed.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn environment_names(flow: &ReportFlow, overrides: &super::params::ParamValues) -> Vec<String> {
+    use super::flow::{EnvClause, FlowNode, ParamKind, RoleRef};
+    fn walk(nodes: &[FlowNode], names: &mut Vec<String>) {
+        for node in nodes {
+            match node {
+                FlowNode::ForEnvs { clause, body, .. } => {
+                    match clause {
+                        EnvClause::Plain(envs) => names.extend(envs.clone()),
+                        EnvClause::Roles {
+                            baseline,
+                            comparisons,
+                            ..
+                        } => {
+                            for role in baseline.iter().chain(comparisons) {
+                                if let RoleRef::Env(name) = role {
+                                    names.push(name.clone());
+                                }
+                            }
+                        }
+                    }
+                    walk(body, names);
+                }
+                FlowNode::ForEach { body, .. }
+                | FlowNode::Graph { body, .. }
+                | FlowNode::Cache { body, .. } => walk(body, names),
+                FlowNode::Branch {
+                    body, alternative, ..
+                } => {
+                    walk(body, names);
+                    walk(alternative, names);
+                }
+                _ => {}
+            }
+        }
+    }
+    let params = flow.params();
+    let values = super::params::effective(&params, overrides);
+    let mut names = Vec::new();
+    if let Some(name) = flow.header.environment() {
+        names.push(name.to_string());
+    }
+    for param in params {
+        if matches!(param.kind, ParamKind::Env)
+            && let Some(value) = values.get(&param.name)
+        {
+            names.push(value.clone());
+        }
+    }
+    walk(&flow.nodes, &mut names);
+    let mut names: Vec<_> = names
+        .into_iter()
+        .map(|name| crate::environment::substitute(&name, &values))
+        .filter(|name| !name.is_empty() && !name.contains("{{"))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// The fully-owned inputs a report run needs, so it can be handed to a
 /// background thread with no borrow of the app: the flow, a clone of the bound
 /// collection's entries, the resolved base/named environment layers, the
@@ -577,6 +639,23 @@ mod tests {
     use super::*;
     use crate::hurl::{HurlEntry, KvRow};
 
+    #[test]
+    fn environment_names_for_loading_use_effective_parameters_and_ignore_snapshots() {
+        let flow = super::super::parse_flow(
+            "# environment: base\nPARAM ENV TARGET = \"dev\"\n\
+             FOR X IN ENVS BASELINE(FILE(\"old.baseline\")), COMPARISON(\"{{TARGET}}\")\n\
+             END\nFOR Y IN ENVS \"other\", \"{{dynamic}}\"\nEND\n",
+        )
+        .unwrap();
+        assert_eq!(
+            environment_names(&flow, &HashMap::new()),
+            ["base", "dev", "other"]
+        );
+        assert_eq!(
+            environment_names(&flow, &HashMap::from([("TARGET".into(), "staging".into())])),
+            ["base", "other", "staging"]
+        );
+    }
     fn strings() -> crate::i18n::Strings {
         crate::i18n::Strings::for_language(&crate::i18n::Language::English)
     }

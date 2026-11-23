@@ -96,6 +96,59 @@ pub fn file_display_name(path: &Path) -> String {
         .to_string()
 }
 
+/// Discover candidates without reading their values or resolving providers.
+/// Keep ambiguous names as separate paths: selecting the source is the user's
+/// decision, never a side effect of opening a report.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn load_candidates(
+    name: &str,
+    envs: &[Environment],
+    workspace_files: &[PathBuf],
+    report_path: Option<&Path>,
+) -> Vec<PathBuf> {
+    if name.is_empty()
+        || name.contains("{{")
+        || Path::new(name).components().count() != 1
+        || !matches!(
+            Path::new(name).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+        || envs.iter().any(|e| e.name == name)
+    {
+        return Vec::new();
+    }
+    let mut candidates: Vec<_> = workspace_files
+        .iter()
+        .filter(|p| file_display_name(p) == name)
+        .cloned()
+        .collect();
+    if let Some(parent) = report_path.and_then(Path::parent) {
+        for extension in ["vars", "env"] {
+            candidates.push(parent.join(format!("{name}.{extension}")));
+        }
+    }
+    let mut result = Vec::new();
+    let mut sources = Vec::new();
+    for candidate in candidates {
+        if !candidate.is_file()
+            || envs
+                .iter()
+                .any(|e| crate::environment::is_same_source(e, Some(&candidate), None))
+        {
+            continue;
+        }
+        let source = candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.clone());
+        if !sources.contains(&source) {
+            sources.push(source);
+            result.push(candidate);
+        }
+    }
+    result.sort();
+    result
+}
+
 /// Whether `name` matches `filter` — a case-insensitive substring, with an
 /// empty filter matching everything.
 pub fn matches(name: &str, filter: &str) -> bool {
@@ -211,6 +264,48 @@ pub fn reveal_plan(
 mod tests {
     use super::*;
     use crate::environment::parse_vars_pending;
+
+    #[test]
+    fn environment_load_candidates_keep_ambiguous_sources_and_deduplicate_paths() {
+        let root =
+            std::env::temp_dir().join(format!("paperboy-env-offers-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        let local = root.join("dev.vars");
+        let other = root.join("other/dev.vars");
+        std::fs::write(&local, "URL=local\n").unwrap();
+        std::fs::write(&other, "URL=other\n").unwrap();
+        let report = root.join("report.trail");
+        let candidates =
+            load_candidates("dev", &[], &[local.clone(), other.clone()], Some(&report));
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.contains(&local.canonicalize().unwrap()));
+        assert!(candidates.contains(&other.canonicalize().unwrap()));
+        assert!(load_candidates("missing", &[], &[], Some(&report)).is_empty());
+        assert!(load_candidates("../dev", &[], &[], Some(&report)).is_empty());
+        assert!(load_candidates("{{TARGET}}", &[], &[], Some(&report)).is_empty());
+        assert!(load_candidates("dev", &[env("dev", None)], &[other], Some(&report)).is_empty());
+        let mut renamed = env("renamed", None);
+        renamed.path = Some(local);
+        assert!(load_candidates("dev", &[renamed], &[], Some(&report)).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn environment_load_candidates_preserve_symlink_names() {
+        let root =
+            std::env::temp_dir().join(format!("paperboy-env-alias-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("shared.vars");
+        let alias = root.join("dev.env");
+        std::fs::write(&source, "URL=local\n").unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        assert_eq!(
+            load_candidates("dev", &[], &[], Some(&root.join("report.trail"))),
+            [alias]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn env(name: &str, path: Option<&str>) -> Environment {
         let (mut e, _) = parse_vars_pending(name.to_string(), "K=v");

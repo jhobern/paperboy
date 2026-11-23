@@ -932,6 +932,11 @@ runs with `CACHE` / `PERSIST`, and repair expired entries with
 [Persistent preparation caches](docs/caching.md) for syntax, environment/file
 isolation, response-based recovery, and private storage configuration.
 
+In the GUI, a missing environment can be loaded directly from report diagnostics
+or run settings when a matching file exists in an open workspace or beside the
+report. PaperBoy shows the source path and waits for you to choose **Load
+environment**; simply opening a report never loads environment files.
+
 ```sh
 paperboy -r report.trail                                  # collection from the report's headers
 paperboy -c api.hurl -r report.trail -o out.csv           # or given explicitly; - is stdout
