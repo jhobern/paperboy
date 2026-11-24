@@ -896,7 +896,7 @@ mod tests {
             |entry| streamed.push(entry.error.clone()),
             |_, _, _| {},
         );
-        for output in [single, streaming] {
+        for output in [&single, &streaming] {
             assert_eq!(output.entries.len(), 1);
             let entry = &output.entries[0];
             assert_eq!(entry.status, 0);
@@ -905,8 +905,8 @@ mod tests {
             assert!(message.contains("(28)"), "{message}");
             assert!(message.to_lowercase().contains("time"), "{message}");
             assert_eq!(output.error.as_deref(), Some(message));
-            assert_eq!(streamed[0].as_deref(), Some(message));
         }
+        assert_eq!(streamed, vec![streaming.entries[0].error.clone()]);
     }
 
     /// Removes a path when it goes out of scope, so a failing assertion can't

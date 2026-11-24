@@ -31,6 +31,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the saved session. `--gui --foreground` retains the attached behavior for
   debugging. Terminal UI and headless runs are unchanged.
 
+### Fixed
+
+- CI environment-loading tests now expect the original source paths on Windows
+  and macOS, matching discovery's filename-preserving behavior. The timeout test
+  checks streaming diagnostics against their own request rather than requiring
+  identical elapsed times across separate requests.
+
 ## [0.8.2] - 2026-11-20
 
 ### Fixed

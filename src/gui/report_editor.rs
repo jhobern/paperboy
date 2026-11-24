@@ -16579,10 +16579,7 @@ REPORT REQUEST x
         ed.seed_params(&app.session);
         ed.params_modal = Some(RunIntent::Review);
         let candidates = report_environment_offers(&ed, &app, &ed.param_values);
-        assert_eq!(
-            candidates,
-            vec![("dev".into(), path.canonicalize().unwrap())]
-        );
+        assert_eq!(candidates, vec![("dev".into(), path.clone())]);
         app.report_editor = Some(ed);
         let ctx = egui::Context::default();
         painted(&ctx, &mut app);
