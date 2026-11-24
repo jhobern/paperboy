@@ -278,8 +278,8 @@ mod tests {
         let candidates =
             load_candidates("dev", &[], &[local.clone(), other.clone()], Some(&report));
         assert_eq!(candidates.len(), 2);
-        assert!(candidates.contains(&local.canonicalize().unwrap()));
-        assert!(candidates.contains(&other.canonicalize().unwrap()));
+        assert!(candidates.contains(&local));
+        assert!(candidates.contains(&other));
         assert!(load_candidates("missing", &[], &[], Some(&report)).is_empty());
         assert!(load_candidates("../dev", &[], &[], Some(&report)).is_empty());
         assert!(load_candidates("{{TARGET}}", &[], &[], Some(&report)).is_empty());
